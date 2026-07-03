@@ -19,7 +19,7 @@ except ImportError:
 @unittest.skipUnless(HAS_PYSCF and HAS_MP2_IMPORT, "PySCF and fsec structure_factor deps are required")
 class KnownValues(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
+    def _build_system(cls, kmesh):
         cell = gto.Cell()
         cell.unit = "Bohr"
         cell.atom = """
@@ -36,7 +36,7 @@ class KnownValues(unittest.TestCase):
         cell.verbose = 0
         cell.build()
 
-        kpts = cell.make_kpts((1, 1, 1), wrap_around=True, with_gamma_point=True)
+        kpts = cell.make_kpts(kmesh, wrap_around=True, with_gamma_point=True)
         kmf = scf.KRHF(cell, kpts)
         kmf.exxdiv = "ewald"
         kmf.with_df = df.GDF(cell, kpts).build()
@@ -51,9 +51,12 @@ class KnownValues(unittest.TestCase):
         if not getattr(kmp, "converged", True):
             raise RuntimeError("KMP2 did not converge for the H2 test system")
 
-        cls.kmf = kmf
-        cls.kmp = kmp
-        cls.t2 = t2
+        return kmf, kmp, t2
+
+    @classmethod
+    def setUpClass(cls):
+        cls.kmf, cls.kmp, cls.t2 = cls._build_system((1, 1, 1))
+        cls.kmf_112, cls.kmp_112, cls.t2_112 = cls._build_system((1, 1, 2))
         cls.sq_ke_cutoff = 100.0
         cls.qG_cutoff = 8.0
         cls.N_local = cls.kmf.cell.cutoff_to_mesh(cls.sq_ke_cutoff)
@@ -186,6 +189,79 @@ class KnownValues(unittest.TestCase):
             reference["SqG_full_q4"],
             rtol=1e-7,
             atol=1e-10,
+        )
+
+    def test_build_structure_factor_112_kmesh(self):
+        mp2_sf = MP2StructureFactor(
+            self.kmf_112,
+            self.kmp_112,
+            t2=self.t2_112,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+        )
+        result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
+
+        qG = result["qG_full"]
+        idx10 = self._closest_10_indices(qG)
+        reference_qG_10 = [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, -0.5235987755982988],
+            [0.0, 0.0, 0.5235987755982988],
+            [-1.0471975511965976, 0.0, 0.0],
+            [0.0, -1.0471975511965976, 0.0],
+            [0.0, 0.0, -1.0471975511965976],
+            [0.0, 0.0, 1.0471975511965976],
+            [0.0, 1.0471975511965976, 0.0],
+            [1.0471975511965976, 0.0, 0.0],
+            [-1.0471975511965976, 0.0, -0.5235987755982988],
+        ]
+        reference_direct_10 = [
+            -7.0303133198968355e-22,
+            -0.0001194903276263542,
+            -0.0001194903276263542,
+            -6.781821143014501e-22,
+            -6.762184510329533e-22,
+            -0.0001765252081289475,
+            -0.0001765252081289475,
+            -6.762184510329533e-22,
+            -6.781821143014501e-22,
+            -4.5148932980442695e-05,
+        ]
+        reference_q4_10 = [
+            -3.8888130645417575e-41,
+            -8.559020493472634e-07,
+            -8.559020493472634e-07,
+            -3.6272620975584263e-41,
+            -3.6053641934281435e-41,
+            -2.4379646780045767e-06,
+            -2.4379646780045767e-06,
+            -3.6053641934281435e-41,
+            -3.6272620975584263e-41,
+            -1.234368080915971e-07,
+        ]
+        reference_exchange_10 = [
+            3.515156774224535e-22,
+            5.9745163813177126e-05,
+            5.9745163813177126e-05,
+            3.3909105697810145e-22,
+            3.381092268831497e-22,
+            8.82626040644735e-05,
+            8.82626040644735e-05,
+            3.381092268831497e-22,
+            3.3909105697810145e-22,
+            2.2574466490221357e-05,
+        ]
+
+        np.testing.assert_allclose(qG[idx10], reference_qG_10, atol=1e-12)
+        np.testing.assert_allclose(
+            result["SqG_full_direct"][idx10], reference_direct_10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            result["SqG_full_q4"][idx10], reference_q4_10, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            result["SqG_full_exchange"][idx10], reference_exchange_10, atol=1e-10
         )
 
 

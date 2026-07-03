@@ -7,6 +7,7 @@ from pyscf.lib import logger
 from pyscf import lib
 from pyscf.lib.parameters import LARGE_DENOM
 from pyscf.pbc import df
+from pyscf.pbc.lib import kpts_helper
 from pyscf.lib import logger, einsum
 from pyscf.pbc.mp import kmp2
 import numpy as np
@@ -149,6 +150,16 @@ class MP2StructureFactor(StructureFactor):
         kGrid1 = grids.kGrid1 # occupied
         kGrid2 = grids.kGrid2 # virtual
         kGrid3 = grids.kGrid3 # virtual b
+
+        try:
+            trs_map = kpts_helper.conj_mapping(kmf.cell, kGrid1)
+            kgrid_occ_trs = True
+        except kpts_helper.KPointSymmetryError:
+            kgrid_occ_trs = False
+            trs_map = None
+
+        print("kgrid_occ has time reversal symmetry: ", kgrid_occ_trs)
+
         rptGrid3D = grids.RptGrid3D_coarse
         qGrid = grids.qGrid
 
@@ -357,32 +368,56 @@ class MP2StructureFactor(StructureFactor):
             kptbs = kGrid1 - qGpt
             kptas_BZ = minimum_image(kmf.cell, kptas)
             kptbs_BZ = minimum_image(kmf.cell, kptbs)
+
+            # combined_kptgrid = np.concatenate((kptas_BZ, kptbs_BZ), axis=0)
+            # _, unique_indices, _ = kpts_helper.unique(combined_kptgrid)
+            # combined_kptgrid = combined_kptgrid[unique_indices]
+            # try:
+            #     trs_map = kpts_helper.conj_mapping(kmf.cell, combined_kptgrid)
+            #     kgrid_occ_trs = True
+            # except kpts_helper.KPointSymmetryError:
+            #     trs_map = None
+            #     kgrid_occ_trs = False
             
             kGdiffas = kptas - kptas_BZ
             kGdiffbs = kptbs - kptbs_BZ
             
             kas_at_qi = kas[qi]
             kbs_at_qi = kbs[qi]
-            
-            # Precompute exp_term for kGdiffas and kGdiffbs
-            exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
-            exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs.T)).T
-            profile.stop("per-qG index/phase setup", region_t0)
-            
-            # Build pair densities, rho_ikiaka and rho_jkjbkb
-            region_t0 = profile.start()
-            ua_ki = uKpts_a[kas_at_qi] * exp_term_as[:,None,:] # nkpts x nvir x nG
-            profile.stop("pair-density elementwise products", region_t0)
-            region_t0 = profile.start()
-            rho_ia_full = conj_uKpts_i @ ua_ki.transpose(0,2,1) # nkpts x nocc x nvir
-            profile.stop("pair-density matrix multiply", region_t0)
+            if kgrid_occ_trs and trs_map is not None:
+                # Use time-reversal symmetry 
+                exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
+                profile.stop("per-qG index/phase setup", region_t0)
                 
-            region_t0 = profile.start()
-            conj_ub_kj = np.conj(uKpts_b[kbs_at_qi]) * exp_term_bs[:,None,:] # nkpts x nvir x nG
-            profile.stop("pair-density elementwise products", region_t0)
-            region_t0 = profile.start()
-            rho_jb_full = conj_ub_kj @ uKpts_j_T # nkpts x nvir x nocc
-            profile.stop("pair-density matrix multiply", region_t0)
+                # Build pair densities, rho_ikiaka and rho_jkjbkb
+                region_t0 = profile.start()
+                ua_ki = uKpts_a[kas_at_qi] * exp_term_as[:,None,:] # nkpts x nvir x nG
+                profile.stop("pair-density elementwise products", region_t0)
+                region_t0 = profile.start()
+                rho_ia_full = conj_uKpts_i @ ua_ki.transpose(0,2,1) # nkpts x nocc x nvir
+                profile.stop("pair-density matrix multiply", region_t0)
+                    
+                rho_jb_full = rho_ia_full[trs_map,:,:].transpose(0,2,1) # nkpts x nvir x nocc
+            else:
+                # Precompute exp_term for kGdiffas and kGdiffbs
+                exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
+                exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs.T)).T
+                profile.stop("per-qG index/phase setup", region_t0)
+                
+                # Build pair densities, rho_ikiaka and rho_jkjbkb
+                region_t0 = profile.start()
+                ua_ki = uKpts_a[kas_at_qi] * exp_term_as[:,None,:] # nkpts x nvir x nG
+                profile.stop("pair-density elementwise products", region_t0)
+                region_t0 = profile.start()
+                rho_ia_full = conj_uKpts_i @ ua_ki.transpose(0,2,1) # nkpts x nocc x nvir
+                profile.stop("pair-density matrix multiply", region_t0)
+                    
+                region_t0 = profile.start()
+                conj_ub_kj = np.conj(uKpts_b[kbs_at_qi]) * exp_term_bs[:,None,:] # nkpts x nvir x nG
+                profile.stop("pair-density elementwise products", region_t0)
+                region_t0 = profile.start()
+                rho_jb_full = conj_ub_kj @ uKpts_j_T # nkpts x nvir x nocc
+                profile.stop("pair-density matrix multiply", region_t0)
         
 
             if t2_store_type == 'ki' and not t2_given:
