@@ -97,6 +97,9 @@ class MP2SSOptions:
         selected automatically.
     sq_inversion_symm
         Use inversion symmetry when constructing the MP2 structure factor.
+    check_trs
+        Use time-reversal symmetry when constructing MP2 pair densities if
+        the occupied k-point grid supports it.
     sq_ke_cutoff
         Kinetic-energy cutoff used to derive the structure mesh as well as the real-space
         grid density used to compute each S(q+G). When provided, it overrides ``N_local``.
@@ -133,6 +136,7 @@ class MP2SSOptions:
     qG_norm_cutoff: float = 4.0
     min_points: int = 6
     sq_inversion_symm: bool = True
+    check_trs: bool = True
     sq_ke_cutoff: float = None
     fit_method: str = 'scipy_least_squares'
     fit_with_coul_q4: bool = True
@@ -879,6 +883,7 @@ class MP2SS:
         self.qG_norm_cutoff = options.qG_norm_cutoff
         self.min_points = options.min_points
         self.sq_inversion_symm = options.sq_inversion_symm
+        self.check_trs = options.check_trs
         self.sq_ke_cutoff = options.sq_ke_cutoff
         if self.sq_ke_cutoff is not None:
             print("sq_ke_cutoff provided to MP2SS, overriding N_local")
@@ -985,6 +990,7 @@ class MP2SS:
             self.kmf, self.kmp, t2=self.t2, N_local=self.N_local,
             sq_ke_cutoff=self.sq_ke_cutoff, qG_cutoff=self.qG_norm_cutoff,
             sq_inversion_symm=self.sq_inversion_symm,
+            check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
         )
         mp2_structure_factor.set_grids(min_fit_points=self.min_points)

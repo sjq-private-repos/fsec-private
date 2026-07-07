@@ -84,26 +84,26 @@ class PrintResultsTests(unittest.TestCase):
 class KnownValues(unittest.TestCase):
     TOL = 1e-6
     REFERENCES = {
-        "emp2ss": -0.012377126997773956,
-        "mp2ss_total_correction": 0.004131436113473142,
-        "mp2ss_direct_correction": -0.004741925103280841,
-        "mp2ss_exchange_correction": 0.008873361216753983,
-        "direct_integral_term": -0.0291517748423867,
-        "direct_quadrature_term": -0.02440984973910586,
-        "exchange_integral_term": 0.018810916823196567,
-        "exchange_quadrature_term": 0.009937555606442584,
-        "direct_integral_term_q2": -0.02237394483611901,
-        "direct_quadrature_term_q2": -0.02000979264030079,
-        "direct_total_correction_q2": -0.0023641521958182206,
-        "direct_integral_term_q4": -0.00677783000626769,
-        "direct_quadrature_term_q4": -0.00440005709880507,
-        "direct_total_correction_q4": -0.00237777290746262,
-        "direct_total_correction_q2_q4": -0.004741925103280841,
-        "emp2_uncorr": -0.016508563111247095,
-        "edi_uncorr": -0.0311807129223964,
-        "exi_uncorr": 0.014672149811149306,
-        "emp2ss_direct": -0.035922638025677245,
-        "emp2ss_exchange": 0.02354551102790329,
+        "emp2ss": -0.020743652149576734,
+        "mp2ss_total_correction": -0.0042350890410775485,
+        "mp2ss_direct_correction": -0.013108450253663102,
+        "mp2ss_exchange_correction": 0.008873361212585553,
+        "direct_integral_term": -0.03495204165711477,
+        "direct_quadrature_term": -0.021843591403451663,
+        "exchange_integral_term": 0.018810916817992317,
+        "exchange_quadrature_term": 0.009937555605406764,
+        "direct_integral_term_q2": -0.028229618267205235,
+        "direct_quadrature_term_q2": -0.01748981155330432,
+        "direct_total_correction_q2": -0.010739806713900915,
+        "direct_integral_term_q4": -0.006722423389909531,
+        "direct_quadrature_term_q4": -0.004353779850147344,
+        "direct_total_correction_q4": -0.0023686435397621865,
+        "direct_total_correction_q2_q4": -0.013108450253663102,
+        "emp2_uncorr": -0.016508563108499186,
+        "edi_uncorr": -0.031180712917439485,
+        "exi_uncorr": 0.014672149808940297,
+        "emp2ss_direct": -0.04428916317110258,
+        "emp2ss_exchange": 0.02354551102152585,
     }
 
     @classmethod
@@ -146,23 +146,7 @@ class KnownValues(unittest.TestCase):
         _, t2 = kmp.kernel(with_t2=True)
         return kmf, kmp, t2
 
-    def test_mp2ss_stacked_singularity_split_q2_q4(self):
-        mp2ss = MP2SS(
-            kmf=self.kmf,
-            kmp=self.kmp,
-            t2=self.t2,
-        )
-        self.assertEqual(mp2ss.options.auxfunc_direct, "Gauss")
-        self.assertEqual(mp2ss.options.auxfunc_direct_q2, "Gauss")
-        self.assertEqual(mp2ss.options.auxfunc_direct_q4, "Gauss")
-        self.assertEqual(mp2ss.options.auxfunc_exchange, "Gauss")
-        self.assertEqual(mp2ss.options.qG_norm_cutoff, 4.0)
-        self.assertEqual(mp2ss.options.fit_method, "scipy_least_squares")
-        self.assertTrue(mp2ss.options.fit_with_coul)
-        self.assertTrue(mp2ss.options.correct_q2_q4_separately)
-        self.assertEqual(mp2ss.options.t2_store_type, "kikjka")
-        correction = mp2ss.compute_correction(direct=True, exchange=True)
-
+    def _assert_matches_references(self, mp2ss, correction):
         actual = {
             "emp2ss": mp2ss.emp2ss,
             "mp2ss_total_correction": mp2ss.mp2ss_total_correction,
@@ -205,6 +189,40 @@ class KnownValues(unittest.TestCase):
             self.REFERENCES["mp2ss_exchange_correction"],
             delta=self.TOL,
         )
+
+    def test_mp2ss_stacked_singularity_split_q2_q4(self):
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2,
+        )
+        self.assertEqual(mp2ss.options.auxfunc_direct, "Gauss")
+        self.assertEqual(mp2ss.options.auxfunc_direct_q2, "Gauss")
+        self.assertEqual(mp2ss.options.auxfunc_direct_q4, "Gauss")
+        self.assertEqual(mp2ss.options.auxfunc_exchange, "Gauss")
+        self.assertEqual(mp2ss.options.qG_norm_cutoff, 4.0)
+        self.assertEqual(mp2ss.options.fit_method, "scipy_least_squares")
+        self.assertTrue(mp2ss.options.fit_with_coul)
+        self.assertTrue(mp2ss.options.fit_with_coul_q2)
+        self.assertTrue(mp2ss.options.correct_q2_q4_separately)
+        self.assertTrue(mp2ss.options.check_trs)
+        self.assertEqual(mp2ss.options.t2_store_type, "kikjka")
+        correction = mp2ss.compute_correction(direct=True, exchange=True)
+
+        self._assert_matches_references(mp2ss, correction)
+
+    def test_mp2ss_check_trs_false(self):
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2,
+            check_trs=False,
+        )
+        self.assertFalse(mp2ss.options.check_trs)
+        correction = mp2ss.compute_correction(direct=True, exchange=True)
+
+        self.assertFalse(mp2ss.mp2_structure_factor.check_trs)
+        self._assert_matches_references(mp2ss, correction)
 
 
 if __name__ == "__main__":

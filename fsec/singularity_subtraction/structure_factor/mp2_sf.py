@@ -31,6 +31,7 @@ class MP2StructureFactor(StructureFactor):
         self.kGrid1 = minimum_image(kmf.cell, kwargs.get('kGrid1', kmf.kpts))
         self.kGrid2 = kwargs.get('kGrid2', None)
         self.min_points = kwargs.get('min_points', 6)
+        self.check_trs = kwargs.get('check_trs', True)
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
@@ -157,6 +158,7 @@ class MP2StructureFactor(StructureFactor):
         except kpts_helper.KPointSymmetryError:
             kgrid_occ_trs = False
             trs_map = None
+        check_trs = self.check_trs
 
         print("kgrid_occ has time reversal symmetry: ", kgrid_occ_trs)
 
@@ -384,7 +386,7 @@ class MP2StructureFactor(StructureFactor):
             
             kas_at_qi = kas[qi]
             kbs_at_qi = kbs[qi]
-            if kgrid_occ_trs and trs_map is not None:
+            if kgrid_occ_trs and trs_map is not None and check_trs:
                 # Use time-reversal symmetry 
                 exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
                 profile.stop("per-qG index/phase setup", region_t0)
