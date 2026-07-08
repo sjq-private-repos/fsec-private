@@ -62,6 +62,11 @@ class MP2StructureFactor(StructureFactor):
         self.grids.build_grids()
         self.grids.build_truncated_qG_grid()
 
+    @staticmethod
+    def contract_kikj_dG0(rijab, eijab_recip, scale):
+        """Compute the kikj dG0 contraction without materializing sqrt-weighted rijab."""
+        return -2 * scale**2 * np.sum(np.abs(rijab)**2 * np.abs(eijab_recip).ravel())
+
     def build_structure_factor(self,direct=False,exchange=False,qG_full=None,
                                update_class=True, qG_cutoff=None, dG0=False,
                                grids=None, mo_coeff_kpts1=None, mo_coeff_kpts2=None, mo_coeff_kpts3=None, 
@@ -278,6 +283,24 @@ class MP2StructureFactor(StructureFactor):
         _, qi_map = qtree.query(qG_full_BZ, distance_upper_bound=1e-8)
         if np.any(qi_map == len(qGrid)):
             raise TypeError("Cannot locate qG_full_BZ in the qmesh.")
+
+        kikj_on_the_fly = t2_store_type == 'kikj' and not t2_given
+        t2_cache = {}
+        t2_cache_counts = {
+            'direct_hits': 0,
+            'direct_misses': 0,
+            'exchange_hits': 0,
+            'exchange_misses': 0,
+        }
+        repeated_qis = set()
+        if kikj_on_the_fly:
+            unique_qis, qi_counts = np.unique(qi_map, return_counts=True)
+            repeated_qis = {int(qi) for qi, count in zip(unique_qis, qi_counts)
+                            if count > 1}
+            log.note(
+                "kikj t2 cache: %d unique qi, %d repeated qi",
+                len(unique_qis), len(repeated_qis),
+            )
     
         kptas = kGrid1[None,:,:] + qGrid[:,None,:]
         kptbs = kGrid1[None,:,:] - qGrid[:,None,:]
@@ -533,12 +556,22 @@ class MP2StructureFactor(StructureFactor):
                 if direct:
 
                     if t2_store_type == 'kikj' and not t2_given:
-                        region_t0 = profile.start()
-                        t2_qi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                            skip_if_no_qpt=True, mode='direct',Lov=Lov, verbose=logger.NOTE)
-                        t2_qi = t2_qi.transpose(2,0,1,3,4,5,6)
-                        t2_qi = t2_qi[0]
-                        profile.stop("direct t2 construction on the fly", region_t0)
+                        cache_key = ('direct', int(qi))
+                        if cache_key in t2_cache:
+                            region_t0 = profile.start()
+                            t2_qi = t2_cache[cache_key]
+                            t2_cache_counts['direct_hits'] += 1
+                            profile.stop("direct t2 cache hit", region_t0)
+                        else:
+                            region_t0 = profile.start()
+                            t2_qi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
+                                                                skip_if_no_qpt=True, mode='direct',Lov=Lov, verbose=logger.NOTE)
+                            t2_qi = t2_qi.transpose(2,0,1,3,4,5,6)
+                            t2_qi = t2_qi[0]
+                            if int(qi) in repeated_qis:
+                                t2_cache[cache_key] = t2_qi
+                            t2_cache_counts['direct_misses'] += 1
+                            profile.stop("direct t2 cache miss", region_t0)
                     region_t0 = profile.start()
                     temp_SqG_k =2/(omega_cell*nkpts) * np.dot(rijab, t2_qi.ravel()) * dvol**2 #ORIGINAL 3/3/26
                     # temp_SqG_k =2/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qi.ravel()) * dvol**2 #NEW 3/3/26
@@ -546,17 +579,27 @@ class MP2StructureFactor(StructureFactor):
                     SqG_full_direct[qG] += temp_SqG_k.real / nkpts
                     profile.stop("direct final contraction", region_t0)
                 if exchange:
-                    region_t0 = profile.start()
-                    t2_qpi = np.zeros((nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=np.complex128)
-                    profile.stop("exchange t2 allocation", region_t0)
                     if t2_store_type == 'kikj' and not t2_given:
-                        region_t0 = profile.start()
-                        t2_qpi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                            skip_if_no_qpt=True, mode='exchange',Lov=Lov, verbose=logger.NOTE)
-                        t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
-                        t2_qpi = t2_qpi[0]
-                        profile.stop("exchange t2 construction on the fly", region_t0)
+                        cache_key = ('exchange', int(qi))
+                        if cache_key in t2_cache:
+                            region_t0 = profile.start()
+                            t2_qpi = t2_cache[cache_key]
+                            t2_cache_counts['exchange_hits'] += 1
+                            profile.stop("exchange t2 cache hit", region_t0)
+                        else:
+                            region_t0 = profile.start()
+                            t2_qpi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
+                                                                skip_if_no_qpt=True, mode='exchange',Lov=Lov, verbose=logger.NOTE)
+                            t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
+                            t2_qpi = t2_qpi[0]
+                            if int(qi) in repeated_qis:
+                                t2_cache[cache_key] = t2_qpi
+                            t2_cache_counts['exchange_misses'] += 1
+                            profile.stop("exchange t2 cache miss", region_t0)
                     else:
+                        region_t0 = profile.start()
+                        t2_qpi = np.zeros((nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=np.complex128)
+                        profile.stop("exchange t2 allocation", region_t0)
                         region_t0 = profile.start()
                         kii, kjj = np.indices((nkpts, nkpts))
                         t2_qpi = t2[qpis, kii, kjj]
@@ -583,19 +626,31 @@ class MP2StructureFactor(StructureFactor):
                     profile.stop("dG0 denominator setup", region_t0)
 
                     region_t0 = profile.start()
-                    # rijab_ovr_e =  np.einsum(contract_expression_q4,rho_ia_full,rho_jb_full.conj(),np.sqrt(np.abs(eijab)),optimize=True
-                    rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
+                    if t2_store_type == 'kikj':
+                        scale = dvol**2 / (nkpts * omega_cell)
+                        temp_SqG_k_q4 = self.contract_kikj_dG0(rijab, eijab, scale)
+                    else:
+                        # rijab_ovr_e =  np.einsum(contract_expression_q4,rho_ia_full,rho_jb_full.conj(),np.sqrt(np.abs(eijab)),optimize=True
+                        rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
 
-                    rijab_ovr_e = rijab_ovr_e * dvol**2 / (nkpts * omega_cell) # For using rijab instead of t2
-                    
-                    # temp_SqG_k_q4 = -2 * np.sum(np.abs(rijab_ovr_e)**2) # Check prefactor here
-                    # temp_SqG_k_q4 = -2 * np.dot(rijab_ovr_e, rijab_ovr_e.conj()) #ORIGINAL 3/3/26
-                    temp_SqG_k_q4 = -2 * pyscf_einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj()) #NEW 3/3/26
+                        rijab_ovr_e = rijab_ovr_e * dvol**2 / (nkpts * omega_cell) # For using rijab instead of t2
+                        
+                        # temp_SqG_k_q4 = -2 * np.sum(np.abs(rijab_ovr_e)**2) # Check prefactor here
+                        # temp_SqG_k_q4 = -2 * np.dot(rijab_ovr_e, rijab_ovr_e.conj()) #ORIGINAL 3/3/26
+                        temp_SqG_k_q4 = -2 * pyscf_einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj()) #NEW 3/3/26
                     SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
                     profile.stop("dG0 final contraction", region_t0)
         profile.stop("main qG loop (inclusive)", loop_t0)
 
         log.note("Number of equivalent qG points: %d", num_equiv_qG)
+        if kikj_on_the_fly:
+            cache_mem = sum(value.nbytes for value in t2_cache.values()) / 1024**2
+            log.note(
+                "kikj t2 cache: direct hits/misses %d/%d, exchange hits/misses %d/%d, retained %.3f MB",
+                t2_cache_counts['direct_hits'], t2_cache_counts['direct_misses'],
+                t2_cache_counts['exchange_hits'], t2_cache_counts['exchange_misses'],
+                cache_mem,
+            )
         if update_class:
             phase_t0 = profile.start()
             self.SqG_full_direct = SqG_full_direct

@@ -191,6 +191,75 @@ class KnownValues(unittest.TestCase):
             atol=1e-10,
         )
 
+    def test_kikj_on_the_fly_matches_kikjka_with_repeated_qi(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+
+        reference_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            t2_store_type="kikjka",
+        )
+        reference = reference_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        kikj_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            t2_store_type="kikj",
+        )
+        actual = kikj_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        np.testing.assert_allclose(actual["qG_full"], reference["qG_full"], atol=1e-12)
+        np.testing.assert_allclose(
+            actual["SqG_full_direct"],
+            reference["SqG_full_direct"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            actual["SqG_full_exchange"],
+            reference["SqG_full_exchange"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            actual["SqG_full_q4"],
+            reference["SqG_full_q4"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
+        self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
+
+    def test_contract_kikj_dG0_matches_old_expression(self):
+        rng = np.random.default_rng(12)
+        rijab = rng.normal(size=24) + 1j * rng.normal(size=24)
+        eijab = rng.normal(size=(2, 3, 4))
+        scale = 0.125
+
+        rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
+        rijab_ovr_e = rijab_ovr_e * scale
+        reference = -2 * np.einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj())
+        actual = MP2StructureFactor.contract_kikj_dG0(rijab, eijab, scale)
+
+        self.assertAlmostEqual(actual.real, reference.real, places=14)
+        self.assertAlmostEqual(actual.imag, reference.imag, places=14)
+
     def test_build_structure_factor_112_kmesh(self):
         mp2_sf = MP2StructureFactor(
             self.kmf_112,
