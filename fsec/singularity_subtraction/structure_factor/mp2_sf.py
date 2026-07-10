@@ -414,12 +414,14 @@ class MP2StructureFactor(StructureFactor):
                 exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
                 profile.stop("per-qG index/phase setup", region_t0)
                 
-                # Build pair densities, rho_ikiaka and rho_jkjbkb
+                # Build pair densities, rho_ikiaka and rho_jkjbkb.
+                # Apply the phase on the occupied side to avoid nvir-sized
+                # temporaries on the real-space grid.
                 region_t0 = profile.start()
-                ua_ki = uKpts_a[kas_at_qi] * exp_term_as[:,None,:] # nkpts x nvir x nG
+                phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
-                rho_ia_full = conj_uKpts_i @ ua_ki.transpose(0,2,1) # nkpts x nocc x nvir
+                rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
                 profile.stop("pair-density matrix multiply", region_t0)
                     
                 rho_jb_full = rho_ia_full[trs_map,:,:].transpose(0,2,1) # nkpts x nvir x nocc
@@ -428,20 +430,19 @@ class MP2StructureFactor(StructureFactor):
                 exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
                 exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs.T)).T
                 profile.stop("per-qG index/phase setup", region_t0)
-                
-                # Build pair densities, rho_ikiaka and rho_jkjbkb
+
                 region_t0 = profile.start()
-                ua_ki = uKpts_a[kas_at_qi] * exp_term_as[:,None,:] # nkpts x nvir x nG
+                phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
-                rho_ia_full = conj_uKpts_i @ ua_ki.transpose(0,2,1) # nkpts x nocc x nvir
+                rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
                 profile.stop("pair-density matrix multiply", region_t0)
                     
                 region_t0 = profile.start()
-                conj_ub_kj = np.conj(uKpts_b[kbs_at_qi]) * exp_term_bs[:,None,:] # nkpts x nvir x nG
+                phased_uj_T = (uKpts_j * exp_term_bs[:,None,:]).transpose(0,2,1) # nkpts x nG x nocc
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
-                rho_jb_full = conj_ub_kj @ uKpts_j_T # nkpts x nvir x nocc
+                rho_jb_full = np.conj(uKpts_b[kbs_at_qi]) @ phased_uj_T # nkpts x nvir x nocc
                 profile.stop("pair-density matrix multiply", region_t0)
         
 
