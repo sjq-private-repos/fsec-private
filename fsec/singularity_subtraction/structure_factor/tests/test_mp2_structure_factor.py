@@ -374,6 +374,119 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(result["SqG_full_q4"])))
         self.assertIn("line_sampling_decay_events", result)
 
+    def test_adaptive_sq_ke_cutoff_matches_uniform_references(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+        switch_radius = np.linalg.norm(reciprocal[0]) + 1e-8
+        half_sq_ke_cutoff = 0.5 * self.sq_ke_cutoff
+
+        adaptive_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            sq_ke_cutoff=self.sq_ke_cutoff,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            sq_ke_cutoff_switch_radius=switch_radius,
+        )
+        adaptive = adaptive_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        full_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            sq_ke_cutoff=self.sq_ke_cutoff,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        full_reference = full_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        half_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            sq_ke_cutoff=half_sq_ke_cutoff,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        half_reference = half_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        inner = np.linalg.norm(qG_full, axis=1) <= switch_radius + 1e-8
+        outer = ~inner
+        np.testing.assert_allclose(adaptive["qG_full"], qG_full, atol=1e-12)
+        np.testing.assert_allclose(
+            adaptive["sq_ke_cutoff_by_qG"][inner],
+            np.full(np.count_nonzero(inner), self.sq_ke_cutoff),
+        )
+        np.testing.assert_allclose(
+            adaptive["sq_ke_cutoff_by_qG"][outer],
+            np.full(np.count_nonzero(outer), half_sq_ke_cutoff),
+        )
+        np.testing.assert_array_equal(
+            adaptive["N_local_by_region"]["inner"],
+            self.kmf.cell.cutoff_to_mesh(self.sq_ke_cutoff),
+        )
+        np.testing.assert_array_equal(
+            adaptive["N_local_by_region"]["outer"],
+            self.kmf.cell.cutoff_to_mesh(half_sq_ke_cutoff),
+        )
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                adaptive[key][inner],
+                full_reference[key][inner],
+                rtol=1e-7,
+                atol=1e-10,
+            )
+            np.testing.assert_allclose(
+                adaptive[key][outer],
+                half_reference[key][outer],
+                rtol=1e-7,
+                atol=1e-10,
+            )
+
+    def test_adaptive_sq_ke_cutoff_preserves_line_sampling_masks(self):
+        mp2_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            sq_ke_cutoff=self.sq_ke_cutoff,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            sq_ke_cutoff_switch_radius=1.5,
+        )
+        mp2_sf.set_grids(min_fit_points=10)
+        qG_full = mp2_sf.grids.build_qG_line_sampling()
+        result = mp2_sf.build_structure_factor(
+            qG_full=qG_full,
+            direct=True,
+            exchange=True,
+            dG0=True,
+            line_sampling_decay_min_fraction=10.0,
+            line_sampling_decay_consecutive_below=1,
+            line_sampling_decay_components=("direct_q4", "exchange"),
+            qG_line_sampling_segments=mp2_sf.grids.qG_line_sampling_segments,
+        )
+
+        np.testing.assert_allclose(result["qG_full"], qG_full, atol=1e-12)
+        self.assertEqual(len(result["SqG_full_direct_mask"]), len(result["qG_full"]))
+        self.assertEqual(len(result["SqG_full_exchange_mask"]), len(result["qG_full"]))
+        self.assertEqual(len(result["SqG_full_q4_mask"]), len(result["qG_full"]))
+        self.assertEqual(len(result["sq_ke_cutoff_by_qG"]), len(result["qG_full"]))
+        self.assertIn("inner", result["N_local_by_region"])
+        self.assertIn("outer", result["N_local_by_region"])
+        self.assertIn("line_sampling_decay_events", result)
+
     def test_build_structure_factor_112_kmesh(self):
         mp2_sf = MP2StructureFactor(
             self.kmf_112,

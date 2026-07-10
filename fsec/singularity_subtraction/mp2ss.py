@@ -103,6 +103,12 @@ class MP2SSOptions:
     sq_ke_cutoff
         Kinetic-energy cutoff used to derive the structure mesh as well as the real-space
         grid density used to compute each S(q+G). When provided, it overrides ``N_local``.
+    sq_ke_cutoff_switch_radius
+        If provided, use ``sq_ke_cutoff`` inside this q+G norm radius and a
+        scaled-down cutoff outside it.
+    outer_sq_ke_cutoff_scale
+        Multiplicative scale applied to ``sq_ke_cutoff`` for q+G points outside
+        ``sq_ke_cutoff_switch_radius``.
     fit_method
         Optimizer used for model fitting: ``"scipy_least_squares"`` or
         ``"scipy_minimize"``. Use ``None`` or ``"Disabled"`` to disable
@@ -148,6 +154,8 @@ class MP2SSOptions:
     sq_inversion_symm: bool = True
     check_trs: bool = True
     sq_ke_cutoff: float = None
+    sq_ke_cutoff_switch_radius: float = None
+    outer_sq_ke_cutoff_scale: float = 0.5
     fit_method: str = 'scipy_least_squares'
     fit_with_coul_q4: bool = True
     fit_with_coul_q2: bool = True
@@ -910,6 +918,8 @@ class MP2SS:
         self.sq_inversion_symm = options.sq_inversion_symm
         self.check_trs = options.check_trs
         self.sq_ke_cutoff = options.sq_ke_cutoff
+        self.sq_ke_cutoff_switch_radius = options.sq_ke_cutoff_switch_radius
+        self.outer_sq_ke_cutoff_scale = options.outer_sq_ke_cutoff_scale
         if self.sq_ke_cutoff is not None:
             print("sq_ke_cutoff provided to MP2SS, overriding N_local")
             self.N_local = self.cell.cutoff_to_mesh(self.sq_ke_cutoff)
@@ -1020,6 +1030,8 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
+            sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
+            outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
         )
         mp2_structure_factor.set_grids(min_fit_points=self.min_points)
 

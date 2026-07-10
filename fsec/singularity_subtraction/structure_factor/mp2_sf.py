@@ -40,6 +40,9 @@ class MP2StructureFactor(StructureFactor):
         self.kGrid2 = kwargs.get('kGrid2', None)
         self.min_points = kwargs.get('min_points', 6)
         self.check_trs = kwargs.get('check_trs', True)
+        self.input_sq_ke_cutoff = sq_ke_cutoff
+        self.sq_ke_cutoff_switch_radius = kwargs.get('sq_ke_cutoff_switch_radius', None)
+        self.outer_sq_ke_cutoff_scale = kwargs.get('outer_sq_ke_cutoff_scale', 0.5)
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
@@ -75,6 +78,20 @@ class MP2StructureFactor(StructureFactor):
         """Compute the kikj dG0 contraction without materializing sqrt-weighted rijab."""
         return -2 * scale**2 * np.sum(np.abs(rijab)**2 * np.abs(eijab_recip).ravel())
 
+    @staticmethod
+    def _build_coarse_real_space_grid(cell, N_local):
+        Lvec_real = cell.lattice_vectors()
+        N_local = np.asarray(N_local, dtype=int)
+        L_delta = Lvec_real / N_local
+        xv, yv, zv = np.meshgrid(
+            np.arange(N_local[0]),
+            np.arange(N_local[1]),
+            np.arange(N_local[2]),
+            indexing='ij',
+        )
+        mesh_idx = np.hstack([xv.reshape(-1, 1), yv.reshape(-1, 1), zv.reshape(-1, 1)])
+        return mesh_idx @ L_delta
+
     def build_structure_factor(self,direct=False,exchange=False,qG_full=None,
                                update_class=True, qG_cutoff=None, dG0=False,
                                grids=None, mo_coeff_kpts1=None, mo_coeff_kpts2=None, mo_coeff_kpts3=None, 
@@ -83,7 +100,9 @@ class MP2StructureFactor(StructureFactor):
                                line_sampling_decay_min_fraction=None,
                                line_sampling_decay_consecutive_below=3,
                                line_sampling_decay_components=(),
-                               qG_line_sampling_segments=None):
+                               qG_line_sampling_segments=None,
+                               sq_ke_cutoff_switch_radius=None,
+                               outer_sq_ke_cutoff_scale=None):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -153,6 +172,23 @@ class MP2StructureFactor(StructureFactor):
         if qG_cutoff is None:
             qG_cutoff = self.qG_cutoff
 
+        if sq_ke_cutoff_switch_radius is None:
+            sq_ke_cutoff_switch_radius = self.sq_ke_cutoff_switch_radius
+        if outer_sq_ke_cutoff_scale is None:
+            outer_sq_ke_cutoff_scale = self.outer_sq_ke_cutoff_scale
+        adaptive_sq_ke_cutoff = sq_ke_cutoff_switch_radius is not None
+        full_sq_ke_cutoff = self.input_sq_ke_cutoff
+        if full_sq_ke_cutoff is None and np.isscalar(self.sq_ke_cutoff):
+            full_sq_ke_cutoff = self.sq_ke_cutoff
+        if adaptive_sq_ke_cutoff:
+            if full_sq_ke_cutoff is None or not np.isscalar(full_sq_ke_cutoff):
+                raise ValueError("Adaptive sq_ke_cutoff requires a scalar user-provided sq_ke_cutoff")
+            if outer_sq_ke_cutoff_scale <= 0:
+                raise ValueError("outer_sq_ke_cutoff_scale must be positive")
+            sq_ke_cutoff_switch_radius = float(sq_ke_cutoff_switch_radius)
+            outer_sq_ke_cutoff_scale = float(outer_sq_ke_cutoff_scale)
+            full_sq_ke_cutoff = float(full_sq_ke_cutoff)
+
         line_sampling_decay_components = normalize_line_sampling_decay_components(
             line_sampling_decay_components, supported_components={"direct_q4", "exchange"})
         
@@ -182,7 +218,6 @@ class MP2StructureFactor(StructureFactor):
 
         print("kgrid_occ has time reversal symmetry: ", kgrid_occ_trs)
 
-        rptGrid3D = grids.RptGrid3D_coarse
         qGrid = grids.qGrid
 
         # Set up constants
@@ -235,24 +270,6 @@ class MP2StructureFactor(StructureFactor):
         
         kgrids_equal = kGrid1 is kGrid2 or np.allclose(kGrid1, kGrid2, atol=1e-8)
         mo_coeffs_equal = mo_coeff_kpts1 is mo_coeff_kpts2 or np.allclose(mo_coeff_kpts1, mo_coeff_kpts2, atol=1e-8)
-        if kgrids_equal and mo_coeffs_equal:
-            uKpts_i = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
-            uKpts_j = uKpts_i
-            uKpts_a = uKpts_i
-            uKpts_b = uKpts_i
-        else:
-            uKpts_i = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
-            uKpts_j = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
-            uKpts_a = build_uKpts(kmf, kGrid2, mo_coeff_kpts2, rptGrid3D=rptGrid3D, nbands=nbands)
-            uKpts_b = build_uKpts(kmf, kGrid3, mo_coeff_kpts3, rptGrid3D=rptGrid3D, nbands=nbands) # SJQ checked
-        profile.stop("uKpts construction", phase_t0)
-        
-        uKpts_i = uKpts_i[:,:nocc,:]
-        uKpts_j = uKpts_j[:,:nocc,:]
-        uKpts_a = uKpts_a[:,nocc:,:]
-        uKpts_b = uKpts_b[:,nocc:,:]
-        conj_uKpts_i = np.conj(uKpts_i)
-        uKpts_j_T = uKpts_j.transpose(0,2,1)
 
         if mo_energy is None:
             mo_energy = mo_energy_padded
@@ -262,13 +279,60 @@ class MP2StructureFactor(StructureFactor):
         mo_e_v_b = mo_e_v.copy() if mo_e_v_b is None else np.asarray(mo_e_v_b)
         
         Lvec_real = kmf.cell.lattice_vectors()
-        L_delta = Lvec_real / NsCell[:, None]
         omega_cell = np.abs(np.linalg.det(Lvec_real))
-        dvol = np.abs(np.linalg.det(L_delta))
+
+        def build_mesh_context(label, N_local, rptGrid3D, sq_ke_cutoff_value):
+            local_NsCell = np.asarray(N_local, dtype=int)
+            if kgrids_equal and mo_coeffs_equal:
+                uKpts_i_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
+                uKpts_j_local = uKpts_i_local
+                uKpts_a_local = uKpts_i_local
+                uKpts_b_local = uKpts_i_local
+            else:
+                uKpts_i_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
+                uKpts_j_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
+                uKpts_a_local = build_uKpts(kmf, kGrid2, mo_coeff_kpts2, rptGrid3D=rptGrid3D, nbands=nbands)
+                uKpts_b_local = build_uKpts(kmf, kGrid3, mo_coeff_kpts3, rptGrid3D=rptGrid3D, nbands=nbands) # SJQ checked
+
+            L_delta = Lvec_real / local_NsCell[:, None]
+            return {
+                'label': label,
+                'N_local': local_NsCell.copy(),
+                'sq_ke_cutoff': sq_ke_cutoff_value,
+                'rptGrid3D': rptGrid3D,
+                'dvol': np.abs(np.linalg.det(L_delta)),
+                'uKpts_i': uKpts_i_local[:,:nocc,:],
+                'uKpts_j': uKpts_j_local[:,:nocc,:],
+                'uKpts_a': uKpts_a_local[:,nocc:,:],
+                'uKpts_b': uKpts_b_local[:,nocc:,:],
+                'conj_uKpts_i': np.conj(uKpts_i_local[:,:nocc,:]),
+            }
+
+        full_context = build_mesh_context(
+            'inner',
+            NsCell,
+            grids.RptGrid3D_coarse,
+            None if full_sq_ke_cutoff is None else float(full_sq_ke_cutoff),
+        )
+        mesh_contexts = {'inner': full_context}
+        if adaptive_sq_ke_cutoff:
+            outer_sq_ke_cutoff = outer_sq_ke_cutoff_scale * full_sq_ke_cutoff
+            outer_NsCell = cutoff_to_mesh(kmf.cell.lattice_vectors(), outer_sq_ke_cutoff)
+            outer_rptGrid3D = self._build_coarse_real_space_grid(kmf.cell, outer_NsCell)
+            mesh_contexts['outer'] = build_mesh_context(
+                'outer',
+                outer_NsCell,
+                outer_rptGrid3D,
+                outer_sq_ke_cutoff,
+            )
+        profile.stop("uKpts construction", phase_t0)
+
         # SqG = pymp.shared.array((nkpts, nG), dtype=np.float64)
         nqG = qG_full.shape[0]
-        nG = np.prod(NsCell)
+        nG = np.prod(full_context['N_local'])
         print("MP2StructureFactorTruncated nG: ", nG)
+        if adaptive_sq_ke_cutoff:
+            print("MP2StructureFactorTruncated outer nG: ", np.prod(mesh_contexts['outer']['N_local']))
         print("MP2StructureFactorTruncated nqG: ", nqG)
         SqG_full_direct = np.zeros(nqG, dtype=np.float64)
         SqG_full_exchange = np.zeros(nqG, dtype=np.float64)
@@ -290,6 +354,17 @@ class MP2StructureFactor(StructureFactor):
         SqG_full_direct_mask = np.ones(qG_full.shape[0], dtype=bool)
         SqG_full_exchange_mask = np.ones(qG_full.shape[0], dtype=bool)
         SqG_full_q4_mask = np.ones(qG_full.shape[0], dtype=bool)
+        qG_norms = np.linalg.norm(qG_full, axis=1)
+        if adaptive_sq_ke_cutoff:
+            qG_uses_outer_mesh = qG_norms > sq_ke_cutoff_switch_radius + 1e-8
+            sq_ke_cutoff_by_qG = np.where(
+                qG_uses_outer_mesh,
+                mesh_contexts['outer']['sq_ke_cutoff'],
+                mesh_contexts['inner']['sq_ke_cutoff'],
+            )
+        else:
+            qG_uses_outer_mesh = np.zeros(qG_full.shape[0], dtype=bool)
+            sq_ke_cutoff_by_qG = None
         q4_decay_state = None
         exchange_decay_state = None
         if dG0 and "direct_q4" in line_sampling_decay_components:
@@ -434,6 +509,14 @@ class MP2StructureFactor(StructureFactor):
 
             # Find qi index
             region_t0 = profile.start()
+            mesh_context = mesh_contexts['outer'] if qG_uses_outer_mesh[qG] else mesh_contexts['inner']
+            rptGrid3D = mesh_context['rptGrid3D']
+            dvol = mesh_context['dvol']
+            uKpts_i = mesh_context['uKpts_i']
+            uKpts_j = mesh_context['uKpts_j']
+            uKpts_a = mesh_context['uKpts_a']
+            uKpts_b = mesh_context['uKpts_b']
+            conj_uKpts_i = mesh_context['conj_uKpts_i']
             qi = qi_map[qG]
             qpt = qGrid[qi]
             if compute_exchange and t2_store_type == 'kikjka':
@@ -777,6 +860,11 @@ class MP2StructureFactor(StructureFactor):
             self.SqG_full_q4_mask = SqG_full_q4_mask
             self.line_sampling_decay_events = line_sampling_decay_events
             self.qG_full = qG_full
+            self.sq_ke_cutoff_by_qG = sq_ke_cutoff_by_qG
+            self.N_local_by_region = {
+                key: value['N_local'].copy()
+                for key, value in mesh_contexts.items()
+            }
             profile.stop("class result update", phase_t0)
                 
         # Find zero index
@@ -796,6 +884,11 @@ class MP2StructureFactor(StructureFactor):
             'SqG_full_exchange_mask': SqG_full_exchange_mask,
             'SqG_full_q4_mask': SqG_full_q4_mask,
             'line_sampling_decay_events': line_sampling_decay_events,
+            'sq_ke_cutoff_by_qG': sq_ke_cutoff_by_qG,
+            'N_local_by_region': {
+                key: value['N_local'].copy()
+                for key, value in mesh_contexts.items()
+            },
             'qG_full': qG_full,
         }
         self.last_build_timings = profile.summary(total_t0)

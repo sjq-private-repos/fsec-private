@@ -13,6 +13,7 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2DirectFullSS,
     MP2DirectSecondOrderSS,
     MP2ExchangeSS,
+    MP2SSOptions,
 )
 
 
@@ -79,6 +80,19 @@ class PrintResultsTests(unittest.TestCase):
         self.assertNotIn("Direct Term:\n", result)
         self.assertIn("Exchange Term:\n", result)
         self.assertIn("Final Energies:", result)
+
+
+class MP2SSOptionsTests(unittest.TestCase):
+    def test_adaptive_sq_ke_cutoff_options(self):
+        options = MP2SSOptions(
+            sq_ke_cutoff=100.0,
+            sq_ke_cutoff_switch_radius=2.5,
+            outer_sq_ke_cutoff_scale=0.25,
+        )
+
+        self.assertEqual(options.sq_ke_cutoff, 100.0)
+        self.assertEqual(options.sq_ke_cutoff_switch_radius, 2.5)
+        self.assertEqual(options.outer_sq_ke_cutoff_scale, 0.25)
 
 
 class KnownValues(unittest.TestCase):
