@@ -18,7 +18,15 @@ from pyscf.lib.numpy_helper import einsum as pyscf_einsum
 
 
 from fsec.singularity_subtraction.structure_factor import StructureFactor
-from fsec.singularity_subtraction.structure_factor.helpers_sf import build_uKpts, TimingProfile
+from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+    TimingProfile,
+    build_uKpts,
+    filter_line_sampling_segments,
+    make_line_sampling_decay_state,
+    normalize_line_sampling_decay_components,
+    should_compute_line_sample,
+    update_line_sampling_decay_mask,
+)
 
 class MP2StructureFactor(StructureFactor):
     def __init__(self, kmf, kmp, t2=None, N_local=None, sq_ke_cutoff=None, qG_cutoff=None, relative_shift=0.0, **kwargs):
@@ -71,7 +79,11 @@ class MP2StructureFactor(StructureFactor):
                                update_class=True, qG_cutoff=None, dG0=False,
                                grids=None, mo_coeff_kpts1=None, mo_coeff_kpts2=None, mo_coeff_kpts3=None, 
                                kmf=None, t2=None, mo_energy=None, mo_e_o=None, mo_e_v=None, mo_e_v_b=None,
-                               t2_store_type=None, Lov=None, Lov_b=None, kmp=None, verbose=None):
+                               t2_store_type=None, Lov=None, Lov_b=None, kmp=None, verbose=None,
+                               line_sampling_decay_min_fraction=None,
+                               line_sampling_decay_consecutive_below=3,
+                               line_sampling_decay_components=(),
+                               qG_line_sampling_segments=None):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -140,6 +152,9 @@ class MP2StructureFactor(StructureFactor):
         
         if qG_cutoff is None:
             qG_cutoff = self.qG_cutoff
+
+        line_sampling_decay_components = normalize_line_sampling_decay_components(
+            line_sampling_decay_components, supported_components={"direct_q4"})
         
         if mo_coeff_kpts1 is None:
             mo_coeff_kpts1 = mo_coeff_padded
@@ -265,10 +280,25 @@ class MP2StructureFactor(StructureFactor):
         num_equiv_qG = 0
 
         phase_t0 = profile.start()
-        qG_full = qG_full[np.linalg.norm(qG_full, axis=1) < qG_cutoff + 1e-8,:]
+        qG_keep_mask = np.linalg.norm(qG_full, axis=1) < qG_cutoff + 1e-8
+        qG_line_sampling_segments = filter_line_sampling_segments(
+            qG_line_sampling_segments, qG_keep_mask)
+        qG_full = qG_full[qG_keep_mask,:]
         SqG_full_direct = np.zeros(qG_full.shape[0], dtype=np.float64)
         SqG_full_exchange = np.zeros(qG_full.shape[0], dtype=np.float64)
         SqG_full_q4 = np.zeros(qG_full.shape[0], dtype=np.float64)
+        SqG_full_q4_mask = np.ones(qG_full.shape[0], dtype=bool)
+        q4_decay_state = None
+        if dG0 and "direct_q4" in line_sampling_decay_components:
+            q4_decay_state = make_line_sampling_decay_state(
+                qG_full,
+                qG_line_sampling_segments,
+                line_sampling_decay_min_fraction,
+                line_sampling_decay_consecutive_below,
+                power=4,
+            )
+            if q4_decay_state is not None:
+                SqG_full_q4_mask[:] = False
         if t2_required and t2_store_type == 'kikjka':
             # Convert ki,kj,q -> qi,ki,kj
             t2 = t2.transpose(2, 0, 1, 3, 4, 5, 6)
@@ -359,35 +389,38 @@ class MP2StructureFactor(StructureFactor):
             # First, see if S(-qG) has already been computed
             # precompute all idx_kpta and idx_kptb for all kpts
             qGpt = qG_full[qG, :]
+            compute_direct = direct
+            compute_exchange = exchange
+            compute_q4 = dG0 and should_compute_line_sample(qG, q4_decay_state)
             region_t0 = profile.start()
             if self.sq_inversion_symm and qG > 1:
                 equiv_qG_index = inversion_partner[qG]
                 if equiv_qG_index < qG:
                     num_equiv_qG += 1
-                    if direct:
+                    if compute_direct:
                         SqG_full_direct[qG] = SqG_full_direct[equiv_qG_index]
-                    if exchange:
+                    if compute_exchange:
                         SqG_full_exchange[qG] = SqG_full_exchange[equiv_qG_index]
-                    if dG0:
+                    if compute_q4:
                         SqG_full_q4[qG] = SqG_full_q4[equiv_qG_index]
+                        SqG_full_q4_mask[qG] = SqG_full_q4_mask[equiv_qG_index]
                     profile.stop("inversion-symmetry reuse", region_t0)
                     continue
             profile.stop("inversion-symmetry lookup", region_t0)
-                
 
-            
+            if not compute_direct and not compute_exchange and not compute_q4:
+                continue
 
             # Find qi index
             region_t0 = profile.start()
             qi = qi_map[qG]
             qpt = qGrid[qi]
-            if exchange and t2_store_type == 'kikjka':
+            if compute_exchange and t2_store_type == 'kikjka':
                 qpis = qpis_full[qi] # nkpts x nkpts.
 
             t2_qi = None
             if t2_required and t2_store_type == 'kikjka':  
                 t2_qi = t2[qi]
-            
 
             kptas = kGrid1 + qGpt
             kptbs = kGrid1 - qGpt
@@ -450,9 +483,9 @@ class MP2StructureFactor(StructureFactor):
                 # O(Nk) memory scaling pathway
                 oovv_ij = None
                 oovv_ji = None
-                if exchange:
+                if compute_exchange:
                     oovv_ji = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff_kpts1[0].dtype)
-                if direct:
+                if compute_direct:
                     oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff_kpts1[0].dtype)
 
                 for ki in range(nkpts):
@@ -471,7 +504,7 @@ class MP2StructureFactor(StructureFactor):
                             else: 
                                 raise ValueError("Lov must be a 3D or 4D array")
 
-                            if direct:
+                            if compute_direct:
                                 Lov_kika = None
                                 Lov_kjkb = None
                                 if Lov_linear_scaling:
@@ -486,7 +519,7 @@ class MP2StructureFactor(StructureFactor):
                                     Lov_kika, Lov_kjkb
                                 ).transpose(0,2,1,3)
 
-                            if exchange:
+                            if compute_exchange:
                                 oovv_ji[kj] = (1./nkpts) * lib.einsum(
                                     "Lia,Ljb->iajb",
                                     Lov_b[ki, kb], Lov[kj, ka]
@@ -497,13 +530,13 @@ class MP2StructureFactor(StructureFactor):
                             orbo_j = mo_coeff_kpts1[kj][:,:nocc]
                             orbv_a = mo_coeff_kpts2[ka][:,nocc:]
                             orbv_b = mo_coeff_kpts3[kb][:,nocc:]
-                            if direct:
+                            if compute_direct:
                                 oovv_ij[kj] = fao2mo(
                                     (orbo_i,orbv_a,orbo_j,orbv_b),
                                     (kGrid1[ki],kGrid2[ka],kGrid1[kj],kGrid3[kb]),
                                     compact=False
                                 ).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
-                            if exchange:
+                            if compute_exchange:
                                 oovv_ji[kj] = fao2mo(
                                     (orbo_i,orbv_b,orbo_j,orbv_a),
                                     (kGrid1[ki],kGrid3[kb],kGrid1[kj],kGrid2[ka]),
@@ -517,19 +550,19 @@ class MP2StructureFactor(StructureFactor):
                     region_t0 = profile.start()
                     rijab_ki = np.einsum('ia,nbj->nijab', rho_ia_full[ki], rho_jb_full.conj()) * dvol**2 / (nkpts * omega_cell)
                     profile.stop("rijab construction (ki path)", region_t0)
-                    if direct or dG0:
+                    if compute_direct or compute_q4:
                         region_t0 = profile.start()
                         eijab_ki = mo_e_o[ki,None,:,None,None,None] + mo_e_o[:,None,:,None,None] \
                             -mo_e_v[ka,None,None,None,:,None] - mo_e_v_b[kbs_at_qi,None,None,None,:]
                         profile.stop("energy denominators (ki path)", region_t0)
 
-                    if direct:
+                    if compute_direct:
                         region_t0 = profile.start()
                         t2_ki = np.conj(oovv_ij / eijab_ki) # kj, i, j, a, b
                         temp_SqG_k = 2 * pyscf_einsum('nijab,nijab->', rijab_ki, t2_ki) 
                         SqG_full_direct[qG] += temp_SqG_k.real / nkpts
                         profile.stop("direct contraction (ki path)", region_t0)
-                    if exchange:
+                    if compute_exchange:
                         region_t0 = profile.start()
                         eijba_ki = mo_e_o[ki,None,:,None,None,None] + mo_e_o[:,None,:,None,None] \
                             -mo_e_v_b[kbs_at_qi,None,None,:,None] - mo_e_v[ka,None,None,None,None,:]
@@ -537,11 +570,21 @@ class MP2StructureFactor(StructureFactor):
                         temp_SqG_k = - pyscf_einsum('nijab,nijba->', rijab_ki, t2_ki_x) 
                         SqG_full_exchange[qG] += temp_SqG_k.real / nkpts
                         profile.stop("exchange contraction (ki path)", region_t0)
-                    if dG0:
+                    if compute_q4:
                         region_t0 = profile.start()
                         temp_SqG_k =  2 * np.sum(np.abs(rijab_ki)**2 / eijab_ki)
                         SqG_full_q4[qG] += temp_SqG_k.real / nkpts
                         profile.stop("dG0 contraction (ki path)", region_t0)
+
+                if compute_q4:
+                    update_line_sampling_decay_mask(
+                        SqG_full_q4_mask,
+                        qG,
+                        SqG_full_q4[qG],
+                        np.linalg.norm(qGpt),
+                        q4_decay_state,
+                        qGpt=qGpt,
+                    )
 
                 oovv_ij = None
                 oovv_ji = None
@@ -554,7 +597,7 @@ class MP2StructureFactor(StructureFactor):
                 rijab = rijab.ravel()
                 profile.stop("rijab tensor contraction", region_t0)
                 
-                if direct:
+                if compute_direct:
 
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('direct', int(qi))
@@ -579,7 +622,7 @@ class MP2StructureFactor(StructureFactor):
                     
                     SqG_full_direct[qG] += temp_SqG_k.real / nkpts
                     profile.stop("direct final contraction", region_t0)
-                if exchange:
+                if compute_exchange:
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('exchange', int(qi))
                         if cache_key in t2_cache:
@@ -614,7 +657,7 @@ class MP2StructureFactor(StructureFactor):
                     SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
                     profile.stop("exchange final contraction", region_t0)
                 
-                if dG0:
+                if compute_q4:
                     region_t0 = profile.start()
                     if t2_store_type == 'kikj':
                         ka_at_qi = kas[qi]
@@ -641,9 +684,27 @@ class MP2StructureFactor(StructureFactor):
                         temp_SqG_k_q4 = -2 * pyscf_einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj()) #NEW 3/3/26
                     SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
                     profile.stop("dG0 final contraction", region_t0)
+                    update_line_sampling_decay_mask(
+                        SqG_full_q4_mask,
+                        qG,
+                        SqG_full_q4[qG],
+                        np.linalg.norm(qGpt),
+                        q4_decay_state,
+                        qGpt=qGpt,
+                    )
         profile.stop("main qG loop (inclusive)", loop_t0)
 
         log.note("Number of equivalent qG points: %d", num_equiv_qG)
+        line_sampling_decay_events = []
+        if q4_decay_state is not None:
+            line_sampling_decay_events = q4_decay_state["stop_events"]
+            for event in line_sampling_decay_events:
+                log.note(
+                    "Line-sampling decay reached for direct_q4 on B_index %d at |q+G| %.8g "
+                    "(qG index %d, normalized %.8g < threshold %.8g)",
+                    event["B_index"], event["qG_norm"], event["qG_index"],
+                    event["normalized_contribution"], event["threshold"],
+                )
         if kikj_on_the_fly:
             cache_mem = sum(value.nbytes for value in t2_cache.values()) / 1024**2
             log.note(
@@ -657,6 +718,8 @@ class MP2StructureFactor(StructureFactor):
             self.SqG_full_direct = SqG_full_direct
             self.SqG_full_exchange = SqG_full_exchange
             self.SqG_full_q4 = SqG_full_q4
+            self.SqG_full_q4_mask = SqG_full_q4_mask
+            self.line_sampling_decay_events = line_sampling_decay_events
             self.qG_full = qG_full
             profile.stop("class result update", phase_t0)
                 
@@ -673,6 +736,8 @@ class MP2StructureFactor(StructureFactor):
             'SqG_full_direct': SqG_full_direct,
             'SqG_full_exchange': SqG_full_exchange,
             'SqG_full_q4': SqG_full_q4,
+            'SqG_full_q4_mask': SqG_full_q4_mask,
+            'line_sampling_decay_events': line_sampling_decay_events,
             'qG_full': qG_full,
         }
         self.last_build_timings = profile.summary(total_t0)

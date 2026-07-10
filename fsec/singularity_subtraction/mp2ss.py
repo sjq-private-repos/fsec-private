@@ -114,6 +114,16 @@ class MP2SSOptions:
     line_sampling
         Sample q+G only along reciprocal-lattice directions when building the
         structure factor.
+    line_sampling_decay_min_fraction
+        Minimum retained line-sampled contribution, as a fraction of the first
+        nonzero point on each line. Use ``None`` or ``0`` to disable decay
+        filtering.
+    line_sampling_decay_consecutive_below
+        Number of consecutive below-threshold points required before skipping
+        the rest of a sampled line.
+    line_sampling_decay_components
+        Structure-factor components eligible for line-sampling decay filtering.
+        Only ``"direct_q4"`` is implemented currently.
     t2_store_type
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, and ``"ki"``, ranging from largest to smallest
@@ -142,6 +152,9 @@ class MP2SSOptions:
     fit_with_coul_q4: bool = True
     fit_with_coul_q2: bool = True
     line_sampling: bool = False
+    line_sampling_decay_min_fraction: object = 0.1
+    line_sampling_decay_consecutive_below: int = 3
+    line_sampling_decay_components: object = ("direct_q4",)
     t2_store_type: str = 'kikjka'
     correct_q2_q4_separately: bool = True
 
@@ -320,7 +333,7 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
                 deg=spec.get('deg', 4))
         return m, initial_params, spec.get('fit_multipliers')
 
-    def optimize_parameters(self, *, SqG_full_q4, qG_full, grids, nks):
+    def optimize_parameters(self, *, SqG_full_q4, qG_full, grids, nks, q4_fit_mask=None):
         config = self.config
 
         Lvec_recip = config.cell.reciprocal_vectors()
@@ -343,8 +356,16 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
         fit_method_q4 = config.fit_class(f_q4, fit_with_coul=config.fit_with_coul_q4)
         fit_method_q4.initial_guess = initial_params
         fit_method_q4.coul_deg = 4 if config.fit_with_coul_q4 else None
+        if q4_fit_mask is None:
+            q4_fit_mask = np.ones(qGlocal_fit.shape[0], dtype=bool)
+        else:
+            q4_fit_mask = np.asarray(q4_fit_mask, dtype=bool)
+            if q4_fit_mask.shape[0] != qGlocal_fit.shape[0]:
+                raise ValueError("q4_fit_mask must have the same length as qG_full")
         if config.qG_norm_cutoff is not None:
-            mask = np.linalg.norm(qGlocal_fit, axis=1) <= config.qG_norm_cutoff
+            mask = (np.linalg.norm(qGlocal_fit, axis=1) <= config.qG_norm_cutoff) & q4_fit_mask
+            if not np.any(mask):
+                raise ValueError("No q4 fitting points remain after applying q4_fit_mask")
             print(f"Fitting with {len(qGlocal_fit[mask])} points")
             print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
             SqG_vals = SqG_full_q4[mask]
@@ -356,8 +377,10 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
                 jac=jac, x_scale='jac', max_nfev=1000 * f_q4.num_params
             )
         else:
+            if not np.any(q4_fit_mask):
+                raise ValueError("No q4 fitting points remain after applying q4_fit_mask")
             fitted_params_q4 = fit_method_q4.fit_model(
-                qGlocal_fit, SqG_full_q4, fit_multipliers=fit_multipliers,
+                qGlocal_fit[q4_fit_mask], SqG_full_q4[q4_fit_mask], fit_multipliers=fit_multipliers,
                 fixed_params=fixed_params, force_positive_params=force_positive_params,
                 jac=jac, x_scale='jac', max_nfev=1000 * f_q4.num_params
             )
@@ -379,7 +402,8 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
         prefactor_q4 = 4 * np.pi * (4 * np.pi) * numKpt3D / omega_star
         return prefactor_q4 * f_q4.coulomb_integral(coul_deg=4)
 
-    def compute_correction(self, *, SqG_full_q4=None, qG_full=None, grids=None, nks=None):
+    def compute_correction(self, *, SqG_full_q4=None, qG_full=None, grids=None, nks=None,
+                           q4_fit_mask=None):
         if SqG_full_q4 is None:
             raise ValueError("SqG_full_q4 must be provided explicitly")
         if qG_full is None:
@@ -394,6 +418,7 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
             qG_full=qG_full,
             grids=grids,
             nks=nks,
+            q4_fit_mask=q4_fit_mask,
         )
         if optimized is None:
             return None
@@ -902,6 +927,9 @@ class MP2SS:
         self.fit_with_coul_q4 = options.fit_with_coul_q4
         self.fit_with_coul_q2 = options.fit_with_coul_q2
         self.line_sampling = options.line_sampling
+        self.line_sampling_decay_min_fraction = options.line_sampling_decay_min_fraction
+        self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
+        self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
         
         
@@ -1006,6 +1034,10 @@ class MP2SS:
 
         mp2_structure_factor.build_structure_factor(
             qG_full=qG_full, direct=direct, exchange=exchange, dG0=dG0,
+            line_sampling_decay_min_fraction=self.line_sampling_decay_min_fraction if line_sampling else None,
+            line_sampling_decay_consecutive_below=self.line_sampling_decay_consecutive_below,
+            line_sampling_decay_components=self.line_sampling_decay_components if line_sampling else (),
+            qG_line_sampling_segments=getattr(mp2_structure_factor.grids, "qG_line_sampling_segments", None),
         )
 
         if self.t2_store_type == 'kikjka':
@@ -1021,6 +1053,7 @@ class MP2SS:
         if qG_full is None:
             qG_full = self.mp2_structure_factor.qG_full
         SqG_full_q4 = self.mp2_structure_factor.SqG_full_q4 if self.dG0 else None
+        SqG_full_q4_mask = getattr(self.mp2_structure_factor, "SqG_full_q4_mask", None)
 
         self.direct_integral_term_q2 = None
         self.direct_quadrature_term_q2 = None
@@ -1037,7 +1070,10 @@ class MP2SS:
                 raise ValueError("SqG_full_q4 must be available when correct_q2_q4_separately=True")
             denominator = np.linalg.norm(qG_full, axis=1) ** 2
             denominator[denominator < 1e-8] = np.inf
-            SqG_full_q2_part = SqG_full_direct - (4 * np.pi) * SqG_full_q4 / denominator
+            SqG_full_q4_for_q2 = SqG_full_q4
+            if SqG_full_q4_mask is not None:
+                SqG_full_q4_for_q2 = np.where(SqG_full_q4_mask, SqG_full_q4, 0.0)
+            SqG_full_q2_part = SqG_full_direct - (4 * np.pi) * SqG_full_q4_for_q2 / denominator
 
             second_order_config = self._build_direct_second_order_correction_config()
             fourth_order_config = self._build_direct_fourth_order_correction_config()
@@ -1056,6 +1092,7 @@ class MP2SS:
                 qG_full=qG_full,
                 grids=self.grids,
                 nks=self.nks,
+                q4_fit_mask=SqG_full_q4_mask,
             )
             if q2_result is None or q4_result is None:
                 return None

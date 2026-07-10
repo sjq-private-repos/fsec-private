@@ -11,9 +11,89 @@ except ImportError:
 
 try:
     from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
+    from fsec.singularity_subtraction.grids import ExxSSGrids
+    from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+        make_line_sampling_decay_state,
+        normalize_line_sampling_decay_components,
+        should_compute_line_sample,
+        update_line_sampling_decay_mask,
+    )
     HAS_MP2_IMPORT = True
 except ImportError:
     HAS_MP2_IMPORT = False
+
+
+@unittest.skipUnless(HAS_MP2_IMPORT, "fsec structure_factor deps are required")
+class LineSamplingDecayHelpers(unittest.TestCase):
+    def test_line_sampling_decay_rejects_unimplemented_components(self):
+        with self.assertRaises(NotImplementedError):
+            normalize_line_sampling_decay_components(
+                ("direct_q2",), supported_components={"direct_q4"})
+
+    def test_line_sampling_decay_stops_after_consecutive_below_values(self):
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [7.0, 0.0, 0.0],
+        ])
+        segments = [{
+            "line_index": 0,
+            "B_index": 0,
+            "step_vector": np.array([1.0, 0.0, 0.0]),
+            "q_min": qG_full[1],
+            "indices": np.arange(1, len(qG_full)),
+        }]
+        state = make_line_sampling_decay_state(
+            qG_full, segments, min_fraction=0.1, consecutive_below=3, power=4)
+        mask = np.zeros(len(qG_full), dtype=bool)
+
+        normalized_values = [1.0, 0.05, 0.2, 0.04, 0.03, 0.02, 0.9]
+        for index, normalized_value in enumerate(normalized_values, start=1):
+            self.assertTrue(should_compute_line_sample(index, state))
+            norm = np.linalg.norm(qG_full[index])
+            value = normalized_value * norm**4
+            update_line_sampling_decay_mask(
+                mask, index, value, norm, state, qGpt=qG_full[index])
+            if index == 6:
+                break
+
+        self.assertTrue(mask[1])
+        self.assertFalse(mask[2])
+        self.assertTrue(mask[3])
+        self.assertFalse(mask[4])
+        self.assertFalse(mask[5])
+        self.assertFalse(mask[6])
+        self.assertFalse(should_compute_line_sample(7, state))
+        self.assertEqual(len(state["stop_events"]), 1)
+        stop_event = state["stop_events"][0]
+        self.assertEqual(stop_event["B_index"], 0)
+        self.assertEqual(stop_event["qG_index"], 6)
+        self.assertAlmostEqual(stop_event["qG_norm"], 6.0)
+        self.assertTrue(np.allclose(stop_event["qG"], qG_full[6]))
+
+    def test_build_qG_line_sampling_stores_segments(self):
+        class DummyCell:
+            def reciprocal_vectors(self):
+                return np.eye(3)
+
+        grids = ExxSSGrids.__new__(ExxSSGrids)
+        grids.cell = DummyCell()
+        grids.nks = np.ones(3, dtype=int)
+        grids.qG_norm_cutoff = 4.1
+
+        qG_full = ExxSSGrids.build_qG_line_sampling(grids)
+
+        self.assertTrue(np.allclose(qG_full[0], np.zeros(3)))
+        self.assertEqual(len(grids.qG_line_sampling_segments), 3)
+        self.assertEqual(grids.qG_line_sampling_metadata["origin_index"], 0)
+        for segment in grids.qG_line_sampling_segments:
+            self.assertEqual(len(segment["indices"]), 3)
+            self.assertTrue(np.allclose(qG_full[segment["indices"][0]], segment["q_min"]))
 
 
 @unittest.skipUnless(HAS_PYSCF and HAS_MP2_IMPORT, "PySCF and fsec structure_factor deps are required")
@@ -259,6 +339,36 @@ class KnownValues(unittest.TestCase):
 
         self.assertAlmostEqual(actual.real, reference.real, places=14)
         self.assertAlmostEqual(actual.imag, reference.imag, places=14)
+
+    def test_line_sampling_q4_decay_mask_can_exclude_points(self):
+        mp2_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        mp2_sf.set_grids(min_fit_points=10)
+        qG_full = mp2_sf.grids.build_qG_line_sampling()
+        result = mp2_sf.build_structure_factor(
+            qG_full=qG_full,
+            direct=True,
+            exchange=True,
+            dG0=True,
+            line_sampling_decay_min_fraction=10.0,
+            line_sampling_decay_consecutive_below=1,
+            line_sampling_decay_components=("direct_q4",),
+            qG_line_sampling_segments=mp2_sf.grids.qG_line_sampling_segments,
+        )
+
+        q4_mask = result["SqG_full_q4_mask"]
+        self.assertEqual(len(q4_mask), len(result["qG_full"]))
+        self.assertTrue(q4_mask[0])
+        self.assertTrue(np.any(~q4_mask))
+        self.assertTrue(np.all(np.isfinite(result["SqG_full_q4"])))
+        self.assertIn("line_sampling_decay_events", result)
 
     def test_build_structure_factor_112_kmesh(self):
         mp2_sf = MP2StructureFactor(
