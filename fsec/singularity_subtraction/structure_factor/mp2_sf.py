@@ -154,7 +154,7 @@ class MP2StructureFactor(StructureFactor):
             qG_cutoff = self.qG_cutoff
 
         line_sampling_decay_components = normalize_line_sampling_decay_components(
-            line_sampling_decay_components, supported_components={"direct_q4"})
+            line_sampling_decay_components, supported_components={"direct_q4", "exchange"})
         
         if mo_coeff_kpts1 is None:
             mo_coeff_kpts1 = mo_coeff_padded
@@ -287,8 +287,11 @@ class MP2StructureFactor(StructureFactor):
         SqG_full_direct = np.zeros(qG_full.shape[0], dtype=np.float64)
         SqG_full_exchange = np.zeros(qG_full.shape[0], dtype=np.float64)
         SqG_full_q4 = np.zeros(qG_full.shape[0], dtype=np.float64)
+        SqG_full_direct_mask = np.ones(qG_full.shape[0], dtype=bool)
+        SqG_full_exchange_mask = np.ones(qG_full.shape[0], dtype=bool)
         SqG_full_q4_mask = np.ones(qG_full.shape[0], dtype=bool)
         q4_decay_state = None
+        exchange_decay_state = None
         if dG0 and "direct_q4" in line_sampling_decay_components:
             q4_decay_state = make_line_sampling_decay_state(
                 qG_full,
@@ -298,7 +301,19 @@ class MP2StructureFactor(StructureFactor):
                 power=4,
             )
             if q4_decay_state is not None:
+                if direct:
+                    SqG_full_direct_mask[:] = False
                 SqG_full_q4_mask[:] = False
+        if exchange and "exchange" in line_sampling_decay_components:
+            exchange_decay_state = make_line_sampling_decay_state(
+                qG_full,
+                qG_line_sampling_segments,
+                line_sampling_decay_min_fraction,
+                line_sampling_decay_consecutive_below,
+                power=2,
+            )
+            if exchange_decay_state is not None:
+                SqG_full_exchange_mask[:] = False
         if t2_required and t2_store_type == 'kikjka':
             # Convert ki,kj,q -> qi,ki,kj
             t2 = t2.transpose(2, 0, 1, 3, 4, 5, 6)
@@ -390,7 +405,11 @@ class MP2StructureFactor(StructureFactor):
             # precompute all idx_kpta and idx_kptb for all kpts
             qGpt = qG_full[qG, :]
             compute_direct = direct
+            if direct and q4_decay_state is not None:
+                compute_direct = should_compute_line_sample(qG, q4_decay_state)
             compute_exchange = exchange
+            if exchange and exchange_decay_state is not None:
+                compute_exchange = should_compute_line_sample(qG, exchange_decay_state)
             compute_q4 = dG0 and should_compute_line_sample(qG, q4_decay_state)
             region_t0 = profile.start()
             if self.sq_inversion_symm and qG > 1:
@@ -399,8 +418,10 @@ class MP2StructureFactor(StructureFactor):
                     num_equiv_qG += 1
                     if compute_direct:
                         SqG_full_direct[qG] = SqG_full_direct[equiv_qG_index]
+                        SqG_full_direct_mask[qG] = SqG_full_direct_mask[equiv_qG_index]
                     if compute_exchange:
                         SqG_full_exchange[qG] = SqG_full_exchange[equiv_qG_index]
+                        SqG_full_exchange_mask[qG] = SqG_full_exchange_mask[equiv_qG_index]
                     if compute_q4:
                         SqG_full_q4[qG] = SqG_full_q4[equiv_qG_index]
                         SqG_full_q4_mask[qG] = SqG_full_q4_mask[equiv_qG_index]
@@ -585,6 +606,17 @@ class MP2StructureFactor(StructureFactor):
                         q4_decay_state,
                         qGpt=qGpt,
                     )
+                    if direct and q4_decay_state is not None:
+                        SqG_full_direct_mask[qG] = SqG_full_q4_mask[qG]
+                if compute_exchange:
+                    update_line_sampling_decay_mask(
+                        SqG_full_exchange_mask,
+                        qG,
+                        SqG_full_exchange[qG],
+                        np.linalg.norm(qGpt),
+                        exchange_decay_state,
+                        qGpt=qGpt,
+                    )
 
                 oovv_ij = None
                 oovv_ji = None
@@ -656,6 +688,14 @@ class MP2StructureFactor(StructureFactor):
                     
                     SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
                     profile.stop("exchange final contraction", region_t0)
+                    update_line_sampling_decay_mask(
+                        SqG_full_exchange_mask,
+                        qG,
+                        SqG_full_exchange[qG],
+                        np.linalg.norm(qGpt),
+                        exchange_decay_state,
+                        qGpt=qGpt,
+                    )
                 
                 if compute_q4:
                     region_t0 = profile.start()
@@ -692,15 +732,29 @@ class MP2StructureFactor(StructureFactor):
                         q4_decay_state,
                         qGpt=qGpt,
                     )
+                    if direct and q4_decay_state is not None:
+                        SqG_full_direct_mask[qG] = SqG_full_q4_mask[qG]
         profile.stop("main qG loop (inclusive)", loop_t0)
 
         log.note("Number of equivalent qG points: %d", num_equiv_qG)
         line_sampling_decay_events = []
         if q4_decay_state is not None:
-            line_sampling_decay_events = q4_decay_state["stop_events"]
+            line_sampling_decay_events = list(q4_decay_state["stop_events"])
             for event in line_sampling_decay_events:
+                event["component"] = "direct_q4"
                 log.note(
                     "Line-sampling decay reached for direct_q4 on B_index %d at |q+G| %.8g "
+                    "(qG index %d, normalized %.8g < threshold %.8g)",
+                    event["B_index"], event["qG_norm"], event["qG_index"],
+                    event["normalized_contribution"], event["threshold"],
+                )
+        if exchange_decay_state is not None:
+            exchange_decay_events = list(exchange_decay_state["stop_events"])
+            line_sampling_decay_events.extend(exchange_decay_events)
+            for event in exchange_decay_events:
+                event["component"] = "exchange"
+                log.note(
+                    "Line-sampling decay reached for exchange on B_index %d at |q+G| %.8g "
                     "(qG index %d, normalized %.8g < threshold %.8g)",
                     event["B_index"], event["qG_norm"], event["qG_index"],
                     event["normalized_contribution"], event["threshold"],
@@ -718,6 +772,8 @@ class MP2StructureFactor(StructureFactor):
             self.SqG_full_direct = SqG_full_direct
             self.SqG_full_exchange = SqG_full_exchange
             self.SqG_full_q4 = SqG_full_q4
+            self.SqG_full_direct_mask = SqG_full_direct_mask
+            self.SqG_full_exchange_mask = SqG_full_exchange_mask
             self.SqG_full_q4_mask = SqG_full_q4_mask
             self.line_sampling_decay_events = line_sampling_decay_events
             self.qG_full = qG_full
@@ -736,6 +792,8 @@ class MP2StructureFactor(StructureFactor):
             'SqG_full_direct': SqG_full_direct,
             'SqG_full_exchange': SqG_full_exchange,
             'SqG_full_q4': SqG_full_q4,
+            'SqG_full_direct_mask': SqG_full_direct_mask,
+            'SqG_full_exchange_mask': SqG_full_exchange_mask,
             'SqG_full_q4_mask': SqG_full_q4_mask,
             'line_sampling_decay_events': line_sampling_decay_events,
             'qG_full': qG_full,

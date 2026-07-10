@@ -28,7 +28,7 @@ class LineSamplingDecayHelpers(unittest.TestCase):
     def test_line_sampling_decay_rejects_unimplemented_components(self):
         with self.assertRaises(NotImplementedError):
             normalize_line_sampling_decay_components(
-                ("direct_q2",), supported_components={"direct_q4"})
+                ("direct_q2",), supported_components={"direct_q4", "exchange"})
 
     def test_line_sampling_decay_stops_after_consecutive_below_values(self):
         qG_full = np.array([
@@ -364,9 +364,13 @@ class KnownValues(unittest.TestCase):
         )
 
         q4_mask = result["SqG_full_q4_mask"]
+        direct_mask = result["SqG_full_direct_mask"]
         self.assertEqual(len(q4_mask), len(result["qG_full"]))
+        self.assertEqual(len(direct_mask), len(result["qG_full"]))
         self.assertTrue(q4_mask[0])
+        self.assertTrue(direct_mask[0])
         self.assertTrue(np.any(~q4_mask))
+        np.testing.assert_array_equal(direct_mask, q4_mask)
         self.assertTrue(np.all(np.isfinite(result["SqG_full_q4"])))
         self.assertIn("line_sampling_decay_events", result)
 

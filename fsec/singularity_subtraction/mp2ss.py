@@ -123,7 +123,7 @@ class MP2SSOptions:
         the rest of a sampled line.
     line_sampling_decay_components
         Structure-factor components eligible for line-sampling decay filtering.
-        Only ``"direct_q4"`` is implemented currently.
+        Supported values are ``"direct_q4"`` and ``"exchange"``.
     t2_store_type
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, and ``"ki"``, ranging from largest to smallest
@@ -154,7 +154,7 @@ class MP2SSOptions:
     line_sampling: bool = False
     line_sampling_decay_min_fraction: object = 0.1
     line_sampling_decay_consecutive_below: int = 3
-    line_sampling_decay_components: object = ("direct_q4",)
+    line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
     correct_q2_q4_separately: bool = True
 
@@ -1053,6 +1053,7 @@ class MP2SS:
         if qG_full is None:
             qG_full = self.mp2_structure_factor.qG_full
         SqG_full_q4 = self.mp2_structure_factor.SqG_full_q4 if self.dG0 else None
+        SqG_full_direct_mask = getattr(self.mp2_structure_factor, "SqG_full_direct_mask", None)
         SqG_full_q4_mask = getattr(self.mp2_structure_factor, "SqG_full_q4_mask", None)
 
         self.direct_integral_term_q2 = None
@@ -1071,8 +1072,12 @@ class MP2SS:
             denominator = np.linalg.norm(qG_full, axis=1) ** 2
             denominator[denominator < 1e-8] = np.inf
             SqG_full_q4_for_q2 = SqG_full_q4
+            q2_fit_mask = np.ones(qG_full.shape[0], dtype=bool)
             if SqG_full_q4_mask is not None:
+                q2_fit_mask &= SqG_full_q4_mask
                 SqG_full_q4_for_q2 = np.where(SqG_full_q4_mask, SqG_full_q4, 0.0)
+            if SqG_full_direct_mask is not None:
+                q2_fit_mask &= SqG_full_direct_mask
             SqG_full_q2_part = SqG_full_direct - (4 * np.pi) * SqG_full_q4_for_q2 / denominator
 
             second_order_config = self._build_direct_second_order_correction_config()
@@ -1081,8 +1086,8 @@ class MP2SS:
 
             self.direct_second_order_correction = MP2DirectSecondOrderSS(second_order_config)
             q2_result = self.direct_second_order_correction.compute_correction(
-                SqG_full_q2_part=SqG_full_q2_part,
-                qG_full=qG_full,
+                SqG_full_q2_part=SqG_full_q2_part[q2_fit_mask],
+                qG_full=qG_full[q2_fit_mask],
                 grids=self.grids,
                 nks=self.nks,
             )
@@ -1142,6 +1147,10 @@ class MP2SS:
             SqG_full_exchange = self.mp2_structure_factor.SqG_full_exchange
         if qG_full is None:
             qG_full = self.mp2_structure_factor.qG_full
+        SqG_full_exchange_mask = getattr(self.mp2_structure_factor, "SqG_full_exchange_mask", None)
+        if SqG_full_exchange_mask is not None:
+            SqG_full_exchange = SqG_full_exchange[SqG_full_exchange_mask]
+            qG_full = qG_full[SqG_full_exchange_mask]
 
         result = self.exchange_correction.compute_correction(
             SqG_full_exchange=SqG_full_exchange,
