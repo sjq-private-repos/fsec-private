@@ -326,6 +326,117 @@ class KnownValues(unittest.TestCase):
         self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
         self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
 
+    def test_qG_batch_size_matches_scalar_without_trs(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+
+        scalar_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            check_trs=False,
+            sq_inversion_symm=False,
+        )
+        scalar = scalar_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True,
+            qG_batch_size=1)
+
+        batch_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            check_trs=False,
+            sq_inversion_symm=False,
+        )
+        batched = batch_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True,
+            qG_batch_size=3)
+
+        self.assertEqual(batch_sf.last_qG_batch_size, 3)
+        np.testing.assert_allclose(batched["qG_full"], scalar["qG_full"], atol=1e-12)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                batched[key], scalar[key], rtol=1e-7, atol=1e-10)
+
+    def test_qG_batch_size_matches_scalar_with_trs(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+
+        scalar_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        scalar = scalar_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True,
+            qG_batch_size=1)
+
+        batch_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        batched = batch_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True,
+            qG_batch_size=3)
+
+        self.assertEqual(batch_sf.last_qG_batch_size, 3)
+        np.testing.assert_allclose(batched["qG_full"], scalar["qG_full"], atol=1e-12)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                batched[key], scalar[key], rtol=1e-7, atol=1e-10)
+
+    def test_qG_batch_size_auto_respects_cell_memory(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+        original_max_memory = self.kmf.cell.max_memory
+        self.kmf.cell.max_memory = 0
+        try:
+            mp2_sf = MP2StructureFactor(
+                self.kmf,
+                self.kmp,
+                t2=self.t2,
+                N_local=self.N_local,
+                qG_cutoff=self.qG_cutoff,
+                min_points=10,
+                sq_inversion_symm=False,
+            )
+            result = mp2_sf.build_structure_factor(
+                qG_full=qG_full, direct=True, exchange=True, dG0=True,
+                qG_batch_size="auto")
+        finally:
+            self.kmf.cell.max_memory = original_max_memory
+
+        self.assertEqual(mp2_sf.last_qG_batch_size, 1)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            self.assertTrue(np.all(np.isfinite(result[key])))
+
     def test_contract_kikj_dG0_matches_old_expression(self):
         rng = np.random.default_rng(12)
         rijab = rng.normal(size=24) + 1j * rng.normal(size=24)

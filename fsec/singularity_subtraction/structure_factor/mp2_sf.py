@@ -79,6 +79,96 @@ class MP2StructureFactor(StructureFactor):
         return -2 * scale**2 * np.sum(np.abs(rijab)**2 * np.abs(eijab_recip).ravel())
 
     @staticmethod
+    def _estimate_pair_density_batch_bytes(nkpts, nocc, nvir, nG, dtype,
+                                           include_rho_jb=True):
+        """Estimate per-qG memory for batched pair-density construction."""
+        itemsize = np.dtype(dtype).itemsize
+        output_factor = 1 + int(include_rho_jb)
+        output_terms = output_factor * nkpts * nocc * nvir
+        temp_factor = output_factor
+        temp_terms = temp_factor * nG * (1 + nocc + nvir)
+        return int((output_terms + temp_terms) * itemsize)
+
+    @staticmethod
+    def _resolve_qG_batch_size(qG_batch_size, qG_batch_memory_fraction, kmf,
+                               nkpts, nocc, nvir, nG, dtype,
+                               include_rho_jb=True, max_nqG=None):
+        if isinstance(qG_batch_size, bool):
+            raise ValueError("qG_batch_size must be None, 1, a positive integer, or 'auto'")
+        if qG_batch_size is None or qG_batch_size == 1:
+            return 1
+        if isinstance(qG_batch_size, str):
+            if qG_batch_size != "auto":
+                raise ValueError("qG_batch_size must be None, 1, a positive integer, or 'auto'")
+            requested_size = None
+        else:
+            if int(qG_batch_size) != qG_batch_size:
+                raise ValueError("qG_batch_size must be None, 1, a positive integer, or 'auto'")
+            requested_size = int(qG_batch_size)
+            if requested_size < 1:
+                raise ValueError("qG_batch_size must be positive")
+            if requested_size == 1:
+                return 1
+
+        if qG_batch_memory_fraction <= 0:
+            raise ValueError("qG_batch_memory_fraction must be positive")
+
+        bytes_per_qG = MP2StructureFactor._estimate_pair_density_batch_bytes(
+            nkpts, nocc, nvir, nG, dtype, include_rho_jb=include_rho_jb)
+        mem_avail_mb = max(float(kmf.cell.max_memory) - lib.current_memory()[0], 0.0)
+        memory_budget_bytes = mem_avail_mb * float(qG_batch_memory_fraction) * 1e6
+        memory_limited_size = max(int(memory_budget_bytes // bytes_per_qG), 1)
+
+        if requested_size is None:
+            effective_size = memory_limited_size
+        else:
+            effective_size = min(requested_size, memory_limited_size)
+        if max_nqG is not None:
+            effective_size = min(effective_size, max(int(max_nqG), 1))
+        return max(effective_size, 1)
+
+    @staticmethod
+    def _build_pair_density_batch(cell, kGrid1, qGpts, rptGrid3D,
+                                  uKpts_i, uKpts_j, uKpts_a, uKpts_b,
+                                  conj_uKpts_i, kas_batch, kbs_batch,
+                                  kgrid_occ_trs, trs_map, check_trs):
+        qGpts = np.asarray(qGpts)
+        batch_size = qGpts.shape[0]
+        nkpts, nocc, nG = conj_uKpts_i.shape
+        nvir = uKpts_a.shape[1]
+        dtype = np.result_type(
+            conj_uKpts_i.dtype, uKpts_j.dtype, uKpts_a.dtype, uKpts_b.dtype,
+            np.complex128)
+        rho_ia_batch = np.empty((batch_size, nkpts, nocc, nvir), dtype=dtype)
+
+        kptas = kGrid1[None, :, :] + qGpts[:, None, :]
+        kptas_BZ = minimum_image(cell, kptas.reshape(-1, 3)).reshape(batch_size, nkpts, 3)
+        kGdiffas = kptas - kptas_BZ
+
+        for k in range(nkpts):
+            exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas[:, k, :].T)).T
+            phased_conj_ui = conj_uKpts_i[k][None, :, :] * exp_term_as[:, None, :]
+            u_a_T = uKpts_a[kas_batch[:, k]].transpose(0, 2, 1)
+            rho_ia_batch[:, k, :, :] = phased_conj_ui @ u_a_T
+
+        if kgrid_occ_trs and trs_map is not None and check_trs:
+            rho_jb_batch = rho_ia_batch[:, trs_map, :, :].transpose(0, 1, 3, 2)
+            return rho_ia_batch, rho_jb_batch
+
+        rho_jb_batch = np.empty((batch_size, nkpts, nvir, nocc), dtype=dtype)
+        kptbs = kGrid1[None, :, :] - qGpts[:, None, :]
+        kptbs_BZ = minimum_image(cell, kptbs.reshape(-1, 3)).reshape(batch_size, nkpts, 3)
+        kGdiffbs = kptbs - kptbs_BZ
+
+        for k in range(nkpts):
+            exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs[:, k, :].T)).T
+            phased_uj_T = (uKpts_j[k][None, :, :] * exp_term_bs[:, None, :]).transpose(0, 2, 1)
+            conj_u_b = np.conj(uKpts_b[kbs_batch[:, k]])
+            rho_jb_batch[:, k, :, :] = conj_u_b @ phased_uj_T
+
+        return rho_ia_batch, rho_jb_batch
+
+    @staticmethod
     def _build_coarse_real_space_grid(cell, N_local):
         Lvec_real = cell.lattice_vectors()
         N_local = np.asarray(N_local, dtype=int)
@@ -102,7 +192,9 @@ class MP2StructureFactor(StructureFactor):
                                line_sampling_decay_components=(),
                                qG_line_sampling_segments=None,
                                sq_ke_cutoff_switch_radius=None,
-                               outer_sq_ke_cutoff_scale=None):
+                               outer_sq_ke_cutoff_scale=None,
+                               qG_batch_size=None,
+                               qG_batch_memory_fraction=0.5):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -127,6 +219,12 @@ class MP2StructureFactor(StructureFactor):
         verbose : int or pyscf.lib.logger.Logger, optional
             PySCF verbosity level or logger used for the timing summary. If
             omitted, the verbosity and output stream are inherited from kmp.
+        qG_batch_size : int or "auto", optional
+            Number of q+G points to batch for pair-density construction. If
+            "auto", choose a memory-limited size from ``kmf.cell.max_memory``.
+        qG_batch_memory_fraction : float, optional
+            Fraction of currently available cell memory to use when capping a
+            requested qG batch size or choosing the "auto" batch size.
         Returns
         -------
         SqG_full_direct : np.ndarray
@@ -470,6 +568,43 @@ class MP2StructureFactor(StructureFactor):
             qg_tree = scipy.spatial.KDTree(qG_full)
             _, inversion_partner = qg_tree.query(-qG_full, distance_upper_bound=1e-8)
 
+        max_batch_nG = max(int(np.prod(value['N_local'])) for value in mesh_contexts.values())
+        pair_density_dtype = np.result_type(
+            full_context['conj_uKpts_i'].dtype,
+            full_context['uKpts_j'].dtype,
+            full_context['uKpts_a'].dtype,
+            full_context['uKpts_b'].dtype,
+            np.complex128,
+        )
+        trs_pair_density_reuse = kgrid_occ_trs and trs_map is not None and check_trs
+        effective_qG_batch_size = self._resolve_qG_batch_size(
+            qG_batch_size,
+            qG_batch_memory_fraction,
+            kmf,
+            nkpts,
+            nocc,
+            nvir,
+            max_batch_nG,
+            pair_density_dtype,
+            include_rho_jb=not trs_pair_density_reuse,
+            max_nqG=qG_full.shape[0],
+        )
+        self.last_qG_batch_size = effective_qG_batch_size
+        batched_qG_pair_density = effective_qG_batch_size > 1
+        if batched_qG_pair_density:
+            log.note("qG pair-density batch size: %d", effective_qG_batch_size)
+            if q4_decay_state is not None or exchange_decay_state is not None:
+                q4_decay_state = None
+                exchange_decay_state = None
+                SqG_full_direct_mask[:] = True
+                SqG_full_exchange_mask[:] = True
+                SqG_full_q4_mask[:] = True
+
+        batch_start = -1
+        batch_stop = -1
+        batch_rho_ia = None
+        batch_rho_jb = None
+
         loop_t0 = profile.start()
         for qG in range(qG_full.shape[0]):
             if qG % interval == 0:
@@ -487,7 +622,7 @@ class MP2StructureFactor(StructureFactor):
                 compute_exchange = should_compute_line_sample(qG, exchange_decay_state)
             compute_q4 = dG0 and should_compute_line_sample(qG, q4_decay_state)
             region_t0 = profile.start()
-            if self.sq_inversion_symm and qG > 1:
+            if not batched_qG_pair_density and self.sq_inversion_symm and qG > 1:
                 equiv_qG_index = inversion_partner[qG]
                 if equiv_qG_index < qG:
                     num_equiv_qG += 1
@@ -526,61 +661,94 @@ class MP2StructureFactor(StructureFactor):
             if t2_required and t2_store_type == 'kikjka':  
                 t2_qi = t2[qi]
 
-            kptas = kGrid1 + qGpt
-            kptbs = kGrid1 - qGpt
-            kptas_BZ = minimum_image(kmf.cell, kptas)
-            kptbs_BZ = minimum_image(kmf.cell, kptbs)
-
-            # combined_kptgrid = np.concatenate((kptas_BZ, kptbs_BZ), axis=0)
-            # _, unique_indices, _ = kpts_helper.unique(combined_kptgrid)
-            # combined_kptgrid = combined_kptgrid[unique_indices]
-            # try:
-            #     trs_map = kpts_helper.conj_mapping(kmf.cell, combined_kptgrid)
-            #     kgrid_occ_trs = True
-            # except kpts_helper.KPointSymmetryError:
-            #     trs_map = None
-            #     kgrid_occ_trs = False
-            
-            kGdiffas = kptas - kptas_BZ
-            kGdiffbs = kptbs - kptbs_BZ
-            
             kas_at_qi = kas[qi]
             kbs_at_qi = kbs[qi]
-            if kgrid_occ_trs and trs_map is not None and check_trs:
-                # Use time-reversal symmetry 
-                exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
-                profile.stop("per-qG index/phase setup", region_t0)
-                
-                # Build pair densities, rho_ikiaka and rho_jkjbkb.
-                # Apply the phase on the occupied side to avoid nvir-sized
-                # temporaries on the real-space grid.
-                region_t0 = profile.start()
-                phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
-                profile.stop("pair-density elementwise products", region_t0)
-                region_t0 = profile.start()
-                rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
-                profile.stop("pair-density matrix multiply", region_t0)
-                    
-                rho_jb_full = rho_ia_full[trs_map,:,:].transpose(0,2,1) # nkpts x nvir x nocc
-            else:
-                # Precompute exp_term for kGdiffas and kGdiffbs
-                exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
-                exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs.T)).T
-                profile.stop("per-qG index/phase setup", region_t0)
 
-                region_t0 = profile.start()
-                phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
-                profile.stop("pair-density elementwise products", region_t0)
-                region_t0 = profile.start()
-                rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
-                profile.stop("pair-density matrix multiply", region_t0)
+            if batched_qG_pair_density:
+                if not (batch_start <= qG < batch_stop):
+                    batch_start = qG
+                    batch_stop = min(qG_full.shape[0], qG + effective_qG_batch_size)
+                    while (batch_stop > batch_start + 1
+                           and np.any(qG_uses_outer_mesh[batch_start:batch_stop] != qG_uses_outer_mesh[batch_start])):
+                        batch_stop -= 1
+                    batch_indices = np.arange(batch_start, batch_stop)
+                    qi_batch = qi_map[batch_indices]
+                    batch_rho_ia, batch_rho_jb = self._build_pair_density_batch(
+                        kmf.cell,
+                        kGrid1,
+                        qG_full[batch_indices],
+                        rptGrid3D,
+                        uKpts_i,
+                        uKpts_j,
+                        uKpts_a,
+                        uKpts_b,
+                        conj_uKpts_i,
+                        kas[qi_batch],
+                        kbs[qi_batch],
+                        kgrid_occ_trs,
+                        trs_map,
+                        check_trs,
+                    )
+                    profile.stop("batched pair-density construction", region_t0)
+                else:
+                    profile.stop("batched pair-density cache lookup", region_t0)
+                batch_offset = qG - batch_start
+                rho_ia_full = batch_rho_ia[batch_offset]
+                rho_jb_full = batch_rho_jb[batch_offset]
+            else:
+                kptas = kGrid1 + qGpt
+                kptbs = kGrid1 - qGpt
+                kptas_BZ = minimum_image(kmf.cell, kptas)
+                kptbs_BZ = minimum_image(kmf.cell, kptbs)
+
+                # combined_kptgrid = np.concatenate((kptas_BZ, kptbs_BZ), axis=0)
+                # _, unique_indices, _ = kpts_helper.unique(combined_kptgrid)
+                # combined_kptgrid = combined_kptgrid[unique_indices]
+                # try:
+                #     trs_map = kpts_helper.conj_mapping(kmf.cell, combined_kptgrid)
+                #     kgrid_occ_trs = True
+                # except kpts_helper.KPointSymmetryError:
+                #     trs_map = None
+                #     kgrid_occ_trs = False
+                
+                kGdiffas = kptas - kptas_BZ
+                kGdiffbs = kptbs - kptbs_BZ
+                
+                if kgrid_occ_trs and trs_map is not None and check_trs:
+                    # Use time-reversal symmetry 
+                    exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
+                    profile.stop("per-qG index/phase setup", region_t0)
                     
-                region_t0 = profile.start()
-                phased_uj_T = (uKpts_j * exp_term_bs[:,None,:]).transpose(0,2,1) # nkpts x nG x nocc
-                profile.stop("pair-density elementwise products", region_t0)
-                region_t0 = profile.start()
-                rho_jb_full = np.conj(uKpts_b[kbs_at_qi]) @ phased_uj_T # nkpts x nvir x nocc
-                profile.stop("pair-density matrix multiply", region_t0)
+                    # Build pair densities, rho_ikiaka and rho_jkjbkb.
+                    # Apply the phase on the occupied side to avoid nvir-sized
+                    # temporaries on the real-space grid.
+                    region_t0 = profile.start()
+                    phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
+                    profile.stop("pair-density elementwise products", region_t0)
+                    region_t0 = profile.start()
+                    rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
+                    profile.stop("pair-density matrix multiply", region_t0)
+                        
+                    rho_jb_full = rho_ia_full[trs_map,:,:].transpose(0,2,1) # nkpts x nvir x nocc
+                else:
+                    # Precompute exp_term for kGdiffas and kGdiffbs
+                    exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
+                    exp_term_bs = np.exp(1j * (rptGrid3D @ kGdiffbs.T)).T
+                    profile.stop("per-qG index/phase setup", region_t0)
+
+                    region_t0 = profile.start()
+                    phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
+                    profile.stop("pair-density elementwise products", region_t0)
+                    region_t0 = profile.start()
+                    rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
+                    profile.stop("pair-density matrix multiply", region_t0)
+                        
+                    region_t0 = profile.start()
+                    phased_uj_T = (uKpts_j * exp_term_bs[:,None,:]).transpose(0,2,1) # nkpts x nG x nocc
+                    profile.stop("pair-density elementwise products", region_t0)
+                    region_t0 = profile.start()
+                    rho_jb_full = np.conj(uKpts_b[kbs_at_qi]) @ phased_uj_T # nkpts x nvir x nocc
+                    profile.stop("pair-density matrix multiply", region_t0)
         
 
             if t2_store_type == 'ki' and not t2_given:
