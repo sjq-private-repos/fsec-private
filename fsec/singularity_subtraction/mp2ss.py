@@ -1050,6 +1050,7 @@ class MP2SS:
             line_sampling_decay_consecutive_below=self.line_sampling_decay_consecutive_below,
             line_sampling_decay_components=self.line_sampling_decay_components if line_sampling else (),
             qG_line_sampling_segments=getattr(mp2_structure_factor.grids, "qG_line_sampling_segments", None),
+            qG_batch_size=8,
         )
 
         if self.t2_store_type == 'kikjka':
