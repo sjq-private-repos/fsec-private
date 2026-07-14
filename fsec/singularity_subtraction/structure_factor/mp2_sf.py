@@ -86,6 +86,100 @@ class MP2StructureFactor(StructureFactor):
         return -2 * scale**2 * np.sum(np.abs(rijab)**2 * np.abs(eijab_recip).ravel())
 
     @staticmethod
+    def _build_trs_pair_representatives(trs_map, nkpts=None):
+        """Return canonical (m, n, factor) pairs for the TRS rijab involution."""
+        trs_map = np.asarray(trs_map, dtype=int)
+        if nkpts is None:
+            nkpts = len(trs_map)
+        representatives = []
+        for m in range(nkpts):
+            for n in range(nkpts):
+                flat = m * nkpts + n
+                partner_m = trs_map[n]
+                partner_n = trs_map[m]
+                partner_flat = partner_m * nkpts + partner_n
+                if flat <= partner_flat:
+                    factor = 1 if flat == partner_flat else 2
+                    representatives.append((m, n, factor))
+        return representatives
+
+    @staticmethod
+    def _contract_trs_representative_rijab(
+            rho_ia_full, rho_jb_full, pair_representatives,
+            trs_map=None, direct_t2=None, exchange_t2=None, eijab_recip=None):
+        """Contract rijab over TRS representative (m,n) pairs without full materialization."""
+        if trs_map is not None:
+            trs_map = np.asarray(trs_map, dtype=int)
+        direct_value = 0.0
+        exchange_value = 0.0
+        q4_weighted_norm = 0.0
+
+        for m, n, factor in pair_representatives:
+            rijab_mn = np.einsum(
+                'ia,bj->ijab',
+                rho_ia_full[m],
+                rho_jb_full[n].conj(),
+                optimize=True,
+            )
+            if direct_t2 is not None:
+                direct_block = np.einsum(
+                    'ijab,ijab->',
+                    rijab_mn,
+                    direct_t2[m, n],
+                    optimize=True,
+                )
+                if factor == 1 or trs_map is None:
+                    direct_value += factor * direct_block.real
+                else:
+                    partner_m = trs_map[n]
+                    partner_n = trs_map[m]
+                    direct_partner_block = np.einsum(
+                        'ijab,ijab->',
+                        rijab_mn.conj(),
+                        direct_t2[partner_m, partner_n].transpose(1, 0, 3, 2),
+                        optimize=True,
+                    )
+                    direct_value += (direct_block + direct_partner_block).real
+            if exchange_t2 is not None:
+                exchange_block = np.einsum(
+                    'ijab,ijba->',
+                    rijab_mn,
+                    exchange_t2[m, n],
+                    optimize=True,
+                )
+                if factor == 1 or trs_map is None:
+                    exchange_value += factor * exchange_block.real
+                else:
+                    partner_m = trs_map[n]
+                    partner_n = trs_map[m]
+                    exchange_partner_block = np.einsum(
+                        'ijab,ijab->',
+                        rijab_mn.conj(),
+                        exchange_t2[partner_m, partner_n].transpose(1, 0, 2, 3),
+                        optimize=True,
+                    )
+                    exchange_value += (exchange_block + exchange_partner_block).real
+            if eijab_recip is not None:
+                abs_rijab_mn = np.abs(rijab_mn)**2
+                q4_weighted_norm += np.sum(
+                    abs_rijab_mn * np.abs(eijab_recip[m, n])
+                )
+                if factor == 2:
+                    if trs_map is None:
+                        q4_weighted_norm += np.sum(
+                            abs_rijab_mn * np.abs(eijab_recip[m, n])
+                        )
+                    else:
+                        partner_m = trs_map[n]
+                        partner_n = trs_map[m]
+                        q4_weighted_norm += np.sum(
+                            abs_rijab_mn
+                            * np.abs(eijab_recip[partner_m, partner_n].transpose(1, 0, 3, 2))
+                        )
+
+        return direct_value, exchange_value, q4_weighted_norm
+
+    @staticmethod
     def _build_coarse_real_space_grid(cell, N_local):
         Lvec_real = cell.lattice_vectors()
         N_local = np.asarray(N_local, dtype=int)
@@ -513,6 +607,18 @@ class MP2StructureFactor(StructureFactor):
                 kii, kjj = np.indices((nkpts, nkpts))
                 
         contract_expression_rijab = 'mia,nbj->mnijab'
+        use_trs_representative_rijab = (
+            kgrid_occ_trs and trs_map is not None and check_trs
+            and t2_store_type in ('kikjka', 'kikj')
+        )
+        trs_pair_representatives = None
+        if use_trs_representative_rijab:
+            trs_pair_representatives = self._build_trs_pair_representatives(
+                trs_map, nkpts)
+            log.note(
+                "TRS rijab representative pairs: %d of %d k-point pairs",
+                len(trs_pair_representatives), nkpts * nkpts,
+            )
         profile.stop("qG/k-point precomputation", phase_t0)
             
         nqG_full = qG_full.shape[0]
@@ -768,13 +874,9 @@ class MP2StructureFactor(StructureFactor):
 
             else:
                 # O(Nk^2) or O(Nk^3) memory scaling pathway
-                region_t0 = profile.start()
-                rijab = np.einsum(contract_expression_rijab,rho_ia_full,rho_jb_full.conj(),optimize=True)
-                rijab = rijab.ravel()
-                profile.stop("rijab tensor contraction", region_t0)
-                
+                t2_qpi = None
+                eijab = None
                 if compute_direct:
-
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('direct', int(qi))
                         if cache_key in t2_cache:
@@ -792,18 +894,13 @@ class MP2StructureFactor(StructureFactor):
                                 t2_cache[cache_key] = t2_qi
                             t2_cache_counts['direct_misses'] += 1
                             profile.stop("direct t2 cache miss", region_t0)
-                    region_t0 = profile.start()
-                    temp_SqG_k =2/(omega_cell*nkpts) * np.dot(rijab, t2_qi.ravel()) * quadrature_product_scale #ORIGINAL 3/3/26
-                    # temp_SqG_k =2/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qi.ravel()) * dvol**2 #NEW 3/3/26
-                    
-                    SqG_full_direct[qG] += temp_SqG_k.real / nkpts
-                    profile.stop("direct final contraction", region_t0)
+
                 if compute_exchange:
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('exchange', int(qi))
                         if cache_key in t2_cache:
                             region_t0 = profile.start()
-                            t2_qpi_flat = t2_cache[cache_key]
+                            t2_qpi = t2_cache[cache_key]
                             t2_cache_counts['exchange_hits'] += 1
                             profile.stop("exchange t2 cache hit", region_t0)
                         else:
@@ -812,41 +909,15 @@ class MP2StructureFactor(StructureFactor):
                                                                 skip_if_no_qpt=True, mode='exchange',Lov=Lov, verbose=logger.NOTE)
                             t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
                             t2_qpi = t2_qpi[0]
-                            t2_qpi_flat = np.ascontiguousarray(
-                                t2_qpi.transpose(0,1,2,3,5,4)
-                            ).ravel()
                             if int(qi) in repeated_qis:
-                                t2_cache[cache_key] = t2_qpi_flat
+                                t2_cache[cache_key] = t2_qpi
                             t2_cache_counts['exchange_misses'] += 1
                             profile.stop("exchange t2 cache miss", region_t0)
                     else:
                         region_t0 = profile.start()
-                        t2_qpi = np.zeros((nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=np.complex128)
-                        profile.stop("exchange t2 allocation", region_t0)
-                        region_t0 = profile.start()
                         t2_qpi = t2[qpis, kii, kjj]
                         profile.stop("exchange t2 gather", region_t0)
-                        region_t0 = profile.start()
-                        t2_qpi_flat = np.ascontiguousarray(
-                            t2_qpi.transpose(0,1,2,3,5,4)
-                        ).ravel()
-                        profile.stop("exchange t2 transpose/flatten", region_t0)
 
-                    region_t0 = profile.start()
-                    temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi_flat) * quadrature_product_scale #ORIGINAL 3/3/26
-                    # temp_SqG_k_x = -1/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qpi) * dvol**2 #NEW 3/3/26
-                    
-                    SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
-                    profile.stop("exchange final contraction", region_t0)
-                    update_line_sampling_decay_mask(
-                        SqG_full_exchange_mask,
-                        qG,
-                        SqG_full_exchange[qG],
-                        np.linalg.norm(qGpt),
-                        exchange_decay_state,
-                        qGpt=qGpt,
-                    )
-                
                 if compute_q4:
                     region_t0 = profile.start()
                     if t2_store_type == 'kikj':
@@ -859,21 +930,86 @@ class MP2StructureFactor(StructureFactor):
                         eijab = eijab_full[qi]
                     profile.stop("dG0 denominator setup", region_t0)
 
+                if use_trs_representative_rijab:
                     region_t0 = profile.start()
-                    if t2_store_type == 'kikj':
+                    direct_sum, exchange_sum, q4_weighted_norm = (
+                        self._contract_trs_representative_rijab(
+                            rho_ia_full,
+                            rho_jb_full,
+                            trs_pair_representatives,
+                            trs_map=trs_map,
+                            direct_t2=t2_qi if compute_direct else None,
+                            exchange_t2=t2_qpi if compute_exchange else None,
+                            eijab_recip=eijab if compute_q4 else None,
+                        )
+                    )
+                    profile.stop("rijab TRS representative construction/contraction", region_t0)
+
+                    if compute_direct:
+                        temp_SqG_k = (
+                            2 / (omega_cell * nkpts)
+                            * direct_sum
+                            * quadrature_product_scale
+                        )
+                        SqG_full_direct[qG] += temp_SqG_k / nkpts
+                    if compute_exchange:
+                        temp_SqG_k_x = (
+                            -1 / (omega_cell * nkpts)
+                            * exchange_sum
+                            * quadrature_product_scale
+                        )
+                        SqG_full_exchange[qG] += temp_SqG_k_x / nkpts
+                    if compute_q4:
+                        scale = quadrature_product_scale / (nkpts * omega_cell)
+                        temp_SqG_k_q4 = -2 * scale**2 * q4_weighted_norm
+                        SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
+
+                else:
+                    region_t0 = profile.start()
+                    rijab = np.einsum(contract_expression_rijab,rho_ia_full,rho_jb_full.conj(),optimize=True)
+                    rijab = rijab.ravel()
+                    profile.stop("rijab tensor contraction", region_t0)
+
+                    if compute_direct:
+                        region_t0 = profile.start()
+                        temp_SqG_k =2/(omega_cell*nkpts) * np.dot(rijab, t2_qi.ravel()) * quadrature_product_scale #ORIGINAL 3/3/26
+                        # temp_SqG_k =2/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qi.ravel()) * dvol**2 #NEW 3/3/26
+
+                        SqG_full_direct[qG] += temp_SqG_k.real / nkpts
+                        profile.stop("direct final contraction", region_t0)
+
+                    if compute_exchange:
+                        region_t0 = profile.start()
+                        t2_qpi_flat = np.ascontiguousarray(
+                            t2_qpi.transpose(0,1,2,3,5,4)
+                        ).ravel()
+                        profile.stop("exchange t2 transpose/flatten", region_t0)
+
+                        region_t0 = profile.start()
+                        temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi_flat) * quadrature_product_scale #ORIGINAL 3/3/26
+                        # temp_SqG_k_x = -1/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qpi) * dvol**2 #NEW 3/3/26
+
+                        SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
+                        profile.stop("exchange final contraction", region_t0)
+
+                    if compute_q4:
+                        region_t0 = profile.start()
                         scale = quadrature_product_scale / (nkpts * omega_cell)
                         temp_SqG_k_q4 = self.contract_kikj_dG0(rijab, eijab, scale)
-                    else:
-                        # rijab_ovr_e =  np.einsum(contract_expression_q4,rho_ia_full,rho_jb_full.conj(),np.sqrt(np.abs(eijab)),optimize=True
-                        rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
+                        SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
+                        profile.stop("dG0 final contraction", region_t0)
 
-                        rijab_ovr_e = rijab_ovr_e * quadrature_product_scale / (nkpts * omega_cell) # For using rijab instead of t2
-                        
-                        # temp_SqG_k_q4 = -2 * np.sum(np.abs(rijab_ovr_e)**2) # Check prefactor here
-                        # temp_SqG_k_q4 = -2 * np.dot(rijab_ovr_e, rijab_ovr_e.conj()) #ORIGINAL 3/3/26
-                        temp_SqG_k_q4 = -2 * pyscf_einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj()) #NEW 3/3/26
-                    SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
-                    profile.stop("dG0 final contraction", region_t0)
+                if compute_exchange:
+                    update_line_sampling_decay_mask(
+                        SqG_full_exchange_mask,
+                        qG,
+                        SqG_full_exchange[qG],
+                        np.linalg.norm(qGpt),
+                        exchange_decay_state,
+                        qGpt=qGpt,
+                    )
+
+                if compute_q4:
                     update_line_sampling_decay_mask(
                         SqG_full_q4_mask,
                         qG,

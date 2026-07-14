@@ -95,6 +95,90 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             self.assertEqual(len(segment["indices"]), 3)
             self.assertTrue(np.allclose(qG_full[segment["indices"][0]], segment["q_min"]))
 
+    def test_trs_pair_representatives_cover_each_pair_once(self):
+        trs_map = np.array([0, 2, 1, 4, 3])
+        nkpts = len(trs_map)
+        representatives = MP2StructureFactor._build_trs_pair_representatives(
+            trs_map, nkpts)
+
+        covered = set()
+        for m, n, factor in representatives:
+            partner = (trs_map[n], trs_map[m])
+            if (m, n) == partner:
+                self.assertEqual(factor, 1)
+            else:
+                self.assertEqual(factor, 2)
+            covered.add((m, n))
+            covered.add(partner)
+
+        self.assertEqual(len(covered), nkpts * nkpts)
+        self.assertEqual(sum(factor for _, _, factor in representatives), nkpts * nkpts)
+
+    def test_trs_representative_contractions_match_full_reductions(self):
+        rng = np.random.default_rng(14)
+        trs_map = np.array([0, 2, 1, 3])
+        nkpts = len(trs_map)
+        nocc = 2
+        nvir = 3
+        representatives = MP2StructureFactor._build_trs_pair_representatives(
+            trs_map, nkpts)
+
+        rho_ia = (
+            rng.normal(size=(nkpts, nocc, nvir))
+            + 1j * rng.normal(size=(nkpts, nocc, nvir))
+        )
+        rho_jb = rho_ia[trs_map].transpose(0, 2, 1)
+        rijab = np.einsum("mia,nbj->mnijab", rho_ia, rho_jb.conj())
+
+        direct_t2 = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir), dtype=complex)
+        exchange_t2 = np.zeros_like(direct_t2)
+        eijab = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir))
+        for m, n, _ in representatives:
+            partner_m = trs_map[n]
+            partner_n = trs_map[m]
+            direct_block = (
+                rng.normal(size=(nocc, nocc, nvir, nvir))
+                + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
+            )
+            exchange_block = (
+                rng.normal(size=(nocc, nocc, nvir, nvir))
+                + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
+            )
+            denom_block = rng.random(size=(nocc, nocc, nvir, nvir)) + 0.1
+            direct_t2[m, n] = direct_block
+            exchange_t2[m, n] = exchange_block
+            eijab[m, n] = denom_block
+            if (partner_m, partner_n) != (m, n):
+                direct_t2[partner_m, partner_n] = (
+                    rng.normal(size=(nocc, nocc, nvir, nvir))
+                    + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
+                )
+                exchange_t2[partner_m, partner_n] = (
+                    rng.normal(size=(nocc, nocc, nvir, nvir))
+                    + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
+                )
+                eijab[partner_m, partner_n] = (
+                    rng.random(size=(nocc, nocc, nvir, nvir)) + 0.1
+                )
+
+        full_direct = np.einsum("mnijab,mnijab->", rijab, direct_t2).real
+        full_exchange = np.einsum("mnijab,mnijba->", rijab, exchange_t2).real
+        full_q4 = np.sum(np.abs(rijab)**2 * np.abs(eijab))
+
+        direct, exchange, q4 = MP2StructureFactor._contract_trs_representative_rijab(
+            rho_ia,
+            rho_jb,
+            representatives,
+            trs_map=trs_map,
+            direct_t2=direct_t2,
+            exchange_t2=exchange_t2,
+            eijab_recip=eijab,
+        )
+
+        self.assertAlmostEqual(direct, full_direct, places=12)
+        self.assertAlmostEqual(exchange, full_exchange, places=12)
+        self.assertAlmostEqual(q4, full_q4, places=12)
+
 
 @unittest.skipUnless(HAS_PYSCF and HAS_MP2_IMPORT, "PySCF and fsec structure_factor deps are required")
 class KnownValues(unittest.TestCase):
@@ -381,6 +465,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
+            check_trs=False,
             t2_store_type="kikjka",
             pair_density_eval_grid="uniform",
         )
@@ -421,6 +506,58 @@ class KnownValues(unittest.TestCase):
         )
         self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
         self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
+
+    def test_trs_representative_kikjka_matches_fallback_112_kmesh(self):
+        reciprocal = self.kmf_112.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            0.5 * reciprocal[2],
+            -0.5 * reciprocal[2],
+        ])
+
+        fallback_sf = MP2StructureFactor(
+            self.kmf_112,
+            self.kmp_112,
+            t2=self.t2_112,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=False,
+            t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
+        )
+        fallback = fallback_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        optimized_sf = MP2StructureFactor(
+            self.kmf_112,
+            self.kmp_112,
+            t2=self.t2_112,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=True,
+            t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
+        )
+        optimized = optimized_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        np.testing.assert_allclose(optimized["qG_full"], fallback["qG_full"], atol=1e-12)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                optimized[key],
+                fallback[key],
+                rtol=1e-7,
+                atol=1e-10,
+            )
+        self.assertIn(
+            "rijab TRS representative construction/contraction",
+            optimized_sf.last_build_timings,
+        )
+        self.assertIn("rijab tensor contraction", fallback_sf.last_build_timings)
 
     def test_contract_kikj_dG0_matches_old_expression(self):
         rng = np.random.default_rng(12)
