@@ -461,6 +461,8 @@ class MP2StructureFactor(StructureFactor):
             'exchange_hits': 0,
             'exchange_misses': 0,
         }
+        kii = None
+        kjj = None
         repeated_qis = set()
         if kikj_on_the_fly:
             unique_qis, qi_counts = np.unique(qi_map, return_counts=True)
@@ -507,6 +509,8 @@ class MP2StructureFactor(StructureFactor):
                 eijab = mo_e_o[:,None,:,None,None,None] + mo_e_o[None,:,None,:,None,None] \
                     -mo_e_v[ka_at_qi,None,None,None,:,None] - mo_e_v_b[None,kb_at_qi,None,None,None,:]
                 eijab_full[qi,:,:,:,:,:,:] = 1/(eijab)
+            if exchange:
+                kii, kjj = np.indices((nkpts, nkpts))
                 
         contract_expression_rijab = 'mia,nbj->mnijab'
         profile.stop("qG/k-point precomputation", phase_t0)
@@ -799,7 +803,7 @@ class MP2StructureFactor(StructureFactor):
                         cache_key = ('exchange', int(qi))
                         if cache_key in t2_cache:
                             region_t0 = profile.start()
-                            t2_qpi = t2_cache[cache_key]
+                            t2_qpi_flat = t2_cache[cache_key]
                             t2_cache_counts['exchange_hits'] += 1
                             profile.stop("exchange t2 cache hit", region_t0)
                         else:
@@ -808,8 +812,11 @@ class MP2StructureFactor(StructureFactor):
                                                                 skip_if_no_qpt=True, mode='exchange',Lov=Lov, verbose=logger.NOTE)
                             t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
                             t2_qpi = t2_qpi[0]
+                            t2_qpi_flat = np.ascontiguousarray(
+                                t2_qpi.transpose(0,1,2,3,5,4)
+                            ).ravel()
                             if int(qi) in repeated_qis:
-                                t2_cache[cache_key] = t2_qpi
+                                t2_cache[cache_key] = t2_qpi_flat
                             t2_cache_counts['exchange_misses'] += 1
                             profile.stop("exchange t2 cache miss", region_t0)
                     else:
@@ -817,13 +824,16 @@ class MP2StructureFactor(StructureFactor):
                         t2_qpi = np.zeros((nkpts,nkpts,nocc,nvir,nocc,nvir), dtype=np.complex128)
                         profile.stop("exchange t2 allocation", region_t0)
                         region_t0 = profile.start()
-                        kii, kjj = np.indices((nkpts, nkpts))
                         t2_qpi = t2[qpis, kii, kjj]
                         profile.stop("exchange t2 gather", region_t0)
-                    
+                        region_t0 = profile.start()
+                        t2_qpi_flat = np.ascontiguousarray(
+                            t2_qpi.transpose(0,1,2,3,5,4)
+                        ).ravel()
+                        profile.stop("exchange t2 transpose/flatten", region_t0)
+
                     region_t0 = profile.start()
-                    t2_qpi = t2_qpi.transpose(0,1,2,3,5,4).ravel()
-                    temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi) * quadrature_product_scale #ORIGINAL 3/3/26
+                    temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi_flat) * quadrature_product_scale #ORIGINAL 3/3/26
                     # temp_SqG_k_x = -1/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qpi) * dvol**2 #NEW 3/3/26
                     
                     SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
