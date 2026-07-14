@@ -7,6 +7,7 @@ from pyscf.lib import logger
 from pyscf import lib
 from pyscf.lib.parameters import LARGE_DENOM
 from pyscf.pbc import df
+from pyscf.pbc.dft import gen_grid as pbc_gen_grid
 from pyscf.pbc.lib import kpts_helper
 from pyscf.lib import logger, einsum
 from pyscf.pbc.mp import kmp2
@@ -43,6 +44,12 @@ class MP2StructureFactor(StructureFactor):
         self.input_sq_ke_cutoff = sq_ke_cutoff
         self.sq_ke_cutoff_switch_radius = kwargs.get('sq_ke_cutoff_switch_radius', None)
         self.outer_sq_ke_cutoff_scale = kwargs.get('outer_sq_ke_cutoff_scale', 0.5)
+        self.pair_density_eval_grid = kwargs.get('pair_density_eval_grid', 'becke')
+        pair_density_becke_grid_level = kwargs.get('pair_density_becke_grid_level', 0)
+        self.pair_density_becke_grid_level = (
+            0 if pair_density_becke_grid_level is None
+            else int(pair_density_becke_grid_level)
+        )
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
@@ -102,7 +109,9 @@ class MP2StructureFactor(StructureFactor):
                                line_sampling_decay_components=(),
                                qG_line_sampling_segments=None,
                                sq_ke_cutoff_switch_radius=None,
-                               outer_sq_ke_cutoff_scale=None):
+                               outer_sq_ke_cutoff_scale=None,
+                               pair_density_eval_grid=None,
+                               pair_density_becke_grid_level=None):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -127,6 +136,13 @@ class MP2StructureFactor(StructureFactor):
         verbose : int or pyscf.lib.logger.Logger, optional
             PySCF verbosity level or logger used for the timing summary. If
             omitted, the verbosity and output stream are inherited from kmp.
+        pair_density_eval_grid : {"uniform", "becke"}, optional
+            Real-space quadrature grid used to evaluate pair-density overlaps.
+            ``"uniform"`` uses the existing equally weighted mesh. ``"becke"``
+            uses PySCF PBC Becke coordinates and weights.
+        pair_density_becke_grid_level : int, optional
+            PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
+            Defaults to the class setting, which defaults to 0.
         Returns
         -------
         SqG_full_direct : np.ndarray
@@ -176,7 +192,22 @@ class MP2StructureFactor(StructureFactor):
             sq_ke_cutoff_switch_radius = self.sq_ke_cutoff_switch_radius
         if outer_sq_ke_cutoff_scale is None:
             outer_sq_ke_cutoff_scale = self.outer_sq_ke_cutoff_scale
+        if pair_density_eval_grid is None:
+            pair_density_eval_grid = self.pair_density_eval_grid
+        pair_density_eval_grid = str(pair_density_eval_grid).strip().lower()
+        if pair_density_eval_grid not in ('uniform', 'becke'):
+            raise ValueError("pair_density_eval_grid must be 'uniform' or 'becke'")
+        if pair_density_becke_grid_level is None:
+            pair_density_becke_grid_level = self.pair_density_becke_grid_level
+        pair_density_becke_grid_level = int(pair_density_becke_grid_level)
+        if pair_density_becke_grid_level < 0:
+            raise ValueError("pair_density_becke_grid_level must be non-negative")
         adaptive_sq_ke_cutoff = sq_ke_cutoff_switch_radius is not None
+        if adaptive_sq_ke_cutoff and pair_density_eval_grid == 'becke':
+            raise NotImplementedError(
+                "pair_density_eval_grid='becke' is not implemented with adaptive "
+                "sq_ke_cutoff real-space meshes"
+            )
         full_sq_ke_cutoff = self.input_sq_ke_cutoff
         if full_sq_ke_cutoff is None and np.isscalar(self.sq_ke_cutoff):
             full_sq_ke_cutoff = self.sq_ke_cutoff
@@ -280,9 +311,21 @@ class MP2StructureFactor(StructureFactor):
         
         Lvec_real = kmf.cell.lattice_vectors()
         omega_cell = np.abs(np.linalg.det(Lvec_real))
+        becke_coords = None
+        becke_weights = None
+        if pair_density_eval_grid == 'becke':
+            pair_grid = pbc_gen_grid.BeckeGrids(kmf.cell)
+            pair_grid.level = pair_density_becke_grid_level
+            pair_grid.build(with_non0tab=False)
+            becke_coords = np.asarray(pair_grid.coords)
+            becke_weights = np.asarray(pair_grid.weights)
 
         def build_mesh_context(label, N_local, rptGrid3D, sq_ke_cutoff_value):
             local_NsCell = np.asarray(N_local, dtype=int)
+            quadrature_weights = None
+            if pair_density_eval_grid == 'becke':
+                rptGrid3D = becke_coords
+                quadrature_weights = becke_weights
             if kgrids_equal and mo_coeffs_equal:
                 uKpts_i_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
                 uKpts_j_local = uKpts_i_local
@@ -295,12 +338,18 @@ class MP2StructureFactor(StructureFactor):
                 uKpts_b_local = build_uKpts(kmf, kGrid3, mo_coeff_kpts3, rptGrid3D=rptGrid3D, nbands=nbands) # SJQ checked
 
             L_delta = Lvec_real / local_NsCell[:, None]
+            quadrature_product_scale = 1.0
+            dvol = np.abs(np.linalg.det(L_delta))
+            if pair_density_eval_grid == 'uniform':
+                quadrature_product_scale = dvol**2
             return {
                 'label': label,
                 'N_local': local_NsCell.copy(),
                 'sq_ke_cutoff': sq_ke_cutoff_value,
                 'rptGrid3D': rptGrid3D,
-                'dvol': np.abs(np.linalg.det(L_delta)),
+                'dvol': dvol,
+                'quadrature_weights': quadrature_weights,
+                'quadrature_product_scale': quadrature_product_scale,
                 'uKpts_i': uKpts_i_local[:,:nocc,:],
                 'uKpts_j': uKpts_j_local[:,:nocc,:],
                 'uKpts_a': uKpts_a_local[:,nocc:,:],
@@ -329,10 +378,10 @@ class MP2StructureFactor(StructureFactor):
 
         # SqG = pymp.shared.array((nkpts, nG), dtype=np.float64)
         nqG = qG_full.shape[0]
-        nG = np.prod(full_context['N_local'])
+        nG = full_context['rptGrid3D'].shape[0]
         print("MP2StructureFactorTruncated nG: ", nG)
         if adaptive_sq_ke_cutoff:
-            print("MP2StructureFactorTruncated outer nG: ", np.prod(mesh_contexts['outer']['N_local']))
+            print("MP2StructureFactorTruncated outer nG: ", mesh_contexts['outer']['rptGrid3D'].shape[0])
         print("MP2StructureFactorTruncated nqG: ", nqG)
         SqG_full_direct = np.zeros(nqG, dtype=np.float64)
         SqG_full_exchange = np.zeros(nqG, dtype=np.float64)
@@ -511,7 +560,8 @@ class MP2StructureFactor(StructureFactor):
             region_t0 = profile.start()
             mesh_context = mesh_contexts['outer'] if qG_uses_outer_mesh[qG] else mesh_contexts['inner']
             rptGrid3D = mesh_context['rptGrid3D']
-            dvol = mesh_context['dvol']
+            quadrature_weights = mesh_context['quadrature_weights']
+            quadrature_product_scale = mesh_context['quadrature_product_scale']
             uKpts_i = mesh_context['uKpts_i']
             uKpts_j = mesh_context['uKpts_j']
             uKpts_a = mesh_context['uKpts_a']
@@ -556,6 +606,8 @@ class MP2StructureFactor(StructureFactor):
                 # temporaries on the real-space grid.
                 region_t0 = profile.start()
                 phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
+                if quadrature_weights is not None:
+                    phased_conj_ui = phased_conj_ui * quadrature_weights[None,None,:]
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
                 rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
@@ -570,13 +622,18 @@ class MP2StructureFactor(StructureFactor):
 
                 region_t0 = profile.start()
                 phased_conj_ui = conj_uKpts_i * exp_term_as[:,None,:] # nkpts x nocc x nG
+                if quadrature_weights is not None:
+                    phased_conj_ui = phased_conj_ui * quadrature_weights[None,None,:]
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
                 rho_ia_full = phased_conj_ui @ uKpts_a[kas_at_qi].transpose(0,2,1) # nkpts x nocc x nvir
                 profile.stop("pair-density matrix multiply", region_t0)
                     
                 region_t0 = profile.start()
-                phased_uj_T = (uKpts_j * exp_term_bs[:,None,:]).transpose(0,2,1) # nkpts x nG x nocc
+                phased_uj = uKpts_j * exp_term_bs[:,None,:]
+                if quadrature_weights is not None:
+                    phased_uj = phased_uj * quadrature_weights[None,None,:]
+                phased_uj_T = phased_uj.transpose(0,2,1) # nkpts x nG x nocc
                 profile.stop("pair-density elementwise products", region_t0)
                 region_t0 = profile.start()
                 rho_jb_full = np.conj(uKpts_b[kbs_at_qi]) @ phased_uj_T # nkpts x nvir x nocc
@@ -652,7 +709,7 @@ class MP2StructureFactor(StructureFactor):
 
                     # Compute structure factor contribution
                     region_t0 = profile.start()
-                    rijab_ki = np.einsum('ia,nbj->nijab', rho_ia_full[ki], rho_jb_full.conj()) * dvol**2 / (nkpts * omega_cell)
+                    rijab_ki = np.einsum('ia,nbj->nijab', rho_ia_full[ki], rho_jb_full.conj()) * quadrature_product_scale / (nkpts * omega_cell)
                     profile.stop("rijab construction (ki path)", region_t0)
                     if compute_direct or compute_q4:
                         region_t0 = profile.start()
@@ -732,7 +789,7 @@ class MP2StructureFactor(StructureFactor):
                             t2_cache_counts['direct_misses'] += 1
                             profile.stop("direct t2 cache miss", region_t0)
                     region_t0 = profile.start()
-                    temp_SqG_k =2/(omega_cell*nkpts) * np.dot(rijab, t2_qi.ravel()) * dvol**2 #ORIGINAL 3/3/26
+                    temp_SqG_k =2/(omega_cell*nkpts) * np.dot(rijab, t2_qi.ravel()) * quadrature_product_scale #ORIGINAL 3/3/26
                     # temp_SqG_k =2/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qi.ravel()) * dvol**2 #NEW 3/3/26
                     
                     SqG_full_direct[qG] += temp_SqG_k.real / nkpts
@@ -766,7 +823,7 @@ class MP2StructureFactor(StructureFactor):
                     
                     region_t0 = profile.start()
                     t2_qpi = t2_qpi.transpose(0,1,2,3,5,4).ravel()
-                    temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi) * dvol**2 #ORIGINAL 3/3/26
+                    temp_SqG_k_x = -1/(omega_cell*nkpts) * np.dot(rijab, t2_qpi) * quadrature_product_scale #ORIGINAL 3/3/26
                     # temp_SqG_k_x = -1/(omega_cell*nkpts) * pyscf_einsum('i,i->', rijab, t2_qpi) * dvol**2 #NEW 3/3/26
                     
                     SqG_full_exchange[qG] += temp_SqG_k_x.real / nkpts
@@ -794,13 +851,13 @@ class MP2StructureFactor(StructureFactor):
 
                     region_t0 = profile.start()
                     if t2_store_type == 'kikj':
-                        scale = dvol**2 / (nkpts * omega_cell)
+                        scale = quadrature_product_scale / (nkpts * omega_cell)
                         temp_SqG_k_q4 = self.contract_kikj_dG0(rijab, eijab, scale)
                     else:
                         # rijab_ovr_e =  np.einsum(contract_expression_q4,rho_ia_full,rho_jb_full.conj(),np.sqrt(np.abs(eijab)),optimize=True
                         rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
 
-                        rijab_ovr_e = rijab_ovr_e * dvol**2 / (nkpts * omega_cell) # For using rijab instead of t2
+                        rijab_ovr_e = rijab_ovr_e * quadrature_product_scale / (nkpts * omega_cell) # For using rijab instead of t2
                         
                         # temp_SqG_k_q4 = -2 * np.sum(np.abs(rijab_ovr_e)**2) # Check prefactor here
                         # temp_SqG_k_q4 = -2 * np.dot(rijab_ovr_e, rijab_ovr_e.conj()) #ORIGINAL 3/3/26

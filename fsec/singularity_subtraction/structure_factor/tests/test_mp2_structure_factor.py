@@ -154,6 +154,7 @@ class KnownValues(unittest.TestCase):
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
+            pair_density_eval_grid="uniform",
         )
         result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
 
@@ -229,6 +230,97 @@ class KnownValues(unittest.TestCase):
         for actual, reference in zip(SqG_exchange_10, reference_SqG_exchange_10):
             self.assertAlmostEqual(actual, reference, places=8)
 
+    def test_build_structure_factor_10_closest_qg_points_becke_level0(self):
+        mp2_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            pair_density_eval_grid="becke",
+            pair_density_becke_grid_level=0,
+        )
+        result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
+
+        qG = result["qG_full"]
+        SqG_full_direct = result["SqG_full_direct"]
+        SqG_full_q4 = result["SqG_full_q4"]
+        SqG_full_exchange = result["SqG_full_exchange"]
+
+        self.assertEqual(len(SqG_full_direct), len(qG))
+        self.assertEqual(len(SqG_full_q4), len(qG))
+        self.assertEqual(len(SqG_full_exchange), len(qG))
+        self.assertTrue(np.all(np.isfinite(SqG_full_direct)))
+        self.assertTrue(np.all(np.isfinite(SqG_full_q4)))
+        self.assertTrue(np.all(np.isfinite(SqG_full_exchange)))
+        self.assertTrue(np.isrealobj(SqG_full_direct))
+        self.assertTrue(np.isrealobj(SqG_full_q4))
+        self.assertTrue(np.isrealobj(SqG_full_exchange))
+
+        idx10 = self._closest_10_indices(qG)
+        qG_10 = qG[idx10]
+        SqG_direct_10 = SqG_full_direct[idx10]
+        SqG_q4_10 = SqG_full_q4[idx10]
+        SqG_exchange_10 = SqG_full_exchange[idx10]
+
+        reference_qG_10 = [
+            [0.0, 0.0, 0.0],
+            [-1.0471975511965976, 0.0, 0.0],
+            [0.0, -1.0471975511965976, 0.0],
+            [0.0, 0.0, -1.0471975511965976],
+            [0.0, 0.0, 1.0471975511965976],
+            [0.0, 1.0471975511965976, 0.0],
+            [1.0471975511965976, 0.0, 0.0],
+            [-1.0471975511965976, -1.0471975511965976, 0.0],
+            [-1.0471975511965976, 0.0, -1.0471975511965976],
+            [-1.0471975511965976, 0.0, 1.0471975511965976],
+        ]
+        reference_SqG_direct_10 = [
+            -4.294521938834457e-09,
+            -7.652429628603002e-10,
+            -7.652429628959698e-10,
+            -0.00026828638583244375,
+            -0.00026828638583244375,
+            -7.652429628959698e-10,
+            -7.652429628603002e-10,
+            -1.0870652872799016e-10,
+            -0.0001126844199236413,
+            -0.00011268441992364891,
+        ]
+        reference_SqG_q4_10 = [
+            -1.1994133199422713e-15,
+            -3.808359212315172e-17,
+            -3.808359212670204e-17,
+            -4.680976772564127e-06,
+            -4.680976772564127e-06,
+            -3.808359212670204e-17,
+            -3.808359212315172e-17,
+            -7.68511679024734e-19,
+            -8.257849487100997e-07,
+            -8.257849487102111e-07,
+        ]
+        reference_SqG_exchange_10 = [
+            2.1472609694172284e-09,
+            3.826214814301501e-10,
+            3.826214814479849e-10,
+            0.00013414319291622188,
+            0.00013414319291622188,
+            3.826214814479849e-10,
+            3.826214814301501e-10,
+            5.435326436399508e-11,
+            5.634220996182065e-05,
+            5.6342209961824454e-05,
+        ]
+
+        np.testing.assert_allclose(qG_10, reference_qG_10, atol=1e-12)
+        for actual, reference in zip(SqG_direct_10, reference_SqG_direct_10):
+            self.assertAlmostEqual(actual, reference, places=8)
+        for actual, reference in zip(SqG_q4_10, reference_SqG_q4_10):
+            self.assertAlmostEqual(actual, reference, places=8)
+        for actual, reference in zip(SqG_exchange_10, reference_SqG_exchange_10):
+            self.assertAlmostEqual(actual, reference, places=8)
+
     def test_ki_t2_store_type_matches_kikjka(self):
         reference_sf = MP2StructureFactor(
             self.kmf,
@@ -238,6 +330,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
         )
         reference = reference_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
 
@@ -248,6 +341,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             t2_store_type="ki",
+            pair_density_eval_grid="uniform",
         )
         actual = ki_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
 
@@ -288,6 +382,7 @@ class KnownValues(unittest.TestCase):
             min_points=10,
             sq_inversion_symm=False,
             t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
         )
         reference = reference_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -300,6 +395,7 @@ class KnownValues(unittest.TestCase):
             min_points=10,
             sq_inversion_symm=False,
             t2_store_type="kikj",
+            pair_density_eval_grid="uniform",
         )
         actual = kikj_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -349,6 +445,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
+            pair_density_eval_grid="uniform",
         )
         mp2_sf.set_grids(min_fit_points=10)
         qG_full = mp2_sf.grids.build_qG_line_sampling()
@@ -393,6 +490,7 @@ class KnownValues(unittest.TestCase):
             min_points=10,
             sq_inversion_symm=False,
             sq_ke_cutoff_switch_radius=switch_radius,
+            pair_density_eval_grid="uniform",
         )
         adaptive = adaptive_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -405,6 +503,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
+            pair_density_eval_grid="uniform",
         )
         full_reference = full_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -417,6 +516,7 @@ class KnownValues(unittest.TestCase):
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
+            pair_density_eval_grid="uniform",
         )
         half_reference = half_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -464,6 +564,7 @@ class KnownValues(unittest.TestCase):
             min_points=10,
             sq_inversion_symm=False,
             sq_ke_cutoff_switch_radius=1.5,
+            pair_density_eval_grid="uniform",
         )
         mp2_sf.set_grids(min_fit_points=10)
         qG_full = mp2_sf.grids.build_qG_line_sampling()
@@ -495,6 +596,7 @@ class KnownValues(unittest.TestCase):
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
+            pair_density_eval_grid="uniform",
         )
         result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
 

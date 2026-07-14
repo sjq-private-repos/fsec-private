@@ -94,6 +94,26 @@ class MP2SSOptionsTests(unittest.TestCase):
         self.assertEqual(options.sq_ke_cutoff_switch_radius, 2.5)
         self.assertEqual(options.outer_sq_ke_cutoff_scale, 0.25)
 
+    def test_pair_density_eval_grid_option(self):
+        self.assertEqual(MP2SSOptions().pair_density_eval_grid, "becke")
+        self.assertEqual(MP2SSOptions().pair_density_becke_grid_level, 0)
+        self.assertEqual(
+            MP2SSOptions(pair_density_eval_grid=" Becke ").pair_density_eval_grid,
+            "becke",
+        )
+        self.assertEqual(
+            MP2SSOptions(pair_density_becke_grid_level="1").pair_density_becke_grid_level,
+            1,
+        )
+        self.assertEqual(
+            MP2SSOptions(pair_density_becke_grid_level=None).pair_density_becke_grid_level,
+            0,
+        )
+        with self.assertRaises(ValueError):
+            MP2SSOptions(pair_density_eval_grid="atom")
+        with self.assertRaises(ValueError):
+            MP2SSOptions(pair_density_becke_grid_level=-1)
+
 
 class KnownValues(unittest.TestCase):
     TOL = 1e-6
@@ -209,6 +229,7 @@ class KnownValues(unittest.TestCase):
             kmf=self.kmf,
             kmp=self.kmp,
             t2=self.t2,
+            pair_density_eval_grid="uniform",
         )
         self.assertEqual(mp2ss.options.auxfunc_direct, "Gauss")
         self.assertEqual(mp2ss.options.auxfunc_direct_q2, "Gauss")
@@ -231,6 +252,7 @@ class KnownValues(unittest.TestCase):
             kmp=self.kmp,
             t2=self.t2,
             check_trs=False,
+            pair_density_eval_grid="uniform",
         )
         self.assertFalse(mp2ss.options.check_trs)
         correction = mp2ss.compute_correction(direct=True, exchange=True)

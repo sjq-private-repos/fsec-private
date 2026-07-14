@@ -134,6 +134,13 @@ class MP2SSOptions:
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, and ``"ki"``, ranging from largest to smallest
         memory footprint.
+    pair_density_eval_grid
+        Real-space quadrature grid used to evaluate MP2 pair-density overlaps.
+        Supported values are ``"uniform"`` and ``"becke"``. The default is
+        ``"becke"``.
+    pair_density_becke_grid_level
+        PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
+        Lower values use fewer atom-centered grid points. The default is 0.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
@@ -164,7 +171,26 @@ class MP2SSOptions:
     line_sampling_decay_consecutive_below: int = 3
     line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
+    pair_density_eval_grid: str = 'becke'
+    pair_density_becke_grid_level: int = 0
     correct_q2_q4_separately: bool = True
+
+    def __post_init__(self):
+        pair_density_eval_grid = str(self.pair_density_eval_grid).strip().lower()
+        if pair_density_eval_grid not in ('uniform', 'becke'):
+            raise ValueError("pair_density_eval_grid must be 'uniform' or 'becke'")
+        pair_density_becke_grid_level = (
+            0 if self.pair_density_becke_grid_level is None
+            else int(self.pair_density_becke_grid_level)
+        )
+        if pair_density_becke_grid_level < 0:
+            raise ValueError("pair_density_becke_grid_level must be non-negative")
+        object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
+        object.__setattr__(
+            self,
+            'pair_density_becke_grid_level',
+            pair_density_becke_grid_level,
+        )
 
 
 @dataclass(frozen=True)
@@ -941,6 +967,8 @@ class MP2SS:
         self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
         self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
+        self.pair_density_eval_grid = options.pair_density_eval_grid
+        self.pair_density_becke_grid_level = options.pair_density_becke_grid_level
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
@@ -1030,6 +1058,8 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
+            pair_density_eval_grid=self.pair_density_eval_grid,
+            pair_density_becke_grid_level=self.pair_density_becke_grid_level,
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
             outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
         )
