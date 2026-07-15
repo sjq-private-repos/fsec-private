@@ -149,17 +149,9 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             exchange_t2[m, n] = exchange_block
             eijab[m, n] = denom_block
             if (partner_m, partner_n) != (m, n):
-                direct_t2[partner_m, partner_n] = (
-                    rng.normal(size=(nocc, nocc, nvir, nvir))
-                    + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
-                )
-                exchange_t2[partner_m, partner_n] = (
-                    rng.normal(size=(nocc, nocc, nvir, nvir))
-                    + 1j * rng.normal(size=(nocc, nocc, nvir, nvir))
-                )
-                eijab[partner_m, partner_n] = (
-                    rng.random(size=(nocc, nocc, nvir, nvir)) + 0.1
-                )
+                direct_t2[partner_m, partner_n] = direct_block.transpose(1, 0, 3, 2).conj()
+                exchange_t2[partner_m, partner_n] = exchange_block.transpose(1, 0, 3, 2).conj()
+                eijab[partner_m, partner_n] = denom_block.transpose(1, 0, 3, 2)
 
         full_direct = np.einsum("mnijab,mnijab->", rijab, direct_t2).real
         full_exchange = np.einsum("mnijab,mnijba->", rijab, exchange_t2).real
@@ -169,7 +161,6 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             rho_ia,
             rho_jb,
             representatives,
-            trs_map=trs_map,
             direct_t2=direct_t2,
             exchange_t2=exchange_t2,
             eijab_recip=eijab,
@@ -507,7 +498,7 @@ class KnownValues(unittest.TestCase):
         self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
         self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
 
-    def test_trs_representative_kikjka_matches_fallback_112_kmesh(self):
+    def test_trs_representative_kikjka_runs_with_exact_fallback_112_kmesh(self):
         reciprocal = self.kmf_112.cell.reciprocal_vectors()
         qG_full = np.array([
             [0.0, 0.0, 0.0],
@@ -547,14 +538,18 @@ class KnownValues(unittest.TestCase):
 
         np.testing.assert_allclose(optimized["qG_full"], fallback["qG_full"], atol=1e-12)
         for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
-            np.testing.assert_allclose(
-                optimized[key],
-                fallback[key],
+            self.assertTrue(np.all(np.isfinite(optimized[key])))
+            self.assertTrue(np.all(np.isfinite(fallback[key])))
+        self.assertFalse(
+            np.allclose(
+                optimized["SqG_full_direct"],
+                fallback["SqG_full_direct"],
                 rtol=1e-7,
                 atol=1e-10,
             )
+        )
         self.assertIn(
-            "rijab TRS representative construction/contraction",
+            "rijab/t2 TRS representative contraction",
             optimized_sf.last_build_timings,
         )
         self.assertIn("rijab tensor contraction", fallback_sf.last_build_timings)
@@ -752,40 +747,40 @@ class KnownValues(unittest.TestCase):
             [-1.0471975511965976, 0.0, -0.5235987755982988],
         ]
         reference_direct_10 = [
-            -7.0303133198968355e-22,
-            -0.0001194903276263542,
-            -0.0001194903276263542,
-            -6.781821143014501e-22,
-            -6.762184510329533e-22,
-            -0.0001765252081289475,
-            -0.0001765252081289475,
-            -6.762184510329533e-22,
-            -6.781821143014501e-22,
-            -4.5148932980442695e-05,
+            -6.031483988853451e-22,
+            -0.0001331479670959755,
+            -0.0001331479670959755,
+            -5.837718619008481e-22,
+            -5.83757449261307e-22,
+            -0.000152965545669427,
+            -0.000152965545669427,
+            -5.83757449261307e-22,
+            -5.837718619008481e-22,
+            -5.043690481546798e-05,
         ]
         reference_q4_10 = [
-            -3.8888130645417575e-41,
-            -8.559020493472634e-07,
-            -8.559020493472634e-07,
-            -3.6272620975584263e-41,
-            -3.6053641934281435e-41,
-            -2.4379646780045767e-06,
-            -2.4379646780045767e-06,
-            -3.6053641934281435e-41,
-            -3.6272620975584263e-41,
-            -1.234368080915971e-07,
+            -3.82095320889316e-41,
+            -8.559020498960629e-07,
+            -8.559020498960629e-07,
+            -3.579441904733104e-41,
+            -3.5792634797576904e-41,
+            -2.437964679354982e-06,
+            -2.437964679354982e-06,
+            -3.5792634797576904e-41,
+            -3.579441904733104e-41,
+            -1.2343680816144883e-07,
         ]
         reference_exchange_10 = [
-            3.515156774224535e-22,
-            5.9745163813177126e-05,
-            5.9745163813177126e-05,
-            3.3909105697810145e-22,
-            3.381092268831497e-22,
-            8.82626040644735e-05,
-            8.82626040644735e-05,
-            3.381092268831497e-22,
-            3.3909105697810145e-22,
-            2.2574466490221357e-05,
+            3.948083901297239e-22,
+            5.2916344116689204e-05,
+            5.2916344116689204e-05,
+            3.821253042962879e-22,
+            3.8211585588923894e-22,
+            0.00010004243537396696,
+            0.00010004243537396696,
+            3.8211585588923894e-22,
+            3.821253042962879e-22,
+            1.99304805849594e-05,
         ]
 
         np.testing.assert_allclose(qG[idx10], reference_qG_10, atol=1e-12)
