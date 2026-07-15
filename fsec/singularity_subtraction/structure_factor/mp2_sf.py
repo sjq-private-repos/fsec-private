@@ -855,6 +855,7 @@ class MP2StructureFactor(StructureFactor):
                 if compute_direct:
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('direct', int(qi))
+                        eijab_cache_key = ('eijab', int(qi))
                         if cache_key in t2_cache:
                             region_t0 = profile.start()
                             t2_qi = t2_cache[cache_key]
@@ -862,12 +863,22 @@ class MP2StructureFactor(StructureFactor):
                             profile.stop("direct t2 cache hit", region_t0)
                         else:
                             region_t0 = profile.start()
-                            t2_qi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                skip_if_no_qpt=True, mode='direct',Lov=Lov, verbose=logger.NOTE)
+                            return_eijab_recip = compute_q4
+                            t2_result = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
+                                                                    skip_if_no_qpt=True, mode='direct',Lov=Lov, verbose=logger.NOTE,
+                                                                    return_eijab_recip=return_eijab_recip)
+                            if return_eijab_recip:
+                                t2_qi, eijab = t2_result
+                                eijab = eijab.transpose(2,0,1,3,4,5,6)
+                                eijab = eijab[0]
+                            else:
+                                t2_qi = t2_result
                             t2_qi = t2_qi.transpose(2,0,1,3,4,5,6)
                             t2_qi = t2_qi[0]
                             if int(qi) in repeated_qis:
                                 t2_cache[cache_key] = t2_qi
+                                if return_eijab_recip:
+                                    t2_cache[eijab_cache_key] = eijab
                             t2_cache_counts['direct_misses'] += 1
                             profile.stop("direct t2 cache miss", region_t0)
 
@@ -897,11 +908,28 @@ class MP2StructureFactor(StructureFactor):
                 if compute_q4:
                     region_t0 = profile.start()
                     if t2_store_type == 'kikj':
-                        ka_at_qi = kas[qi]
-                        kb_at_qi = kbs[qi]
-                        eijab = mo_e_o[:,None,:,None,None,None] + mo_e_o[None,:,None,:,None,None] \
-                            -mo_e_v[ka_at_qi,None,None,None,:,None] - mo_e_v_b[None,kb_at_qi,None,None,None,:]
-                        eijab = 1/(eijab)
+                        eijab_cache_key = ('eijab', int(qi))
+                        if eijab is None:
+                            if eijab_cache_key in t2_cache:
+                                eijab = t2_cache[eijab_cache_key]
+                            else:
+                                _, eijab = self.compute_t2_amplitudes(
+                                    self.kmp,
+                                    self.kmp.mo_energy,
+                                    self.kmp.mo_coeff,
+                                    qGrid,
+                                    qGrid_sample=qpt.reshape(1,3),
+                                    skip_if_no_qpt=True,
+                                    mode='direct',
+                                    Lov=Lov,
+                                    verbose=logger.NOTE,
+                                    with_t2=False,
+                                    return_eijab_recip=True,
+                                )
+                                eijab = eijab.transpose(2,0,1,3,4,5,6)
+                                eijab = eijab[0]
+                                if int(qi) in repeated_qis:
+                                    t2_cache[eijab_cache_key] = eijab
                     else:
                         eijab = eijab_full[qi]
                     profile.stop("dG0 denominator setup", region_t0)
@@ -1077,9 +1105,11 @@ class MP2StructureFactor(StructureFactor):
             
     
 
-    def compute_t2_amplitudes(self, kmp, mo_energy, mo_coeff, qGrid, qGrid_sample=None, skip_if_no_qpt=False, mode='direct',Lov=None, verbose=logger.DEBUG):
+    def compute_t2_amplitudes(self, kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=None,
+                              skip_if_no_qpt=False, mode='direct',Lov=None, verbose=logger.DEBUG,
+                              return_eijab_recip=False, with_t2=True):
         
-        """Computes k-point RMP2 energy. Ripped off from KMP2.kernel(). lol.
+        """Computes k-point RMP2 energy.
 
         Args:
             mp (KMP2): an instance of KMP2
@@ -1093,13 +1123,18 @@ class MP2StructureFactor(StructureFactor):
             verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
             with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
             mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct' 
+            return_eijab_recip (bool, optional): whether to also return reciprocal
+                            MP2 denominators in the same layout as t2.
             
 
         Returns:
-            KMP2 energy and t2 amplitudes (=None if with_t2 is False)
+            t2 amplitudes by default. If return_eijab_recip is True, returns
+            (t2, eijab_recip); t2 is None when with_t2 is False.
         """
         if mode not in ['direct', 'exchange']:
             raise ValueError(f"Mode {mode} not recognized. Must be 'direct' or 'exchange'.")
+        if not with_t2:
+            return_eijab_recip = True
         cput0 = (logger.process_clock(), logger.perf_counter())
         log = logger.new_logger(kmp, verbose)
 
@@ -1110,15 +1145,17 @@ class MP2StructureFactor(StructureFactor):
         nocc = kmp.nocc
         nvir = nmo - nocc
         nkpts = kmp.nkpts
-        # qGrid = kmp.kpts if qGrid is None else qGrid
-        nka = np.array(qGrid_sample.shape[0]) if qGrid_sample is not None else nkpts
+        qGrid = kmp.kpts if qGrid is None else qGrid
+        nka = qGrid_sample.shape[0] if qGrid_sample is not None else len(qGrid)
 
 
         with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
 
         mem_avail = kmp.max_memory - lib.current_memory()[0]
-        mem_usage = (nkpts * (nocc * nvir)**2) * 16 / 1e6
-        if with_df_ints:
+        mem_usage = 0
+        if with_t2:
+            mem_usage += (nkpts * (nocc * nvir)**2) * 16 / 1e6
+        if with_t2 and with_df_ints:
             mydf = kmp._scf.with_df
             if mydf.auxcell is None:
                 # Calculate naux based on precomputed GDF integrals
@@ -1127,17 +1164,19 @@ class MP2StructureFactor(StructureFactor):
                 naux = mydf.auxcell.nao_nr()
 
             mem_usage += (nkpts**2 * naux * nocc * nvir) * 16 / 1e6
-        mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 16 / 1e6
+        if with_t2:
+            mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 16 / 1e6
+        if return_eijab_recip:
+            mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 8 / 1e6
         if mem_usage > mem_avail:
             raise MemoryError('Insufficient memory! MP2 memory usage %d MB (currently available %d MB)'
                             % (mem_usage, mem_avail))
 
-        eia = np.zeros((nocc,nvir))
-        eijab = np.zeros((nocc,nocc,nvir,nvir))
-
-        fao2mo = kmp._scf.with_df.ao2mo
+        fao2mo = kmp._scf.with_df.ao2mo if with_t2 else None
         kconserv = kmp.khelper.kconserv
-        oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff[0].dtype)
+        oovv_ij = None
+        if with_t2:
+            oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff[0].dtype)
 
         mo_e_o = [mo_energy[k][:nocc] for k in range(nkpts)]
         mo_e_v = [mo_energy[k][nocc:] for k in range(nkpts)]
@@ -1146,13 +1185,19 @@ class MP2StructureFactor(StructureFactor):
         nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(kmp, kind="split")
 
         if qGrid_sample is not None:
-            nka = np.array(qGrid_sample.shape[0]) if qGrid_sample is not None else nkpts
+            nka = qGrid_sample.shape[0]
             skip_if_no_qpt = True
 
 
-        t2 = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir), dtype=complex)
+        t2 = None
+        if with_t2:
+            t2 = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir), dtype=complex)
+        eijab_recip = None
+        if return_eijab_recip:
+            eijab_recip = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir),
+                                   dtype=mo_energy[0].dtype)
         # Build 3-index DF tensor Lov
-        if with_df_ints and Lov is None:
+        if with_t2 and with_df_ints and Lov is None:
             Lov = kmp2._init_mp_df_eris(kmp)
 
  
@@ -1165,6 +1210,8 @@ class MP2StructureFactor(StructureFactor):
         qpts = minimum_image(cell, qpts.reshape(-1,3))
         _, qi_map = q_tree.query(qpts, distance_upper_bound=1e-8)
         qi_map = qi_map.reshape(nkpts,nkpts)
+        active_qi_map = qi_map
+        active_qgrid_size = len(qGrid)
 
 
         # Find qpt
@@ -1173,34 +1220,37 @@ class MP2StructureFactor(StructureFactor):
             qsample_tree = scipy.spatial.KDTree(qGrid_sample)
             _, qi_map_sample = qsample_tree.query(qpts, distance_upper_bound=1e-8)
             qi_map_sample = qi_map_sample.reshape(nkpts,nkpts)
+            active_qi_map = qi_map_sample
+            active_qgrid_size = len(qGrid_sample)
         
         for ki in range(nkpts):
             for kj in range(nkpts):
                 # kref = ki if mode == 'direct' else kj
-                for ka in range(nkpts):
-                    if qi_map_sample[ka,ki] == len(qGrid_sample):
-                        num_skipped_qpts_oovv += 1
-                        if skip_if_no_qpt:
-                            continue
+                if with_t2:
+                    for ka in range(nkpts):
+                        if active_qi_map[ka,ki] == active_qgrid_size:
+                            num_skipped_qpts_oovv += 1
+                            if skip_if_no_qpt:
+                                continue
+                            else:
+                                raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+
+                        kb = kconserv[ki,ka,kj]
+                        # (ia|jb)
+                        kvirt = ka if mode == 'direct' else kb
+                        kvirt2 = kb if mode == 'direct' else ka
+                        if with_df_ints:
+                            oovv_ij[kvirt] = (1./nkpts) * einsum("Lia,Ljb->iajb", Lov[ki, kvirt], Lov[kj, kvirt2]).transpose(0,2,1,3)
                         else:
-                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
-                    
-                    kb = kconserv[ki,ka,kj]
-                    # (ia|jb)
-                    kvirt = ka if mode == 'direct' else kb
-                    kvirt2 = kb if mode == 'direct' else ka
-                    if with_df_ints:
-                        oovv_ij[kvirt] = (1./nkpts) * einsum("Lia,Ljb->iajb", Lov[ki, kvirt], Lov[kj, kvirt2]).transpose(0,2,1,3)
-                    else:
-                        orbo_i = mo_coeff[ki][:,:nocc]
-                        orbo_j = mo_coeff[kj][:,:nocc]
-                        orbv_a = mo_coeff[ka][:,nocc:]
-                        orbv_b = mo_coeff[kb][:,nocc:]
-                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
-                                            (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
-                                            compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
+                            orbo_i = mo_coeff[ki][:,:nocc]
+                            orbo_j = mo_coeff[kj][:,:nocc]
+                            orbv_a = mo_coeff[ka][:,nocc:]
+                            orbv_b = mo_coeff[kb][:,nocc:]
+                            oovv_ij[kvirt] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
+                                                (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
+                                                compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
                 for ka in range(nkpts):
-                    if qi_map_sample[ka,ki] == len(qGrid_sample):
+                    if active_qi_map[ka,ki] == active_qgrid_size:
                         num_skipped_qpts_t2 += 1
                         if skip_if_no_qpt:
                             continue
@@ -1210,7 +1260,7 @@ class MP2StructureFactor(StructureFactor):
                     kb = kconserv[ki,ka,kj]
                     kvirt = ka if mode == 'direct' else kb
                     kvirt2 = kb if mode == 'direct' else ka
-                    qi = qi_map[ka,ki] if qGrid_sample is None else qi_map_sample[ka,ki]
+                    qi = active_qi_map[ka,ki]
 
                     # Remove zero/padded elements from denominator
                     eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
@@ -1222,12 +1272,18 @@ class MP2StructureFactor(StructureFactor):
                     ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kvirt2])[n0_ovp_jb]
 
                     eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
-                    t2_ijab = np.conj(oovv_ij[kvirt]/eijab)
-                    t2[ki, kj, qi] = t2_ijab
+                    eijab_recip_ijab = 1 / eijab
+                    if return_eijab_recip:
+                        eijab_recip[ki, kj, qi] = eijab_recip_ijab
+                    if with_t2:
+                        t2_ijab = np.conj(oovv_ij[kvirt] * eijab_recip_ijab)
+                        t2[ki, kj, qi] = t2_ijab
 
 
         log.timer("KMP2", *cput0)
         print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
         print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
 
+        if return_eijab_recip:
+            return t2, eijab_recip
         return t2
