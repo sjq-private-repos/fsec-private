@@ -113,45 +113,56 @@ class MP2StructureFactor(StructureFactor):
         q4_weighted_norm = 0.0
 
         for m, n, factor in pair_representatives:
-            region_t0 = profile.start() if profile is not None else None
-            rijab_mn = np.einsum(
-                'ia,bj->ijab',
-                rho_ia_full[m],
-                rho_jb_full[n].conj(),
-                optimize=True,
-            )
-            if profile is not None:
-                profile.stop("TRS rijab block construction", region_t0)
             if direct_t2 is not None:
                 region_t0 = profile.start() if profile is not None else None
-                direct_block = np.einsum(
-                    'ijab,ijab->',
-                    rijab_mn,
+                tmp_jb = np.einsum(
+                    'ia,ijab->jb',
+                    rho_ia_full[m],
                     direct_t2[m, n],
+                    optimize=True,
+                )
+                direct_block = np.einsum(
+                    'jb,bj->',
+                    tmp_jb,
+                    rho_jb_full[n].conj(),
                     optimize=True,
                 )
                 direct_value += factor * direct_block.real
                 if profile is not None:
-                    profile.stop("TRS direct block contraction", region_t0)
+                    profile.stop("TRS direct rho/t2 contraction", region_t0)
             if exchange_t2 is not None:
                 region_t0 = profile.start() if profile is not None else None
-                exchange_block = np.einsum(
-                    'ijab,ijba->',
-                    rijab_mn,
+                tmp_jb = np.einsum(
+                    'ia,ijba->jb',
+                    rho_ia_full[m],
                     exchange_t2[m, n],
+                    optimize=True,
+                )
+                exchange_block = np.einsum(
+                    'jb,bj->',
+                    tmp_jb,
+                    rho_jb_full[n].conj(),
                     optimize=True,
                 )
                 exchange_value += factor * exchange_block.real
                 if profile is not None:
-                    profile.stop("TRS exchange block contraction", region_t0)
+                    profile.stop("TRS exchange rho/t2 contraction", region_t0)
             if eijab_recip is not None:
                 region_t0 = profile.start() if profile is not None else None
-                abs_rijab_mn = np.abs(rijab_mn)**2
-                q4_weighted_norm += factor * np.sum(
-                    abs_rijab_mn * np.abs(eijab_recip[m, n])
+                tmp_jb = np.einsum(
+                    'ia,ijab->jb',
+                    np.abs(rho_ia_full[m])**2,
+                    np.abs(eijab_recip[m, n]),
+                    optimize=True,
+                )
+                q4_weighted_norm += factor * np.einsum(
+                    'jb,bj->',
+                    tmp_jb,
+                    np.abs(rho_jb_full[n])**2,
+                    optimize=True,
                 )
                 if profile is not None:
-                    profile.stop("TRS dG0 weighted norm", region_t0)
+                    profile.stop("TRS dG0 rho/denominator contraction", region_t0)
 
         return direct_value, exchange_value, q4_weighted_norm
 
