@@ -29,6 +29,227 @@ from fsec.singularity_subtraction.structure_factor.helpers_sf import (
     update_line_sampling_decay_mask,
 )
 
+
+def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=None,
+                          skip_if_no_qpt=False, mode='direct', Lov=None, verbose=logger.DEBUG,
+                          return_eijab_recip=False, with_t2=True):
+    """Computes k-point RMP2 energy.
+
+    Args:
+        mp (KMP2): an instance of KMP2
+        mo_energy (list): a list of numpy.ndarray. Each array contains MO energies of
+                        shape (Nmo,) for one kpt. If frozen orbitals or per-k ragged
+                        shapes are present, they are canonicalized via
+                        kmp2._add_padding so the body of this function can safely
+                        use kmp.nocc / kmp.nmo and kmp2.padding_k_idx.
+        mo_coeff (list): a list of numpy.ndarray. Each array contains MO coefficients
+                        of shape (Nao, Nmo) for one kpt. Padded analogously.
+        verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
+        with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
+        mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct'
+        return_eijab_recip (bool, optional): whether to also return reciprocal
+                        MP2 denominators in the same layout as t2.
+
+    Returns:
+        t2 amplitudes by default. If return_eijab_recip is True, returns
+        (t2, eijab_recip); t2 is None when with_t2 is False.
+    """
+    if mode not in ['direct', 'exchange']:
+        raise ValueError(f"Mode {mode} not recognized. Must be 'direct' or 'exchange'.")
+    if not with_t2:
+        return_eijab_recip = True
+    profile = TimingProfile()
+    cput0 = profile.start()
+    log = logger.new_logger(kmp, verbose)
+
+    region_t0 = profile.start()
+    kmp.dump_flags()
+    cell = kmp._scf.cell
+    mo_coeff, mo_energy = kmp2._add_padding(kmp, mo_coeff, mo_energy)
+    nmo = kmp.nmo
+    nocc = kmp.nocc
+    nvir = nmo - nocc
+    nkpts = kmp.nkpts
+    qGrid = kmp.kpts if qGrid is None else qGrid
+    nka = qGrid_sample.shape[0] if qGrid_sample is not None else len(qGrid)
+    profile.stop("compute_t2 setup/padding", region_t0)
+
+    region_t0 = profile.start()
+    with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
+
+    mem_avail = kmp.max_memory - lib.current_memory()[0]
+    mem_usage = 0
+    if with_t2:
+        mem_usage += (nkpts * (nocc * nvir)**2) * 16 / 1e6
+    if with_t2 and with_df_ints:
+        mydf = kmp._scf.with_df
+        if mydf.auxcell is None:
+            # Calculate naux based on precomputed GDF integrals
+            naux = mydf.get_naoaux()
+        else:
+            naux = mydf.auxcell.nao_nr()
+
+        mem_usage += (nkpts**2 * naux * nocc * nvir) * 16 / 1e6
+    if with_t2:
+        mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 16 / 1e6
+    if return_eijab_recip:
+        mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 8 / 1e6
+    if mem_usage > mem_avail:
+        raise MemoryError('Insufficient memory! MP2 memory usage %d MB (currently available %d MB)'
+                          % (mem_usage, mem_avail))
+    profile.stop("compute_t2 memory estimate", region_t0)
+
+    region_t0 = profile.start()
+    fao2mo = kmp._scf.with_df.ao2mo if with_t2 else None
+    kconserv = kmp.khelper.kconserv
+    profile.stop("compute_t2 workspace allocation", region_t0)
+
+    region_t0 = profile.start()
+    mo_e_o = [mo_energy[k][:nocc] for k in range(nkpts)]
+    mo_e_v = [mo_energy[k][nocc:] for k in range(nkpts)]
+
+    # Get location of non-zero/padded elements in occupied and virtual space
+    nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(kmp, kind="split")
+    profile.stop("compute_t2 energy/padding setup", region_t0)
+
+    if qGrid_sample is not None:
+        nka = qGrid_sample.shape[0]
+        skip_if_no_qpt = True
+
+    region_t0 = profile.start()
+    t2 = None
+    if with_t2:
+        t2 = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir), dtype=complex)
+    eijab_recip = None
+    if return_eijab_recip:
+        eijab_recip = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir),
+                               dtype=mo_energy[0].dtype)
+    profile.stop("compute_t2 output allocation", region_t0)
+
+    # Build 3-index DF tensor Lov
+    if with_t2 and with_df_ints and Lov is None:
+        region_t0 = profile.start()
+        Lov = kmp2._init_mp_df_eris(kmp)
+        profile.stop("compute_t2 DF integral init", region_t0)
+
+    region_t0 = profile.start()
+    q_tree = scipy.spatial.KDTree(qGrid)
+    num_skipped_qpts_oovv = 0
+    num_skipped_qpts_t2 = 0
+
+    qpts = kmp.kpts[:,None,:] - kmp.kpts[None,:,:]
+    qpts = minimum_image(cell, qpts.reshape(-1,3))
+    _, qi_map = q_tree.query(qpts, distance_upper_bound=1e-8)
+    qi_map = qi_map.reshape(nkpts,nkpts)
+    active_qi_map = qi_map
+    active_qgrid_size = len(qGrid)
+    profile.stop("compute_t2 q-map setup", region_t0)
+
+    # Find qpt
+    if qGrid_sample is not None:
+        region_t0 = profile.start()
+        qGrid_sample = minimum_image(cell, qGrid_sample.reshape(-1,3))
+        qsample_tree = scipy.spatial.KDTree(qGrid_sample)
+        _, qi_map_sample = qsample_tree.query(qpts, distance_upper_bound=1e-8)
+        qi_map_sample = qi_map_sample.reshape(nkpts,nkpts)
+        active_qi_map = qi_map_sample
+        active_qgrid_size = len(qGrid_sample)
+        profile.stop("compute_t2 sampled q-map setup", region_t0)
+
+    loop_t0 = profile.start()
+    for ki in range(nkpts):
+        for kj in range(nkpts):
+            # kref = ki if mode == 'direct' else kj
+            for ka in range(nkpts):
+                if active_qi_map[ka,ki] == active_qgrid_size:
+                    if with_t2:
+                        num_skipped_qpts_oovv += 1
+                        if not skip_if_no_qpt:
+                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                    num_skipped_qpts_t2 += 1
+                    if not skip_if_no_qpt:
+                        raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                    continue
+
+                kb = kconserv[ki,ka,kj]
+                kvirt = ka if mode == 'direct' else kb
+                kvirt2 = kb if mode == 'direct' else ka
+                qi = active_qi_map[ka,ki]
+
+                oovv_block = None
+                if with_t2:
+                    # (ia|jb)
+                    if with_df_ints:
+                        region_t0 = profile.start()
+                        oovv_block = (1./nkpts) * einsum(
+                            "Lia,Ljb->iajb",
+                            Lov[ki, kvirt],
+                            Lov[kj, kvirt2],
+                        ).transpose(0,2,1,3)
+                        profile.stop("compute_t2 DF oovv block", region_t0)
+                    else:
+                        region_t0 = profile.start()
+                        orbo_i = mo_coeff[ki][:,:nocc]
+                        orbo_j = mo_coeff[kj][:,:nocc]
+                        orbv_a = mo_coeff[ka][:,nocc:]
+                        orbv_b = mo_coeff[kb][:,nocc:]
+                        oovv_block = fao2mo(
+                            (orbo_i,orbv_a,orbo_j,orbv_b),
+                            (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
+                            compact=False
+                        ).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
+                        profile.stop("compute_t2 AO2MO oovv block", region_t0)
+
+                # Remove zero/padded elements from denominator
+                region_t0 = profile.start()
+                eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
+                n0_ovp_ia = np.ix_(nonzero_opadding[ki], nonzero_vpadding[kvirt])
+                eia[n0_ovp_ia] = (mo_e_o[ki][:,None] - mo_e_v[kvirt])[n0_ovp_ia]
+
+                ejb = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
+                n0_ovp_jb = np.ix_(nonzero_opadding[kj], nonzero_vpadding[kvirt2])
+                ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kvirt2])[n0_ovp_jb]
+
+                eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
+                eijab_recip_ijab = 1 / eijab
+                profile.stop("compute_t2 denominator reciprocal", region_t0)
+                if return_eijab_recip:
+                    region_t0 = profile.start()
+                    eijab_recip[ki, kj, qi] = eijab_recip_ijab
+                    profile.stop("compute_t2 denominator store", region_t0)
+                if with_t2:
+                    region_t0 = profile.start()
+                    out = t2[ki, kj, qi]
+                    np.conjugate(oovv_block, out=out)
+                    out *= eijab_recip_ijab
+                    profile.stop("compute_t2 amplitude store", region_t0)
+    profile.stop("compute_t2 main loops", loop_t0)
+
+    log.timer("KMP2", *cput0)
+    print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
+    print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
+    timings = profile.summary(cput0)
+    total = timings["total"]
+    log.debug(
+        "compute_t2 CPU %.2f sec, wall %.2f sec",
+        total["cpu"], total["wall"],
+    )
+    for label, values in sorted(
+            ((key, value) for key, value in timings.items() if key != "total"),
+            key=lambda item: item[1]["wall"], reverse=True):
+        cpu_fraction = 100.0 * values["cpu"] / total["cpu"] if total["cpu"] else 0.0
+        wall_fraction = 100.0 * values["wall"] / total["wall"] if total["wall"] else 0.0
+        log.debug(
+            "  %-36s CPU %9.2f sec (%5.1f%%), wall %9.2f sec (%5.1f%%)",
+            label, values["cpu"], cpu_fraction,
+            values["wall"], wall_fraction,
+        )
+
+    if return_eijab_recip:
+        return t2, eijab_recip
+    return t2
+
+
 class MP2StructureFactor(StructureFactor):
     def __init__(self, kmf, kmp, t2=None, N_local=None, sq_ke_cutoff=None, qG_cutoff=None, relative_shift=0.0, **kwargs):
         """
@@ -351,7 +572,7 @@ class MP2StructureFactor(StructureFactor):
                 # NOTE: t2 MUST be in the kikjq format
                 if self.t2 is None:
                     phase_t0 = profile.start()
-                    t2 = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff) # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
+                    t2 = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff) # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
                     profile.stop("full t2 construction", phase_t0)
                 else:
                     t2 = self.t2
@@ -875,8 +1096,8 @@ class MP2StructureFactor(StructureFactor):
                         else:
                             region_t0 = profile.start()
                             return_eijab_recip = compute_q4
-                            t2_result = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                    skip_if_no_qpt=True, mode='direct',Lov=Lov, verbose=logger.NOTE,
+                            t2_result = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
+                                                                    skip_if_no_qpt=True, mode='direct', Lov=Lov, verbose=logger.NOTE,
                                                                     return_eijab_recip=return_eijab_recip)
                             if return_eijab_recip:
                                 t2_qi, eijab = t2_result
@@ -903,8 +1124,8 @@ class MP2StructureFactor(StructureFactor):
                             profile.stop("exchange t2 cache hit", region_t0)
                         else:
                             region_t0 = profile.start()
-                            t2_qpi = self.compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                skip_if_no_qpt=True, mode='exchange',Lov=Lov, verbose=logger.NOTE)
+                            t2_qpi = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
+                                                                skip_if_no_qpt=True, mode='exchange', Lov=Lov, verbose=logger.NOTE)
                             t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
                             t2_qpi = t2_qpi[0]
                             if int(qi) in repeated_qis:
@@ -924,7 +1145,7 @@ class MP2StructureFactor(StructureFactor):
                             if eijab_cache_key in t2_cache:
                                 eijab = t2_cache[eijab_cache_key]
                             else:
-                                _, eijab = self.compute_t2_amplitudes(
+                                _, eijab = compute_t2_amplitudes(
                                     self.kmp,
                                     self.kmp.mo_energy,
                                     self.kmp.mo_coeff,
@@ -1112,234 +1333,3 @@ class MP2StructureFactor(StructureFactor):
         self.last_build_timings = profile.summary(total_t0)
         profile.log_summary(log, self.last_build_timings)
         return result_dict
-                
-            
-    
-
-    def compute_t2_amplitudes(self, kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=None,
-                              skip_if_no_qpt=False, mode='direct',Lov=None, verbose=logger.DEBUG,
-                              return_eijab_recip=False, with_t2=True):
-        
-        """Computes k-point RMP2 energy.
-
-        Args:
-            mp (KMP2): an instance of KMP2
-            mo_energy (list): a list of numpy.ndarray. Each array contains MO energies of
-                            shape (Nmo,) for one kpt. If frozen orbitals or per-k ragged
-                            shapes are present, they are canonicalized via
-                            kmp2._add_padding so the body of this function can safely
-                            use kmp.nocc / kmp.nmo and kmp2.padding_k_idx.
-            mo_coeff (list): a list of numpy.ndarray. Each array contains MO coefficients
-                            of shape (Nao, Nmo) for one kpt. Padded analogously.
-            verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
-            with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
-            mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct' 
-            return_eijab_recip (bool, optional): whether to also return reciprocal
-                            MP2 denominators in the same layout as t2.
-            
-
-        Returns:
-            t2 amplitudes by default. If return_eijab_recip is True, returns
-            (t2, eijab_recip); t2 is None when with_t2 is False.
-        """
-        if mode not in ['direct', 'exchange']:
-            raise ValueError(f"Mode {mode} not recognized. Must be 'direct' or 'exchange'.")
-        if not with_t2:
-            return_eijab_recip = True
-        profile = TimingProfile()
-        cput0 = profile.start()
-        log = logger.new_logger(kmp, verbose)
-
-        region_t0 = profile.start()
-        kmp.dump_flags()
-        cell = kmp._scf.cell
-        mo_coeff, mo_energy = kmp2._add_padding(kmp, mo_coeff, mo_energy)
-        nmo = kmp.nmo
-        nocc = kmp.nocc
-        nvir = nmo - nocc
-        nkpts = kmp.nkpts
-        qGrid = kmp.kpts if qGrid is None else qGrid
-        nka = qGrid_sample.shape[0] if qGrid_sample is not None else len(qGrid)
-        profile.stop("compute_t2 setup/padding", region_t0)
-
-
-        region_t0 = profile.start()
-        with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
-
-        mem_avail = kmp.max_memory - lib.current_memory()[0]
-        mem_usage = 0
-        if with_t2:
-            mem_usage += (nkpts * (nocc * nvir)**2) * 16 / 1e6
-        if with_t2 and with_df_ints:
-            mydf = kmp._scf.with_df
-            if mydf.auxcell is None:
-                # Calculate naux based on precomputed GDF integrals
-                naux = mydf.get_naoaux()
-            else:
-                naux = mydf.auxcell.nao_nr()
-
-            mem_usage += (nkpts**2 * naux * nocc * nvir) * 16 / 1e6
-        if with_t2:
-            mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 16 / 1e6
-        if return_eijab_recip:
-            mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 8 / 1e6
-        if mem_usage > mem_avail:
-            raise MemoryError('Insufficient memory! MP2 memory usage %d MB (currently available %d MB)'
-                            % (mem_usage, mem_avail))
-        profile.stop("compute_t2 memory estimate", region_t0)
-
-        region_t0 = profile.start()
-        fao2mo = kmp._scf.with_df.ao2mo if with_t2 else None
-        kconserv = kmp.khelper.kconserv
-        profile.stop("compute_t2 workspace allocation", region_t0)
-
-        region_t0 = profile.start()
-        mo_e_o = [mo_energy[k][:nocc] for k in range(nkpts)]
-        mo_e_v = [mo_energy[k][nocc:] for k in range(nkpts)]
-
-        # Get location of non-zero/padded elements in occupied and virtual space
-        nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(kmp, kind="split")
-        profile.stop("compute_t2 energy/padding setup", region_t0)
-
-        if qGrid_sample is not None:
-            nka = qGrid_sample.shape[0]
-            skip_if_no_qpt = True
-
-
-        region_t0 = profile.start()
-        t2 = None
-        if with_t2:
-            t2 = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir), dtype=complex)
-        eijab_recip = None
-        if return_eijab_recip:
-            eijab_recip = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir),
-                                   dtype=mo_energy[0].dtype)
-        profile.stop("compute_t2 output allocation", region_t0)
-
-        # Build 3-index DF tensor Lov
-        if with_t2 and with_df_ints and Lov is None:
-            region_t0 = profile.start()
-            Lov = kmp2._init_mp_df_eris(kmp)
-            profile.stop("compute_t2 DF integral init", region_t0)
-
- 
-        region_t0 = profile.start()
-        q_tree = scipy.spatial.KDTree(qGrid)
-        num_skipped_qpts_oovv = 0
-        num_skipped_qpts_t2 = 0
-
-        
-        qpts = kmp.kpts[:,None,:] - kmp.kpts[None,:,:]
-        qpts = minimum_image(cell, qpts.reshape(-1,3))
-        _, qi_map = q_tree.query(qpts, distance_upper_bound=1e-8)
-        qi_map = qi_map.reshape(nkpts,nkpts)
-        active_qi_map = qi_map
-        active_qgrid_size = len(qGrid)
-        profile.stop("compute_t2 q-map setup", region_t0)
-
-
-        # Find qpt
-        if qGrid_sample is not None:
-            region_t0 = profile.start()
-            qGrid_sample = minimum_image(cell, qGrid_sample.reshape(-1,3))
-            qsample_tree = scipy.spatial.KDTree(qGrid_sample)
-            _, qi_map_sample = qsample_tree.query(qpts, distance_upper_bound=1e-8)
-            qi_map_sample = qi_map_sample.reshape(nkpts,nkpts)
-            active_qi_map = qi_map_sample
-            active_qgrid_size = len(qGrid_sample)
-            profile.stop("compute_t2 sampled q-map setup", region_t0)
-        
-        loop_t0 = profile.start()
-        for ki in range(nkpts):
-            for kj in range(nkpts):
-                # kref = ki if mode == 'direct' else kj
-                for ka in range(nkpts):
-                    if active_qi_map[ka,ki] == active_qgrid_size:
-                        if with_t2:
-                            num_skipped_qpts_oovv += 1
-                            if not skip_if_no_qpt:
-                                raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
-                        num_skipped_qpts_t2 += 1
-                        if not skip_if_no_qpt:
-                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
-                        continue
-
-                    kb = kconserv[ki,ka,kj]
-                    kvirt = ka if mode == 'direct' else kb
-                    kvirt2 = kb if mode == 'direct' else ka
-                    qi = active_qi_map[ka,ki]
-
-                    oovv_block = None
-                    if with_t2:
-                        # (ia|jb)
-                        if with_df_ints:
-                            region_t0 = profile.start()
-                            oovv_block = (1./nkpts) * einsum(
-                                "Lia,Ljb->iajb",
-                                Lov[ki, kvirt],
-                                Lov[kj, kvirt2],
-                            ).transpose(0,2,1,3)
-                            profile.stop("compute_t2 DF oovv block", region_t0)
-                        else:
-                            region_t0 = profile.start()
-                            orbo_i = mo_coeff[ki][:,:nocc]
-                            orbo_j = mo_coeff[kj][:,:nocc]
-                            orbv_a = mo_coeff[ka][:,nocc:]
-                            orbv_b = mo_coeff[kb][:,nocc:]
-                            oovv_block = fao2mo(
-                                (orbo_i,orbv_a,orbo_j,orbv_b),
-                                (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
-                                compact=False
-                            ).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
-                            profile.stop("compute_t2 AO2MO oovv block", region_t0)
-
-                    # Remove zero/padded elements from denominator
-                    region_t0 = profile.start()
-                    eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
-                    n0_ovp_ia = np.ix_(nonzero_opadding[ki], nonzero_vpadding[kvirt])
-                    eia[n0_ovp_ia] = (mo_e_o[ki][:,None] - mo_e_v[kvirt])[n0_ovp_ia]
-
-                    ejb = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
-                    n0_ovp_jb = np.ix_(nonzero_opadding[kj], nonzero_vpadding[kvirt2])
-                    ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kvirt2])[n0_ovp_jb]
-
-                    eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
-                    eijab_recip_ijab = 1 / eijab
-                    profile.stop("compute_t2 denominator reciprocal", region_t0)
-                    if return_eijab_recip:
-                        region_t0 = profile.start()
-                        eijab_recip[ki, kj, qi] = eijab_recip_ijab
-                        profile.stop("compute_t2 denominator store", region_t0)
-                    if with_t2:
-                        region_t0 = profile.start()
-                        out = t2[ki, kj, qi]
-                        np.conjugate(oovv_block, out=out)
-                        out *= eijab_recip_ijab
-                        profile.stop("compute_t2 amplitude store", region_t0)
-        profile.stop("compute_t2 main loops", loop_t0)
-
-
-        log.timer("KMP2", *cput0)
-        print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
-        print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
-        self.last_compute_t2_timings = profile.summary(cput0)
-        total = self.last_compute_t2_timings["total"]
-        log.note(
-            "compute_t2 CPU %.2f sec, wall %.2f sec",
-            total["cpu"], total["wall"],
-        )
-        for label, values in sorted(
-                ((key, value) for key, value in self.last_compute_t2_timings.items()
-                 if key != "total"),
-                key=lambda item: item[1]["wall"], reverse=True):
-            cpu_fraction = 100.0 * values["cpu"] / total["cpu"] if total["cpu"] else 0.0
-            wall_fraction = 100.0 * values["wall"] / total["wall"] if total["wall"] else 0.0
-            log.note(
-                "  %-36s CPU %9.2f sec (%5.1f%%), wall %9.2f sec (%5.1f%%)",
-                label, values["cpu"], cpu_fraction,
-                values["wall"], wall_fraction,
-            )
-
-        if return_eijab_recip:
-            return t2, eijab_recip
-        return t2
