@@ -1,29 +1,19 @@
 import unittest
 
 import numpy as np
+from pyscf.pbc import df, mp
+from pyscf.pbc import gto, scf
 
-try:
-    from pyscf.pbc import gto, scf
-    from pyscf.pbc import df, mp
-    HAS_PYSCF = True
-except ImportError:
-    HAS_PYSCF = False
-
-try:
-    from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
-    from fsec.singularity_subtraction.grids import ExxSSGrids
-    from fsec.singularity_subtraction.structure_factor.helpers_sf import (
-        make_line_sampling_decay_state,
-        normalize_line_sampling_decay_components,
-        should_compute_line_sample,
-        update_line_sampling_decay_mask,
-    )
-    HAS_MP2_IMPORT = True
-except ImportError:
-    HAS_MP2_IMPORT = False
+from fsec.singularity_subtraction.grids import ExxSSGrids
+from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+    make_line_sampling_decay_state,
+    normalize_line_sampling_decay_components,
+    should_compute_line_sample,
+    update_line_sampling_decay_mask,
+)
+from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
 
 
-@unittest.skipUnless(HAS_MP2_IMPORT, "fsec structure_factor deps are required")
 class LineSamplingDecayHelpers(unittest.TestCase):
     def test_line_sampling_decay_rejects_unimplemented_components(self):
         with self.assertRaises(NotImplementedError):
@@ -171,7 +161,6 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         self.assertAlmostEqual(q4, full_q4, places=12)
 
 
-@unittest.skipUnless(HAS_PYSCF and HAS_MP2_IMPORT, "PySCF and fsec structure_factor deps are required")
 class KnownValues(unittest.TestCase):
     @classmethod
     def _build_system(cls, kmesh):

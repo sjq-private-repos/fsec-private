@@ -1,22 +1,12 @@
 import unittest
 
 import numpy as np
+from pyscf.pbc import df
+from pyscf.pbc import gto, scf
 
-try:
-    from pyscf.pbc import gto, scf
-    from pyscf.pbc import df
-    HAS_PYSCF = True
-except ImportError:
-    HAS_PYSCF = False
-
-try:
-    from fsec.singularity_subtraction.structure_factor.exx_sf import ExxStructureFactor
-    HAS_EXX_IMPORT = True
-except ImportError:
-    HAS_EXX_IMPORT = False
+from fsec.singularity_subtraction.structure_factor.exx_sf import ExxStructureFactor
 
 
-@unittest.skipUnless(HAS_PYSCF and HAS_EXX_IMPORT, "PySCF and fsec structure_factor deps are required")
 class KnownValues(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
