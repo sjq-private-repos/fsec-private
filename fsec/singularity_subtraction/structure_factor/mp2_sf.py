@@ -424,14 +424,14 @@ class MP2StructureFactor(StructureFactor):
             ka = int(kas_at_qi[m])
             kb = int(kbs_at_qi[n])
 
-            direct_recip = None
+            edenom = None
             if compute_direct or compute_q4:
                 region_t0 = profile.start() if profile is not None else None
                 eia = MP2StructureFactor._build_eov_pair(
                     m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
                 ejb = MP2StructureFactor._build_eov_pair(
                     n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
-                direct_recip = 1 / lib.direct_sum('ia,jb->ijab', eia, ejb)
+                edenom = 1 / lib.direct_sum('ia,jb->ijab', eia, ejb)
                 if profile is not None:
                     profile.stop("TRS Lov direct denominator", region_t0)
 
@@ -439,14 +439,14 @@ class MP2StructureFactor(StructureFactor):
                 region_t0 = profile.start() if profile is not None else None
                 Lov_mka = MP2StructureFactor._lov_block(Lov, m, ka).conj()
                 Lov_nkb = MP2StructureFactor._lov_block(Lov_b, n, kb).conj()
-                x_lia = Lov_mka * rho_ia_full[m][None, :, :]
-                y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :]
+                x_lia = Lov_mka * rho_ia_full[m][None, :, :] # CPU ~ O(naux, nocc, nvir)
+                y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :] # CPU ~ O(naux, nvir, nocc)
                 naux = x_lia.shape[0]
                 x_lia = x_lia.reshape(naux, -1)
                 y_ljb = y_ljb.reshape(naux, -1)
-                direct_matrix = direct_recip.transpose(0, 2, 1, 3).reshape(
+                edenom_matrix = edenom.transpose(0, 2, 1, 3).reshape(
                     x_lia.shape[1], y_ljb.shape[1])
-                direct_block = np.sum((x_lia @ direct_matrix) * y_ljb)
+                direct_block = np.sum((x_lia @ edenom_matrix) * y_ljb)
                 direct_value += factor * (direct_block / nkpts).real
                 if profile is not None:
                     profile.stop("TRS Lov direct contraction", region_t0)
@@ -459,17 +459,21 @@ class MP2StructureFactor(StructureFactor):
                     m, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
                 eja = MP2StructureFactor._build_eov_pair(
                     n, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
-                for i in range(mo_e_o.shape[1]):
-                    for j in range(mo_e_o.shape[1]):
-                        b_factor = (
-                            Lov_mkb[:, i, :]
-                            * rho_jb_full[n].conj()[:, j][None, :]
-                        )
-                        a_factor = Lov_nka[:, j, :] * rho_ia_full[m, i, :][None, :]
-                        denom_recip = 1 / (eib[i, :, None] + eja[j, None, :])
-                        exchange_block = np.sum(
-                            (a_factor @ denom_recip.T) * b_factor)
-                        exchange_value += factor * (exchange_block / nkpts).real
+                naux, nocc, nvir = Lov_mkb.shape
+                eris_ib_ja = (
+                    Lov_mkb.transpose(1, 2, 0).reshape(nocc * nvir, naux)
+                    @ Lov_nka.reshape(naux, nocc * nvir)
+                )
+                eris_ijba = eris_ib_ja.reshape(
+                    nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
+                edenom_exchange = 1 / (
+                    eib[:, None, :, None] + eja[None, :, None, :])
+                exchange_t2_ijba = (eris_ijba * edenom_exchange) / nkpts
+                exchange_ia_jb = exchange_t2_ijba.transpose(
+                    0, 3, 1, 2).reshape(nocc * nvir, nocc * nvir)
+                tmp_ia = exchange_ia_jb @ rho_jb_full[n].conj().T.reshape(-1)
+                exchange_block = rho_ia_full[m].reshape(-1) @ tmp_ia
+                exchange_value += factor * exchange_block.real
                 if profile is not None:
                     profile.stop("TRS Lov exchange contraction", region_t0)
 
@@ -478,7 +482,7 @@ class MP2StructureFactor(StructureFactor):
                 rho_ia_abs = np.abs(rho_ia_full[m])**2
                 rho_jb_abs = np.abs(rho_jb_full[n])**2
                 tmp_jb = rho_ia_abs.reshape(-1) @ (
-                    np.abs(direct_recip).transpose(0, 2, 1, 3).reshape(
+                    np.abs(edenom).transpose(0, 2, 1, 3).reshape(
                         rho_ia_abs.size, rho_jb_abs.size)
                 )
                 q4_weighted_norm += factor * np.dot(
