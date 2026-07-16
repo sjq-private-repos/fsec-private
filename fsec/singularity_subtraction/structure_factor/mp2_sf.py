@@ -1191,9 +1191,6 @@ class MP2StructureFactor(StructureFactor):
         region_t0 = profile.start()
         fao2mo = kmp._scf.with_df.ao2mo if with_t2 else None
         kconserv = kmp.khelper.kconserv
-        oovv_ij = None
-        if with_t2:
-            oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff[0].dtype)
         profile.stop("compute_t2 workspace allocation", region_t0)
 
         region_t0 = profile.start()
@@ -1256,22 +1253,32 @@ class MP2StructureFactor(StructureFactor):
         for ki in range(nkpts):
             for kj in range(nkpts):
                 # kref = ki if mode == 'direct' else kj
-                if with_t2:
-                    for ka in range(nkpts):
-                        if active_qi_map[ka,ki] == active_qgrid_size:
+                for ka in range(nkpts):
+                    if active_qi_map[ka,ki] == active_qgrid_size:
+                        if with_t2:
                             num_skipped_qpts_oovv += 1
-                            if skip_if_no_qpt:
-                                continue
-                            else:
+                            if not skip_if_no_qpt:
                                 raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                        num_skipped_qpts_t2 += 1
+                        if not skip_if_no_qpt:
+                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                        continue
 
-                        kb = kconserv[ki,ka,kj]
+                    kb = kconserv[ki,ka,kj]
+                    kvirt = ka if mode == 'direct' else kb
+                    kvirt2 = kb if mode == 'direct' else ka
+                    qi = active_qi_map[ka,ki]
+
+                    oovv_block = None
+                    if with_t2:
                         # (ia|jb)
-                        kvirt = ka if mode == 'direct' else kb
-                        kvirt2 = kb if mode == 'direct' else ka
                         if with_df_ints:
                             region_t0 = profile.start()
-                            oovv_ij[kvirt] = (1./nkpts) * einsum("Lia,Ljb->iajb", Lov[ki, kvirt], Lov[kj, kvirt2]).transpose(0,2,1,3)
+                            oovv_block = (1./nkpts) * einsum(
+                                "Lia,Ljb->iajb",
+                                Lov[ki, kvirt],
+                                Lov[kj, kvirt2],
+                            ).transpose(0,2,1,3)
                             profile.stop("compute_t2 DF oovv block", region_t0)
                         else:
                             region_t0 = profile.start()
@@ -1279,22 +1286,12 @@ class MP2StructureFactor(StructureFactor):
                             orbo_j = mo_coeff[kj][:,:nocc]
                             orbv_a = mo_coeff[ka][:,nocc:]
                             orbv_b = mo_coeff[kb][:,nocc:]
-                            oovv_ij[kvirt] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
-                                                (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
-                                                compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
+                            oovv_block = fao2mo(
+                                (orbo_i,orbv_a,orbo_j,orbv_b),
+                                (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
+                                compact=False
+                            ).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
                             profile.stop("compute_t2 AO2MO oovv block", region_t0)
-                for ka in range(nkpts):
-                    if active_qi_map[ka,ki] == active_qgrid_size:
-                        num_skipped_qpts_t2 += 1
-                        if skip_if_no_qpt:
-                            continue
-                        else:
-                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
-                    
-                    kb = kconserv[ki,ka,kj]
-                    kvirt = ka if mode == 'direct' else kb
-                    kvirt2 = kb if mode == 'direct' else ka
-                    qi = active_qi_map[ka,ki]
 
                     # Remove zero/padded elements from denominator
                     region_t0 = profile.start()
@@ -1315,8 +1312,9 @@ class MP2StructureFactor(StructureFactor):
                         profile.stop("compute_t2 denominator store", region_t0)
                     if with_t2:
                         region_t0 = profile.start()
-                        t2_ijab = np.conj(oovv_ij[kvirt] * eijab_recip_ijab)
-                        t2[ki, kj, qi] = t2_ijab
+                        out = t2[ki, kj, qi]
+                        np.conjugate(oovv_block, out=out)
+                        out *= eijab_recip_ijab
                         profile.stop("compute_t2 amplitude store", region_t0)
         profile.stop("compute_t2 main loops", loop_t0)
 
