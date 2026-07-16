@@ -388,6 +388,107 @@ class MP2StructureFactor(StructureFactor):
         return direct_value, exchange_value, q4_weighted_norm
 
     @staticmethod
+    def _lov_block(Lov, ko, kv):
+        """Return a (naux, nocc, nvir) Lov block for supported layouts."""
+        Lov = np.asarray(Lov)
+        if Lov.ndim == 2:
+            return np.asarray(Lov[ko, kv])
+        if Lov.ndim == 4:
+            return np.asarray(Lov[ko])
+        raise ValueError("Lov must be a 2D object array or a dense 4D array")
+
+    @staticmethod
+    def _build_eov_pair(
+            ko, kv, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding):
+        """Build a padded occupied-virtual energy difference block."""
+        nocc = mo_e_o.shape[1]
+        nvir = mo_e_v.shape[1]
+        eov = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_e_o.dtype)
+        nonzero_idx = np.ix_(nonzero_opadding[ko], nonzero_vpadding[kv])
+        eov[nonzero_idx] = (mo_e_o[ko][:, None] - mo_e_v[kv])[nonzero_idx]
+        return eov
+
+    @staticmethod
+    def _contract_trs_representative_rijab_lov(
+            rho_ia_full, rho_jb_full, pair_representatives,
+            Lov, Lov_b, kas_at_qi, kbs_at_qi, mo_e_o, mo_e_v, mo_e_v_b,
+            nonzero_opadding, nonzero_vpadding, nkpts,
+            compute_direct=False, compute_exchange=False, compute_q4=False,
+            profile=None):
+        """Contract TRS representative pairs directly from DF Lov blocks."""
+        direct_value = 0.0
+        exchange_value = 0.0
+        q4_weighted_norm = 0.0
+
+        for m, n, factor in pair_representatives:
+            ka = int(kas_at_qi[m])
+            kb = int(kbs_at_qi[n])
+
+            direct_recip = None
+            if compute_direct or compute_q4:
+                region_t0 = profile.start() if profile is not None else None
+                eia = MP2StructureFactor._build_eov_pair(
+                    m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
+                ejb = MP2StructureFactor._build_eov_pair(
+                    n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
+                direct_recip = 1 / lib.direct_sum('ia,jb->ijab', eia, ejb)
+                if profile is not None:
+                    profile.stop("TRS Lov direct denominator", region_t0)
+
+            if compute_direct:
+                region_t0 = profile.start() if profile is not None else None
+                Lov_mka = MP2StructureFactor._lov_block(Lov, m, ka).conj()
+                Lov_nkb = MP2StructureFactor._lov_block(Lov_b, n, kb).conj()
+                x_lia = Lov_mka * rho_ia_full[m][None, :, :]
+                y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :]
+                naux = x_lia.shape[0]
+                x_lia = x_lia.reshape(naux, -1)
+                y_ljb = y_ljb.reshape(naux, -1)
+                direct_matrix = direct_recip.transpose(0, 2, 1, 3).reshape(
+                    x_lia.shape[1], y_ljb.shape[1])
+                direct_block = np.sum((x_lia @ direct_matrix) * y_ljb)
+                direct_value += factor * (direct_block / nkpts).real
+                if profile is not None:
+                    profile.stop("TRS Lov direct contraction", region_t0)
+
+            if compute_exchange:
+                region_t0 = profile.start() if profile is not None else None
+                Lov_mkb = MP2StructureFactor._lov_block(Lov_b, m, kb).conj()
+                Lov_nka = MP2StructureFactor._lov_block(Lov, n, ka).conj()
+                eib = MP2StructureFactor._build_eov_pair(
+                    m, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
+                eja = MP2StructureFactor._build_eov_pair(
+                    n, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
+                for i in range(mo_e_o.shape[1]):
+                    for j in range(mo_e_o.shape[1]):
+                        b_factor = (
+                            Lov_mkb[:, i, :]
+                            * rho_jb_full[n].conj()[:, j][None, :]
+                        )
+                        a_factor = Lov_nka[:, j, :] * rho_ia_full[m, i, :][None, :]
+                        denom_recip = 1 / (eib[i, :, None] + eja[j, None, :])
+                        exchange_block = np.sum(
+                            (a_factor @ denom_recip.T) * b_factor)
+                        exchange_value += factor * (exchange_block / nkpts).real
+                if profile is not None:
+                    profile.stop("TRS Lov exchange contraction", region_t0)
+
+            if compute_q4:
+                region_t0 = profile.start() if profile is not None else None
+                rho_ia_abs = np.abs(rho_ia_full[m])**2
+                rho_jb_abs = np.abs(rho_jb_full[n])**2
+                tmp_jb = rho_ia_abs.reshape(-1) @ (
+                    np.abs(direct_recip).transpose(0, 2, 1, 3).reshape(
+                        rho_ia_abs.size, rho_jb_abs.size)
+                )
+                q4_weighted_norm += factor * np.dot(
+                    tmp_jb, rho_jb_abs.T.reshape(-1))
+                if profile is not None:
+                    profile.stop("TRS Lov dG0 rho/denominator contraction", region_t0)
+
+        return direct_value, exchange_value, q4_weighted_norm
+
+    @staticmethod
     def _build_coarse_real_space_grid(cell, N_local):
         Lvec_real = cell.lattice_vectors()
         N_local = np.asarray(N_local, dtype=int)
@@ -561,9 +662,23 @@ class MP2StructureFactor(StructureFactor):
         
         t2_required = True # if full t2 in kikjka format is needed
         t2_given = t2 is not None
+        kikj_lov = t2_store_type == 'kikj_lov'
         
         with_df_ints = self.kmp.with_df_ints and isinstance(self.kmp._scf.with_df, df.GDF)
-        if not direct and not exchange:
+        if kikj_lov:
+            if t2_given:
+                raise NotImplementedError("t2_store_type='kikj_lov' does not accept precomputed t2 amplitudes")
+            if not with_df_ints:
+                raise NotImplementedError("t2_store_type='kikj_lov' requires GDF integrals")
+            if grids.kGrid3_neq_kGrid2:
+                raise NotImplementedError("t2_store_type='kikj_lov' is not implemented for kGrid3_neq_kGrid2")
+            phase_t0 = profile.start()
+            Lov = kmp2._init_mp_df_eris(kmp) if Lov is None else Lov
+            Lov_b = Lov.copy() if Lov_b is None else Lov_b
+            profile.stop("DF Lov initialization", phase_t0)
+            print("Using Lov-backed kikj contractions without materializing t2.")
+            t2_required = False
+        elif not direct and not exchange:
             # Only dG0 term. No need to compute t2.
             print("Only dG0 term. No need to compute or use t2.")
             t2_required = False
@@ -610,6 +725,7 @@ class MP2StructureFactor(StructureFactor):
         mo_e_o = mo_energy[:, :nocc] if mo_e_o is None else np.asarray(mo_e_o)
         mo_e_v = mo_energy[:, nocc:] if mo_e_v is None else np.asarray(mo_e_v)
         mo_e_v_b = mo_e_v.copy() if mo_e_v_b is None else np.asarray(mo_e_v_b)
+        nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(kmp, kind="split")
         
         Lvec_real = kmf.cell.lattice_vectors()
         omega_cell = np.abs(np.linalg.det(Lvec_real))
@@ -817,7 +933,7 @@ class MP2StructureFactor(StructureFactor):
         contract_expression_rijab = 'mia,nbj->mnijab'
         use_trs_representative_rijab = (
             kgrid_occ_trs and trs_map is not None and check_trs
-            and t2_store_type in ('kikjka', 'kikj')
+            and t2_store_type in ('kikjka', 'kikj', 'kikj_lov')
         )
         trs_pair_representatives = None
         if use_trs_representative_rijab:
@@ -826,6 +942,10 @@ class MP2StructureFactor(StructureFactor):
             log.note(
                 "TRS rijab representative pairs: %d of %d k-point pairs",
                 len(trs_pair_representatives), nkpts * nkpts,
+            )
+        elif kikj_lov:
+            raise NotImplementedError(
+                "t2_store_type='kikj_lov' requires the TRS representative contraction path"
             )
         profile.stop("qG/k-point precomputation", phase_t0)
             
@@ -1113,6 +1233,8 @@ class MP2StructureFactor(StructureFactor):
                                     t2_cache[eijab_cache_key] = eijab
                             t2_cache_counts['direct_misses'] += 1
                             profile.stop("direct t2 cache miss", region_t0)
+                    elif kikj_lov:
+                        pass
 
                 if compute_exchange:
                     if t2_store_type == 'kikj' and not t2_given:
@@ -1132,6 +1254,8 @@ class MP2StructureFactor(StructureFactor):
                                 t2_cache[cache_key] = t2_qpi
                             t2_cache_counts['exchange_misses'] += 1
                             profile.stop("exchange t2 cache miss", region_t0)
+                    elif kikj_lov:
+                        pass
                     else:
                         region_t0 = profile.start()
                         t2_qpi = t2[qpis, kii, kjj]
@@ -1162,24 +1286,54 @@ class MP2StructureFactor(StructureFactor):
                                 eijab = eijab[0]
                                 if int(qi) in repeated_qis:
                                     t2_cache[eijab_cache_key] = eijab
+                    elif kikj_lov:
+                        pass
                     else:
                         eijab = eijab_full[qi]
                     profile.stop("dG0 denominator setup", region_t0)
 
                 if use_trs_representative_rijab:
                     region_t0 = profile.start()
-                    direct_sum, exchange_sum, q4_weighted_norm = (
-                        self._contract_trs_representative_rijab(
-                            rho_ia_full,
-                            rho_jb_full,
-                            trs_pair_representatives,
-                            direct_t2=t2_qi if compute_direct else None,
-                            exchange_t2=t2_qpi if compute_exchange else None,
-                            eijab_recip=eijab if compute_q4 else None,
-                            profile=profile,
+                    if kikj_lov:
+                        direct_sum, exchange_sum, q4_weighted_norm = (
+                            self._contract_trs_representative_rijab_lov(
+                                rho_ia_full,
+                                rho_jb_full,
+                                trs_pair_representatives,
+                                Lov,
+                                Lov_b,
+                                kas_at_qi,
+                                kbs_at_qi,
+                                mo_e_o,
+                                mo_e_v,
+                                mo_e_v_b,
+                                nonzero_opadding,
+                                nonzero_vpadding,
+                                nkpts,
+                                compute_direct=compute_direct,
+                                compute_exchange=compute_exchange,
+                                compute_q4=compute_q4,
+                                profile=profile,
+                            )
                         )
+                    else:
+                        direct_sum, exchange_sum, q4_weighted_norm = (
+                            self._contract_trs_representative_rijab(
+                                rho_ia_full,
+                                rho_jb_full,
+                                trs_pair_representatives,
+                                direct_t2=t2_qi if compute_direct else None,
+                                exchange_t2=t2_qpi if compute_exchange else None,
+                                eijab_recip=eijab if compute_q4 else None,
+                                profile=profile,
+                            )
+                        )
+                    contraction_label = (
+                        "rijab/Lov TRS representative contraction"
+                        if kikj_lov
+                        else "rijab/t2 TRS representative contraction"
                     )
-                    profile.stop("rijab/t2 TRS representative contraction", region_t0)
+                    profile.stop(contraction_label, region_t0)
 
                     if compute_direct:
                         temp_SqG_k = (

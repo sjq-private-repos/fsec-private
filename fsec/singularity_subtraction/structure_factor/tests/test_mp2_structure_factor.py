@@ -160,6 +160,102 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         self.assertAlmostEqual(exchange, full_exchange, places=12)
         self.assertAlmostEqual(q4, full_q4, places=12)
 
+    def test_trs_representative_lov_contractions_match_t2_blocks(self):
+        rng = np.random.default_rng(37)
+        trs_map = np.array([0, 2, 1])
+        nkpts = len(trs_map)
+        naux = 4
+        nocc = 2
+        nvir = 3
+        representatives = MP2StructureFactor._build_trs_pair_representatives(
+            trs_map, nkpts)
+
+        rho_ia = (
+            rng.normal(size=(nkpts, nocc, nvir))
+            + 1j * rng.normal(size=(nkpts, nocc, nvir))
+        )
+        rho_jb = (
+            rng.normal(size=(nkpts, nvir, nocc))
+            + 1j * rng.normal(size=(nkpts, nvir, nocc))
+        )
+        Lov = np.empty((nkpts, nkpts), dtype=object)
+        Lov_b = np.empty((nkpts, nkpts), dtype=object)
+        for ko in range(nkpts):
+            for kv in range(nkpts):
+                Lov[ko, kv] = (
+                    rng.normal(size=(naux, nocc, nvir))
+                    + 1j * rng.normal(size=(naux, nocc, nvir))
+                )
+                Lov_b[ko, kv] = (
+                    rng.normal(size=(naux, nocc, nvir))
+                    + 1j * rng.normal(size=(naux, nocc, nvir))
+                )
+
+        kas_at_qi = np.array([0, 1, 2])
+        kbs_at_qi = np.array([2, 0, 1])
+        mo_e_o = -rng.random(size=(nkpts, nocc)) - 0.5
+        mo_e_v = rng.random(size=(nkpts, nvir)) + 0.5
+        mo_e_v_b = rng.random(size=(nkpts, nvir)) + 0.75
+        nonzero_opadding = [np.arange(nocc) for _ in range(nkpts)]
+        nonzero_vpadding = [np.arange(nvir) for _ in range(nkpts)]
+
+        direct_t2 = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir), dtype=complex)
+        exchange_t2 = np.zeros_like(direct_t2)
+        eijab_recip = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir))
+
+        for m, n, _ in representatives:
+            ka = kas_at_qi[m]
+            kb = kbs_at_qi[n]
+            eia = mo_e_o[m, :, None] - mo_e_v[ka]
+            ejb = mo_e_o[n, :, None] - mo_e_v_b[kb]
+            direct_recip = 1 / (eia[:, None, :, None] + ejb[None, :, None, :])
+            direct_oovv = (
+                np.einsum("Lia,Ljb->iajb", Lov[m, ka], Lov_b[n, kb])
+                .transpose(0, 2, 1, 3)
+                / nkpts
+            )
+            direct_t2[m, n] = direct_oovv.conj() * direct_recip
+            eijab_recip[m, n] = direct_recip
+
+            eib = mo_e_o[m, :, None] - mo_e_v_b[kb]
+            eja = mo_e_o[n, :, None] - mo_e_v[ka]
+            exchange_recip = 1 / (eib[:, None, :, None] + eja[None, :, None, :])
+            exchange_oovv = (
+                np.einsum("Lib,Lja->ijba", Lov_b[m, kb], Lov[n, ka])
+                / nkpts
+            )
+            exchange_t2[m, n] = exchange_oovv.conj() * exchange_recip
+
+        reference = MP2StructureFactor._contract_trs_representative_rijab(
+            rho_ia,
+            rho_jb,
+            representatives,
+            direct_t2=direct_t2,
+            exchange_t2=exchange_t2,
+            eijab_recip=eijab_recip,
+        )
+        actual = MP2StructureFactor._contract_trs_representative_rijab_lov(
+            rho_ia,
+            rho_jb,
+            representatives,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_direct=True,
+            compute_exchange=True,
+            compute_q4=True,
+        )
+
+        for actual_value, reference_value in zip(actual, reference):
+            self.assertAlmostEqual(actual_value, reference_value, places=12)
+
 
 class KnownValues(unittest.TestCase):
     @classmethod
@@ -486,6 +582,69 @@ class KnownValues(unittest.TestCase):
         )
         self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
         self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
+
+    def test_kikj_lov_matches_kikjka_without_t2_materialization(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            2 * reciprocal[0],
+        ])
+
+        reference_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=True,
+            t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
+        )
+        reference = reference_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        lov_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=True,
+            t2_store_type="kikj_lov",
+            pair_density_eval_grid="uniform",
+        )
+        actual = lov_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        np.testing.assert_allclose(actual["qG_full"], reference["qG_full"], atol=1e-12)
+        np.testing.assert_allclose(
+            actual["SqG_full_direct"],
+            reference["SqG_full_direct"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            actual["SqG_full_exchange"],
+            reference["SqG_full_exchange"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            actual["SqG_full_q4"],
+            reference["SqG_full_q4"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+        self.assertIn(
+            "rijab/Lov TRS representative contraction",
+            lov_sf.last_build_timings,
+        )
+        self.assertNotIn("direct t2 cache miss", lov_sf.last_build_timings)
+        self.assertNotIn("exchange t2 cache miss", lov_sf.last_build_timings)
 
     def test_trs_representative_kikjka_runs_with_exact_fallback_112_kmesh(self):
         reciprocal = self.kmf_112.cell.reciprocal_vectors()
