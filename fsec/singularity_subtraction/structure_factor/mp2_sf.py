@@ -425,57 +425,99 @@ class MP2StructureFactor(StructureFactor):
             kb = int(kbs_at_qi[n])
 
             edenom = None
-            if compute_direct or compute_q4:
+            edenom_matrix = None
+            if compute_direct or compute_exchange or compute_q4:
                 region_t0 = profile.start() if profile is not None else None
                 eia = MP2StructureFactor._build_eov_pair(
                     m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
                 ejb = MP2StructureFactor._build_eov_pair(
                     n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
+                if profile is not None:
+                    profile.stop("TRS Lov denominator eov build", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 edenom = 1 / lib.direct_sum('ia,jb->ijab', eia, ejb)
                 if profile is not None:
-                    profile.stop("TRS Lov direct denominator", region_t0)
+                    profile.stop("TRS Lov denominator direct_sum", region_t0)
+
+                if compute_direct or compute_exchange:
+                    region_t0 = profile.start() if profile is not None else None
+                    nocc, nvir = eia.shape
+                    edenom_matrix = edenom.transpose(0, 2, 1, 3).reshape(
+                        nocc * nvir, nocc * nvir)
+                    if profile is not None:
+                        profile.stop("TRS Lov denominator matrix build", region_t0)
 
             if compute_direct:
                 region_t0 = profile.start() if profile is not None else None
                 Lov_mka = MP2StructureFactor._lov_block(Lov, m, ka).conj()
                 Lov_nkb = MP2StructureFactor._lov_block(Lov_b, n, kb).conj()
+                if profile is not None:
+                    profile.stop("TRS Lov direct Lov fetch/conj", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 x_lia = Lov_mka * rho_ia_full[m][None, :, :] # CPU ~ O(naux, nocc, nvir)
                 y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :] # CPU ~ O(naux, nvir, nocc)
+                if profile is not None:
+                    profile.stop("TRS Lov direct rho scale", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 naux = x_lia.shape[0]
                 x_lia = x_lia.reshape(naux, -1)
                 y_ljb = y_ljb.reshape(naux, -1)
-                edenom_matrix = edenom.transpose(0, 2, 1, 3).reshape(
-                    x_lia.shape[1], y_ljb.shape[1])
-                direct_block = np.sum((x_lia @ edenom_matrix) * y_ljb)
+                if profile is not None:
+                    profile.stop("TRS Lov direct reshape", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
+                xE_ljb = x_lia @ edenom_matrix
+                if profile is not None:
+                    profile.stop("TRS Lov direct X@denom", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
+                direct_block = np.sum(xE_ljb * y_ljb)
                 direct_value += factor * (direct_block / nkpts).real
                 if profile is not None:
-                    profile.stop("TRS Lov direct contraction", region_t0)
+                    profile.stop("TRS Lov direct reduce", region_t0)
 
             if compute_exchange:
                 region_t0 = profile.start() if profile is not None else None
                 Lov_mkb = MP2StructureFactor._lov_block(Lov_b, m, kb).conj()
                 Lov_nka = MP2StructureFactor._lov_block(Lov, n, ka).conj()
-                eib = MP2StructureFactor._build_eov_pair(
-                    m, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
-                eja = MP2StructureFactor._build_eov_pair(
-                    n, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
+                if profile is not None:
+                    profile.stop("TRS Lov exchange Lov fetch/conj", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 naux, nocc, nvir = Lov_mkb.shape
-                eris_ib_ja = (
+                eris_ijba = (
                     Lov_mkb.transpose(1, 2, 0).reshape(nocc * nvir, naux)
                     @ Lov_nka.reshape(naux, nocc * nvir)
                 )
-                eris_ijba = eris_ib_ja.reshape(
+                if profile is not None:
+                    profile.stop("TRS Lov exchange ERI matmul", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
+                eris_ijba = eris_ijba.reshape(
                     nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
-                edenom_exchange = 1 / (
-                    eib[:, None, :, None] + eja[None, :, None, :])
-                exchange_t2_ijba = (eris_ijba * edenom_exchange) / nkpts
-                exchange_ia_jb = exchange_t2_ijba.transpose(
+                exchange_eris_ia_jb = eris_ijba.transpose(
                     0, 3, 1, 2).reshape(nocc * nvir, nocc * nvir)
+                if profile is not None:
+                    profile.stop("TRS Lov exchange ERI reshape", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
+                exchange_ia_jb = (exchange_eris_ia_jb * edenom_matrix) / nkpts
+                if profile is not None:
+                    profile.stop("TRS Lov exchange denom scale", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 tmp_ia = exchange_ia_jb @ rho_jb_full[n].conj().T.reshape(-1)
+                if profile is not None:
+                    profile.stop("TRS Lov exchange t2@rho", region_t0)
+
+                region_t0 = profile.start() if profile is not None else None
                 exchange_block = rho_ia_full[m].reshape(-1) @ tmp_ia
                 exchange_value += factor * exchange_block.real
                 if profile is not None:
-                    profile.stop("TRS Lov exchange contraction", region_t0)
+                    profile.stop("TRS Lov exchange rho dot", region_t0)
 
             if compute_q4:
                 region_t0 = profile.start() if profile is not None else None
