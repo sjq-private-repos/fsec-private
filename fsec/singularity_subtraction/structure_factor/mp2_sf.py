@@ -388,6 +388,16 @@ class MP2StructureFactor(StructureFactor):
         return direct_value, exchange_value, q4_weighted_norm
 
     @staticmethod
+    def _real_part_dot(lhs, rhs):
+        """Compute real(dot(lhs.ravel(), rhs.ravel())) without cross terms."""
+        lhs_flat = lhs.ravel()
+        rhs_flat = rhs.ravel()
+        return (
+            np.vdot(lhs_flat.real, rhs_flat.real)
+            - np.vdot(lhs_flat.imag, rhs_flat.imag)
+        )
+
+    @staticmethod
     def _lov_block(Lov, ko, kv):
         """Return a (naux, nocc, nvir) Lov block for supported layouts."""
         Lov = np.asarray(Lov)
@@ -435,19 +445,28 @@ class MP2StructureFactor(StructureFactor):
                 if profile is not None:
                     profile.stop("TRS Lov direct denominator", region_t0)
 
+            rijab = None
+            if compute_direct or compute_exchange:
+                rijab = (
+                    rho_ia_full[m][:, None, :, None]
+                    * rho_jb_full[n].conj().T[None, :, None, :]
+                )
+
             if compute_direct:
                 region_t0 = profile.start() if profile is not None else None
                 Lov_mka = MP2StructureFactor._lov_block(Lov, m, ka).conj()
                 Lov_nkb = MP2StructureFactor._lov_block(Lov_b, n, kb).conj()
-                x_lia = Lov_mka * rho_ia_full[m][None, :, :] # CPU ~ O(naux, nocc, nvir)
-                y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :] # CPU ~ O(naux, nvir, nocc)
-                naux = x_lia.shape[0]
-                x_lia = x_lia.reshape(naux, -1)
-                y_ljb = y_ljb.reshape(naux, -1)
-                edenom_matrix = edenom.transpose(0, 2, 1, 3).reshape(
-                    x_lia.shape[1], y_ljb.shape[1])
-                direct_block = np.sum((x_lia @ edenom_matrix) * y_ljb)
-                direct_value += factor * (direct_block / nkpts).real
+                naux, nocc, nvir = Lov_mka.shape
+                eris_ijab = (
+                    Lov_mka.transpose(1, 2, 0).reshape(nocc * nvir, naux)
+                    @ Lov_nkb.reshape(naux, nocc * nvir)
+                ).reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
+                direct_t2_ijab = (eris_ijab * edenom) / nkpts
+                direct_block = MP2StructureFactor._real_part_dot(
+                    rijab,
+                    direct_t2_ijab,
+                )
+                direct_value += factor * direct_block
                 if profile is not None:
                     profile.stop("TRS Lov direct contraction", region_t0)
 
@@ -460,20 +479,18 @@ class MP2StructureFactor(StructureFactor):
                 eja = MP2StructureFactor._build_eov_pair(
                     n, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
                 naux, nocc, nvir = Lov_mkb.shape
-                eris_ib_ja = (
+                eris_ijba = (
                     Lov_mkb.transpose(1, 2, 0).reshape(nocc * nvir, naux)
                     @ Lov_nka.reshape(naux, nocc * nvir)
-                )
-                eris_ijba = eris_ib_ja.reshape(
-                    nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
+                ).reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
                 edenom_exchange = 1 / (
                     eib[:, None, :, None] + eja[None, :, None, :])
                 exchange_t2_ijba = (eris_ijba * edenom_exchange) / nkpts
-                exchange_ia_jb = exchange_t2_ijba.transpose(
-                    0, 3, 1, 2).reshape(nocc * nvir, nocc * nvir)
-                tmp_ia = exchange_ia_jb @ rho_jb_full[n].conj().T.reshape(-1)
-                exchange_block = rho_ia_full[m].reshape(-1) @ tmp_ia
-                exchange_value += factor * exchange_block.real
+                exchange_block = MP2StructureFactor._real_part_dot(
+                    rijab,
+                    exchange_t2_ijba.transpose(0, 1, 3, 2),
+                )
+                exchange_value += factor * exchange_block
                 if profile is not None:
                     profile.stop("TRS Lov exchange contraction", region_t0)
 
