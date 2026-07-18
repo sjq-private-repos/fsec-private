@@ -424,7 +424,6 @@ class MP2StructureFactor(StructureFactor):
             ka = int(kas_at_qi[m])
             kb = int(kbs_at_qi[n])
 
-            edenom = None
             edenom_matrix = None
             if compute_direct or compute_exchange or compute_q4:
                 region_t0 = profile.start() if profile is not None else None
@@ -435,18 +434,16 @@ class MP2StructureFactor(StructureFactor):
                 if profile is not None:
                     profile.stop("TRS Lov denominator eov build", region_t0)
 
+            if compute_direct or compute_q4:
                 region_t0 = profile.start() if profile is not None else None
-                edenom = 1 / lib.direct_sum('ia,jb->ijab', eia, ejb)
+                # Build the reciprocal directly in the (ia, jb) matrix layout
+                # used by the direct and q4 contractions.  Going through an
+                # (i, j, a, b) direct_sum requires another full p-by-p copy
+                # when p = nocc * nvir.
+                edenom_matrix = np.add.outer(eia.ravel(), ejb.ravel())
+                np.reciprocal(edenom_matrix, out=edenom_matrix)
                 if profile is not None:
-                    profile.stop("TRS Lov denominator direct_sum", region_t0)
-
-                if compute_direct or compute_exchange:
-                    region_t0 = profile.start() if profile is not None else None
-                    nocc, nvir = eia.shape
-                    edenom_matrix = edenom.transpose(0, 2, 1, 3).reshape(
-                        nocc * nvir, nocc * nvir)
-                    if profile is not None:
-                        profile.stop("TRS Lov denominator matrix build", region_t0)
+                    profile.stop("TRS Lov direct/q4 denominator build", region_t0)
 
             if compute_direct:
                 region_t0 = profile.start() if profile is not None else None
@@ -496,26 +493,43 @@ class MP2StructureFactor(StructureFactor):
                     profile.stop("TRS Lov exchange ERI matmul", region_t0)
 
                 region_t0 = profile.start() if profile is not None else None
-                eris_ijba = eris_ijba.reshape(
-                    nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3)
-                exchange_eris_ia_jb = eris_ijba.transpose(
-                    0, 3, 1, 2).reshape(nocc * nvir, nocc * nvir)
+                # The GEMM result is naturally (ib, ja).  Build the denominator
+                # in that layout too, instead of copying the complex ERI matrix
+                # to (ia, jb).  Both arrays are C contiguous here.
+                exchange_edenom = np.empty(
+                    (nocc, nvir, nocc, nvir), dtype=eia.dtype)
+                np.add(
+                    eia[:, None, None, :],
+                    ejb.T[None, :, :, None],
+                    out=exchange_edenom,
+                )
+                np.reciprocal(exchange_edenom, out=exchange_edenom)
                 if profile is not None:
-                    profile.stop("TRS Lov exchange ERI reshape", region_t0)
+                    profile.stop("TRS Lov exchange denominator build", region_t0)
 
                 region_t0 = profile.start() if profile is not None else None
-                exchange_ia_jb = (exchange_eris_ia_jb * edenom_matrix) / nkpts
+                eris_ib_ja = eris_ijba.reshape(nocc, nvir, nocc, nvir)
+                np.multiply(eris_ib_ja, exchange_edenom, out=eris_ib_ja)
                 if profile is not None:
                     profile.stop("TRS Lov exchange denom scale", region_t0)
 
                 region_t0 = profile.start() if profile is not None else None
-                tmp_ia = exchange_ia_jb @ rho_jb_full[n].conj().T.reshape(-1)
+                # Contract in the native (i, b, j, a) layout.  The nkpts
+                # normalization is applied to the scalar to avoid another pass
+                # over the full ERI matrix.
+                tmp_ia = np.einsum(
+                    'ibja,bj->ia',
+                    eris_ib_ja,
+                    rho_jb_full[n].conj(),
+                    optimize=True,
+                )
                 if profile is not None:
                     profile.stop("TRS Lov exchange t2@rho", region_t0)
 
                 region_t0 = profile.start() if profile is not None else None
-                exchange_block = rho_ia_full[m].reshape(-1) @ tmp_ia
-                exchange_value += factor * exchange_block.real
+                exchange_block = np.einsum(
+                    'ia,ia->', rho_ia_full[m], tmp_ia, optimize=True)
+                exchange_value += factor * (exchange_block / nkpts).real
                 if profile is not None:
                     profile.stop("TRS Lov exchange rho dot", region_t0)
 
@@ -523,10 +537,10 @@ class MP2StructureFactor(StructureFactor):
                 region_t0 = profile.start() if profile is not None else None
                 rho_ia_abs = np.abs(rho_ia_full[m])**2
                 rho_jb_abs = np.abs(rho_jb_full[n])**2
-                tmp_jb = rho_ia_abs.reshape(-1) @ (
-                    np.abs(edenom).transpose(0, 2, 1, 3).reshape(
-                        rho_ia_abs.size, rho_jb_abs.size)
-                )
+                # No later contraction needs the signed denominator, so reuse
+                # its storage for the absolute value required by q4.
+                np.abs(edenom_matrix, out=edenom_matrix)
+                tmp_jb = rho_ia_abs.reshape(-1) @ edenom_matrix
                 q4_weighted_norm += factor * np.dot(
                     tmp_jb, rho_jb_abs.T.reshape(-1))
                 if profile is not None:
@@ -720,7 +734,9 @@ class MP2StructureFactor(StructureFactor):
                 raise NotImplementedError("t2_store_type='kikj_lov' is not implemented for kGrid3_neq_kGrid2")
             phase_t0 = profile.start()
             Lov = kmp2._init_mp_df_eris(kmp) if Lov is None else Lov
-            Lov_b = Lov.copy() if Lov_b is None else Lov_b
+            # Lov is read-only in this path.  Avoid duplicating a dense Lov
+            # tensor when the a and b virtual grids are identical.
+            Lov_b = Lov if Lov_b is None else Lov_b
             profile.stop("DF Lov initialization", phase_t0)
             print("Using Lov-backed kikj contractions without materializing t2.")
             t2_required = False

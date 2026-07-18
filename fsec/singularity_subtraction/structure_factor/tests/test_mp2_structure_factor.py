@@ -256,6 +256,37 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         for actual_value, reference_value in zip(actual, reference):
             self.assertAlmostEqual(actual_value, reference_value, places=12)
 
+        # Exercise the independent allocation paths as well.  In particular,
+        # exchange-only must not construct or depend on the (ia, jb) direct
+        # denominator matrix.
+        for component, expected_index in (
+                ({"compute_direct": True}, 0),
+                ({"compute_exchange": True}, 1),
+                ({"compute_q4": True}, 2)):
+            component_actual = (
+                MP2StructureFactor._contract_trs_representative_rijab_lov(
+                    rho_ia,
+                    rho_jb,
+                    representatives,
+                    Lov,
+                    Lov_b,
+                    kas_at_qi,
+                    kbs_at_qi,
+                    mo_e_o,
+                    mo_e_v,
+                    mo_e_v_b,
+                    nonzero_opadding,
+                    nonzero_vpadding,
+                    nkpts,
+                    **component,
+                )
+            )
+            self.assertAlmostEqual(
+                component_actual[expected_index],
+                reference[expected_index],
+                places=12,
+            )
+
 
 class KnownValues(unittest.TestCase):
     @classmethod
