@@ -28,8 +28,11 @@ from fsec.singularity_subtraction.structure_factor.helpers_sf import (
     should_compute_line_sample,
     update_line_sampling_decay_mask,
 )
-from fsec.singularity_subtraction.structure_factor.laplace_minimax import (
-    make_minimax_laplace_grid,
+from fsec.singularity_subtraction.structure_factor.mp2_contractions import (
+    build_trs_unique_pairs,
+    contract_trs_unique_pair_rijab,
+    contract_trs_unique_pair_rijab_lov,
+    contract_trs_unique_pair_rijab_lov_laplace,
 )
 
 
@@ -276,12 +279,21 @@ class MP2StructureFactor(StructureFactor):
         )
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
-        self.laplace_direct = bool(kwargs.get('laplace_direct', True))
+        legacy_laplace_switches = {
+            name for name in ('laplace_direct', 'laplace_exchange')
+            if name in kwargs
+        }
+        if legacy_laplace_switches:
+            names = ', '.join(sorted(legacy_laplace_switches))
+            raise TypeError(
+                f"{names} are no longer supported; use laplace for all terms"
+            )
+        self.laplace = bool(kwargs.get('laplace', True))
         self.laplace_direct_tol = float(kwargs.get('laplace_direct_tol', 1e-8))
         self.laplace_direct_max_points = int(
             kwargs.get('laplace_direct_max_points', 16))
-        self.laplace_exchange = bool(kwargs.get('laplace_exchange', True))
-        self.laplace_exchange_tol = float(kwargs.get('laplace_exchange_tol', 1e-8))
+        self.laplace_exchange_tol = float(
+            kwargs.get('laplace_exchange_tol', 1e-8))
         self.laplace_exchange_max_points = int(
             kwargs.get('laplace_exchange_max_points', 16))
         if (not np.isfinite(self.laplace_direct_tol)
@@ -322,444 +334,6 @@ class MP2StructureFactor(StructureFactor):
         self.grids.build_grids()
         self.grids.build_truncated_qG_grid()
 
-    @staticmethod
-    def contract_kikj_dG0(rijab, eijab_recip, scale):
-        """Compute the kikj dG0 contraction without materializing sqrt-weighted rijab."""
-        return -2 * scale**2 * np.sum(np.abs(rijab)**2 * np.abs(eijab_recip).ravel())
-
-    @staticmethod
-    def _build_trs_pair_representatives(trs_map, nkpts=None):
-        """Return canonical (m, n, factor) pairs for the TRS rijab involution."""
-        trs_map = np.asarray(trs_map, dtype=int)
-        if nkpts is None:
-            nkpts = len(trs_map)
-        representatives = []
-        for m in range(nkpts):
-            for n in range(nkpts):
-                flat = m * nkpts + n
-                partner_m = trs_map[n]
-                partner_n = trs_map[m]
-                partner_flat = partner_m * nkpts + partner_n
-                if flat <= partner_flat:
-                    factor = 1 if flat == partner_flat else 2
-                    representatives.append((m, n, factor))
-        return representatives
-
-    @staticmethod
-    def _contract_trs_representative_rijab(
-            rho_ia_full, rho_jb_full, pair_representatives,
-            direct_t2=None, exchange_t2=None, eijab_recip=None, profile=None):
-        """Contract rijab/t2 over TRS representative pairs without full materialization."""
-        direct_value = 0.0
-        exchange_value = 0.0
-        q4_weighted_norm = 0.0
-
-        for m, n, factor in pair_representatives:
-            if direct_t2 is not None:
-                region_t0 = profile.start() if profile is not None else None
-                tmp_jb = np.einsum(
-                    'ia,ijab->jb',
-                    rho_ia_full[m],
-                    direct_t2[m, n],
-                    optimize=True,
-                )
-                direct_block = np.einsum(
-                    'jb,bj->',
-                    tmp_jb,
-                    rho_jb_full[n].conj(),
-                    optimize=True,
-                )
-                direct_value += factor * direct_block.real
-                if profile is not None:
-                    profile.stop("TRS direct rho/t2 contraction", region_t0)
-            if exchange_t2 is not None:
-                region_t0 = profile.start() if profile is not None else None
-                tmp_jb = np.einsum(
-                    'ia,ijba->jb',
-                    rho_ia_full[m],
-                    exchange_t2[m, n],
-                    optimize=True,
-                )
-                exchange_block = np.einsum(
-                    'jb,bj->',
-                    tmp_jb,
-                    rho_jb_full[n].conj(),
-                    optimize=True,
-                )
-                exchange_value += factor * exchange_block.real
-                if profile is not None:
-                    profile.stop("TRS exchange rho/t2 contraction", region_t0)
-            if eijab_recip is not None:
-                region_t0 = profile.start() if profile is not None else None
-                tmp_jb = np.einsum(
-                    'ia,ijab->jb',
-                    np.abs(rho_ia_full[m])**2,
-                    np.abs(eijab_recip[m, n]),
-                    optimize=True,
-                )
-                q4_weighted_norm += factor * np.einsum(
-                    'jb,bj->',
-                    tmp_jb,
-                    np.abs(rho_jb_full[n])**2,
-                    optimize=True,
-                )
-                if profile is not None:
-                    profile.stop("TRS dG0 rho/denominator contraction", region_t0)
-
-        return direct_value, exchange_value, q4_weighted_norm
-
-    @staticmethod
-    def _lov_block(Lov, ko, kv):
-        """Return a (naux, nocc, nvir) Lov block for supported layouts."""
-        Lov = np.asarray(Lov)
-        if Lov.ndim == 2:
-            return np.asarray(Lov[ko, kv])
-        if Lov.ndim == 4:
-            return np.asarray(Lov[ko])
-        raise ValueError("Lov must be a 2D object array or a dense 4D array")
-
-    @staticmethod
-    def _build_eov_pair(
-            ko, kv, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding):
-        """Build a padded occupied-virtual energy difference block."""
-        nocc = mo_e_o.shape[1]
-        nvir = mo_e_v.shape[1]
-        eov = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_e_o.dtype)
-        nonzero_idx = np.ix_(nonzero_opadding[ko], nonzero_vpadding[kv])
-        eov[nonzero_idx] = (mo_e_o[ko][:, None] - mo_e_v[kv])[nonzero_idx]
-        return eov
-
-    @staticmethod
-    def _contract_exchange_lov_laplace(
-            rho_ia, rho_jb, Lov_mkb, Lov_nka, eia, ejb,
-            active_ia, active_jb, tolerance, max_points):
-        """Contract one exchange block using a separable minimax denominator.
-
-        The signed MP2 denominator is ``-(gap_ia + gap_jb)``.  Its minimax
-        expansion separates the virtual labels, allowing two ``O x V`` by
-        ``V x O`` products per auxiliary index and Laplace point instead of
-        constructing an ``(OV) x (OV)`` ERI/denominator matrix.
-
-        Returns
-        -------
-        tuple or None
-            ``(exchange_block, grid)`` or ``None`` if the minimax tables do
-            not cover the requested denominator range and tolerance.
-        """
-        active_ia = np.asarray(active_ia, dtype=bool)
-        active_jb = np.asarray(active_jb, dtype=bool)
-        if not np.any(active_ia) or not np.any(active_jb):
-            return 0.0j, None
-
-        gap_ia = np.full(eia.shape, np.inf, dtype=eia.dtype)
-        gap_jb = np.full(ejb.shape, np.inf, dtype=ejb.dtype)
-        gap_ia[active_ia] = -eia[active_ia]
-        gap_jb[active_jb] = -ejb[active_jb]
-        active_gaps_ia = gap_ia[active_ia]
-        active_gaps_jb = gap_jb[active_jb]
-        if np.any(active_gaps_ia <= 0) or np.any(active_gaps_jb <= 0):
-            return None
-
-        denominator_min = active_gaps_ia.min() + active_gaps_jb.min()
-        denominator_max = active_gaps_ia.max() + active_gaps_jb.max()
-        grid = make_minimax_laplace_grid(
-            denominator_min,
-            denominator_max,
-            tolerance=tolerance,
-            max_points=max_points,
-        )
-        if grid is None:
-            return None
-
-        exchange_block = 0.0j
-        Lov_nka_t = Lov_nka.transpose(0, 2, 1)
-        for point, weight in zip(grid.points, grid.weights):
-            scaled_rho_ia = rho_ia * np.exp(-point * gap_ia)
-            scaled_rho_bj = rho_jb.conj() * np.exp(-point * gap_jb).T
-
-            # Both intermediates have shape (naux, nocc, nocc).  The work is
-            # O(naux * nocc**2 * nvir) per Laplace point and the peak scratch
-            # is O(naux * nocc**2), independent of nvir**2.
-            left_lij = Lov_mkb @ scaled_rho_bj
-            right_lij = np.matmul(scaled_rho_ia, Lov_nka_t)
-            exchange_block -= weight * np.einsum(
-                'Lij,Lij->', left_lij, right_lij, optimize=True)
-
-        return exchange_block, grid
-
-    @staticmethod
-    def _contract_direct_q4_lov_laplace(
-            rho_ia, rho_jb, Lov_mka, Lov_nkb, eia, ejb,
-            active_ia, active_jb, compute_direct, compute_q4,
-            tolerance, max_points):
-        """Contract direct and q4 blocks with a separable minimax denominator.
-
-        The direct contraction is evaluated as two batched ``A x OV`` by
-        ``OV x n`` products.  The q4 contraction reuses the same exponential
-        factors, so neither component materializes an ``(OV) x (OV)``
-        reciprocal-denominator matrix.
-
-        Returns
-        -------
-        tuple or None
-            ``(direct_block, q4_block, grid)`` or ``None`` when the active
-            gaps or minimax tables require the exact fallback.
-        """
-        active_ia = np.asarray(active_ia, dtype=bool)
-        active_jb = np.asarray(active_jb, dtype=bool)
-        if not np.any(active_ia) or not np.any(active_jb):
-            return 0.0j, 0.0, None
-
-        gap_ia = np.full(eia.shape, np.inf, dtype=eia.dtype)
-        gap_jb = np.full(ejb.shape, np.inf, dtype=ejb.dtype)
-        gap_ia[active_ia] = -eia[active_ia]
-        gap_jb[active_jb] = -ejb[active_jb]
-        active_gaps_ia = gap_ia[active_ia]
-        active_gaps_jb = gap_jb[active_jb]
-        if np.any(active_gaps_ia <= 0) or np.any(active_gaps_jb <= 0):
-            return None
-
-        grid = make_minimax_laplace_grid(
-            active_gaps_ia.min() + active_gaps_jb.min(),
-            active_gaps_ia.max() + active_gaps_jb.max(),
-            tolerance=tolerance,
-            max_points=max_points,
-        )
-        if grid is None:
-            return None
-
-        exp_ia = np.exp(-grid.points[:, None] * gap_ia.ravel()[None, :])
-        exp_jb = np.exp(-grid.points[:, None] * gap_jb.ravel()[None, :])
-
-        direct_block = 0.0j
-        if compute_direct:
-            rho_ia_weighted = exp_ia * rho_ia.ravel()[None, :]
-            rho_jb_weighted = exp_jb * rho_jb.conj().T.ravel()[None, :]
-            left_ln = Lov_mka.reshape(Lov_mka.shape[0], -1) @ rho_ia_weighted.T
-            right_ln = Lov_nkb.reshape(Lov_nkb.shape[0], -1) @ rho_jb_weighted.T
-            direct_by_point = np.einsum(
-                'Ln,Ln->n', left_ln, right_ln, optimize=True)
-            direct_block = -np.dot(grid.weights, direct_by_point)
-
-        q4_block = 0.0
-        if compute_q4:
-            rho_ia_abs = np.abs(rho_ia.ravel())**2
-            rho_jb_abs = np.abs(rho_jb.conj().T.ravel())**2
-            q4_ia = exp_ia @ rho_ia_abs
-            q4_jb = exp_jb @ rho_jb_abs
-            q4_block = np.dot(grid.weights, q4_ia * q4_jb)
-
-        return direct_block, q4_block, grid
-
-    @staticmethod
-    def _contract_trs_representative_rijab_lov(
-            rho_ia_full, rho_jb_full, pair_representatives,
-            Lov, Lov_b, kas_at_qi, kbs_at_qi, mo_e_o, mo_e_v, mo_e_v_b,
-            nonzero_opadding, nonzero_vpadding, nkpts,
-            compute_direct=False, compute_exchange=False, compute_q4=False,
-            profile=None, laplace_direct=False,
-            laplace_direct_tolerance=1e-8, laplace_direct_max_points=16,
-            laplace_exchange=False, laplace_tolerance=1e-8,
-            laplace_max_points=16):
-        """Contract TRS representative pairs directly from DF Lov blocks."""
-        direct_value = 0.0
-        exchange_value = 0.0
-        q4_weighted_norm = 0.0
-
-        for m, n, factor in pair_representatives:
-            ka = int(kas_at_qi[m])
-            kb = int(kbs_at_qi[n])
-
-            edenom_matrix = None
-            active_ia = None
-            active_jb = None
-            if compute_direct or compute_exchange or compute_q4:
-                region_t0 = profile.start() if profile is not None else None
-                eia = MP2StructureFactor._build_eov_pair(
-                    m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
-                ejb = MP2StructureFactor._build_eov_pair(
-                    n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
-                if profile is not None:
-                    profile.stop("TRS Lov denominator eov build", region_t0)
-
-            if ((laplace_direct and (compute_direct or compute_q4))
-                    or (laplace_exchange and compute_exchange)):
-                active_ia = np.zeros(eia.shape, dtype=bool)
-                active_jb = np.zeros(ejb.shape, dtype=bool)
-                active_ia[np.ix_(
-                    nonzero_opadding[m], nonzero_vpadding[ka])] = True
-                active_jb[np.ix_(
-                    nonzero_opadding[n], nonzero_vpadding[kb])] = True
-
-            Lov_mka = None
-            Lov_nkb = None
-            if compute_direct:
-                region_t0 = profile.start() if profile is not None else None
-                Lov_mka = MP2StructureFactor._lov_block(Lov, m, ka).conj()
-                Lov_nkb = MP2StructureFactor._lov_block(Lov_b, n, kb).conj()
-                if profile is not None:
-                    profile.stop("TRS Lov direct Lov fetch/conj", region_t0)
-
-            direct_laplace_result = None
-            if laplace_direct and (compute_direct or compute_q4):
-                region_t0 = profile.start() if profile is not None else None
-                direct_laplace_result = (
-                    MP2StructureFactor._contract_direct_q4_lov_laplace(
-                        rho_ia_full[m],
-                        rho_jb_full[n],
-                        Lov_mka,
-                        Lov_nkb,
-                        eia,
-                        ejb,
-                        active_ia,
-                        active_jb,
-                        compute_direct,
-                        compute_q4,
-                        laplace_direct_tolerance,
-                        laplace_direct_max_points,
-                    )
-                )
-                if profile is not None:
-                    label = (
-                        "TRS Lov direct/q4 Laplace contraction"
-                        if direct_laplace_result is not None
-                        else "TRS Lov direct/q4 Laplace fallback"
-                    )
-                    profile.stop(label, region_t0)
-
-            if direct_laplace_result is not None:
-                direct_block, q4_block, _ = direct_laplace_result
-                if compute_direct:
-                    direct_value += factor * (direct_block / nkpts).real
-                if compute_q4:
-                    q4_weighted_norm += factor * q4_block
-            elif compute_direct or compute_q4:
-                region_t0 = profile.start() if profile is not None else None
-                # Exact fallback: build the reciprocal directly in the
-                # (ia, jb) matrix layout used by both contractions.
-                edenom_matrix = np.add.outer(eia.ravel(), ejb.ravel())
-                np.reciprocal(edenom_matrix, out=edenom_matrix)
-                if profile is not None:
-                    profile.stop("TRS Lov direct/q4 denominator build", region_t0)
-
-            if compute_direct and direct_laplace_result is None:
-                region_t0 = profile.start() if profile is not None else None
-                x_lia = Lov_mka * rho_ia_full[m][None, :, :]
-                y_ljb = Lov_nkb * rho_jb_full[n].conj().T[None, :, :]
-                if profile is not None:
-                    profile.stop("TRS Lov direct rho scale", region_t0)
-
-                region_t0 = profile.start() if profile is not None else None
-                naux = x_lia.shape[0]
-                x_lia = x_lia.reshape(naux, -1)
-                y_ljb = y_ljb.reshape(naux, -1)
-                if profile is not None:
-                    profile.stop("TRS Lov direct reshape", region_t0)
-
-                region_t0 = profile.start() if profile is not None else None
-                xE_ljb = x_lia @ edenom_matrix
-                if profile is not None:
-                    profile.stop("TRS Lov direct X@denom", region_t0)
-
-                region_t0 = profile.start() if profile is not None else None
-                direct_block = np.sum(xE_ljb * y_ljb)
-                direct_value += factor * (direct_block / nkpts).real
-                if profile is not None:
-                    profile.stop("TRS Lov direct reduce", region_t0)
-
-            if compute_exchange:
-                region_t0 = profile.start() if profile is not None else None
-                Lov_mkb = MP2StructureFactor._lov_block(Lov_b, m, kb).conj()
-                Lov_nka = MP2StructureFactor._lov_block(Lov, n, ka).conj()
-                if profile is not None:
-                    profile.stop("TRS Lov exchange Lov fetch/conj", region_t0)
-
-                laplace_result = None
-                if laplace_exchange:
-                    region_t0 = profile.start() if profile is not None else None
-                    laplace_result = (
-                        MP2StructureFactor._contract_exchange_lov_laplace(
-                            rho_ia_full[m],
-                            rho_jb_full[n],
-                            Lov_mkb,
-                            Lov_nka,
-                            eia,
-                            ejb,
-                            active_ia,
-                            active_jb,
-                            laplace_tolerance,
-                            laplace_max_points,
-                        )
-                    )
-                    if profile is not None:
-                        label = (
-                            "TRS Lov exchange Laplace contraction"
-                            if laplace_result is not None
-                            else "TRS Lov exchange Laplace fallback"
-                        )
-                        profile.stop(label, region_t0)
-
-                if laplace_result is not None:
-                    exchange_block = laplace_result[0]
-                else:
-                    region_t0 = profile.start() if profile is not None else None
-                    naux, nocc, nvir = Lov_mkb.shape
-                    eris_ijba = (
-                        Lov_mkb.transpose(1, 2, 0).reshape(nocc * nvir, naux)
-                        @ Lov_nka.reshape(naux, nocc * nvir)
-                    )
-                    if profile is not None:
-                        profile.stop("TRS Lov exchange ERI matmul", region_t0)
-
-                    region_t0 = profile.start() if profile is not None else None
-                    exchange_edenom = np.empty(
-                        (nocc, nvir, nocc, nvir), dtype=eia.dtype)
-                    np.add(
-                        eia[:, None, None, :],
-                        ejb.T[None, :, :, None],
-                        out=exchange_edenom,
-                    )
-                    np.reciprocal(exchange_edenom, out=exchange_edenom)
-                    if profile is not None:
-                        profile.stop("TRS Lov exchange denominator build", region_t0)
-
-                    region_t0 = profile.start() if profile is not None else None
-                    eris_ib_ja = eris_ijba.reshape(nocc, nvir, nocc, nvir)
-                    np.multiply(eris_ib_ja, exchange_edenom, out=eris_ib_ja)
-                    if profile is not None:
-                        profile.stop("TRS Lov exchange denom scale", region_t0)
-
-                    region_t0 = profile.start() if profile is not None else None
-                    tmp_ia = np.einsum(
-                        'ibja,bj->ia',
-                        eris_ib_ja,
-                        rho_jb_full[n].conj(),
-                        optimize=True,
-                    )
-                    exchange_block = np.einsum(
-                        'ia,ia->', rho_ia_full[m], tmp_ia, optimize=True)
-                    if profile is not None:
-                        profile.stop("TRS Lov exchange exact contraction", region_t0)
-
-                region_t0 = profile.start() if profile is not None else None
-                exchange_value += factor * (exchange_block / nkpts).real
-                if profile is not None:
-                    profile.stop("TRS Lov exchange rho dot", region_t0)
-
-            if compute_q4 and direct_laplace_result is None:
-                region_t0 = profile.start() if profile is not None else None
-                rho_ia_abs = np.abs(rho_ia_full[m])**2
-                rho_jb_abs = np.abs(rho_jb_full[n])**2
-                # No later contraction needs the signed denominator, so reuse
-                # its storage for the absolute value required by q4.
-                np.abs(edenom_matrix, out=edenom_matrix)
-                tmp_jb = rho_ia_abs.reshape(-1) @ edenom_matrix
-                q4_weighted_norm += factor * np.dot(
-                    tmp_jb, rho_jb_abs.T.reshape(-1))
-                if profile is not None:
-                    profile.stop("TRS Lov dG0 rho/denominator contraction", region_t0)
-
-        return direct_value, exchange_value, q4_weighted_norm
 
     @staticmethod
     def _build_coarse_real_space_grid(cell, N_local):
@@ -952,17 +526,9 @@ class MP2StructureFactor(StructureFactor):
             Lov_b = Lov if Lov_b is None else Lov_b
             profile.stop("DF Lov initialization", phase_t0)
             print("Using Lov-backed kikj contractions without materializing t2.")
-            if (direct or dG0) and self.laplace_direct:
+            if (direct or exchange or dG0) and self.laplace:
                 print(
-                    "Using minimax Laplace direct/q4 denominators "
-                    f"(tol={self.laplace_direct_tol:.1e}, "
-                    f"max_points={self.laplace_direct_max_points})."
-                )
-            if exchange and self.laplace_exchange:
-                print(
-                    "Using minimax Laplace exchange denominators "
-                    f"(tol={self.laplace_exchange_tol:.1e}, "
-                    f"max_points={self.laplace_exchange_max_points})."
+                    "Using minimax Laplace denominators for all terms."
                 )
             t2_required = False
         elif not direct and not exchange:
@@ -1218,21 +784,20 @@ class MP2StructureFactor(StructureFactor):
                 kii, kjj = np.indices((nkpts, nkpts))
                 
         contract_expression_rijab = 'mia,nbj->mnijab'
-        use_trs_representative_rijab = (
+        use_trs_unique_pair_rijab = (
             kgrid_occ_trs and trs_map is not None and check_trs
             and t2_store_type in ('kikjka', 'kikj', 'kikj_lov')
         )
-        trs_pair_representatives = None
-        if use_trs_representative_rijab:
-            trs_pair_representatives = self._build_trs_pair_representatives(
-                trs_map, nkpts)
+        trs_unique_pairs = None
+        if use_trs_unique_pair_rijab:
+            trs_unique_pairs = build_trs_unique_pairs(trs_map, nkpts)
             log.note(
-                "TRS rijab representative pairs: %d of %d k-point pairs",
-                len(trs_pair_representatives), nkpts * nkpts,
+                "TRS rijab unique pairs: %d of %d k-point pairs",
+                len(trs_unique_pairs), nkpts * nkpts,
             )
         elif kikj_lov:
             raise NotImplementedError(
-                "t2_store_type='kikj_lov' requires the TRS representative contraction path"
+                "t2_store_type='kikj_lov' requires the TRS unique-pair contraction path"
             )
         profile.stop("qG/k-point precomputation", phase_t0)
             
@@ -1579,14 +1144,31 @@ class MP2StructureFactor(StructureFactor):
                         eijab = eijab_full[qi]
                     profile.stop("dG0 denominator setup", region_t0)
 
-                if use_trs_representative_rijab:
+                if use_trs_unique_pair_rijab:
                     region_t0 = profile.start()
                     if kikj_lov:
+                        contraction = (
+                            contract_trs_unique_pair_rijab_lov_laplace
+                            if self.laplace
+                            else contract_trs_unique_pair_rijab_lov
+                        )
+                        laplace_kwargs = (
+                            {
+                                'direct_tolerance': self.laplace_direct_tol,
+                                'direct_max_points': (
+                                    self.laplace_direct_max_points),
+                                'exchange_tolerance': (
+                                    self.laplace_exchange_tol),
+                                'exchange_max_points': (
+                                    self.laplace_exchange_max_points),
+                            }
+                            if self.laplace else {}
+                        )
                         direct_sum, exchange_sum, q4_weighted_norm = (
-                            self._contract_trs_representative_rijab_lov(
+                            contraction(
                                 rho_ia_full,
                                 rho_jb_full,
-                                trs_pair_representatives,
+                                trs_unique_pairs,
                                 Lov,
                                 Lov_b,
                                 kas_at_qi,
@@ -1601,21 +1183,15 @@ class MP2StructureFactor(StructureFactor):
                                 compute_exchange=compute_exchange,
                                 compute_q4=compute_q4,
                                 profile=profile,
-                                laplace_direct=self.laplace_direct,
-                                laplace_direct_tolerance=self.laplace_direct_tol,
-                                laplace_direct_max_points=(
-                                    self.laplace_direct_max_points),
-                                laplace_exchange=self.laplace_exchange,
-                                laplace_tolerance=self.laplace_exchange_tol,
-                                laplace_max_points=self.laplace_exchange_max_points,
+                                **laplace_kwargs,
                             )
                         )
                     else:
                         direct_sum, exchange_sum, q4_weighted_norm = (
-                            self._contract_trs_representative_rijab(
+                            contract_trs_unique_pair_rijab(
                                 rho_ia_full,
                                 rho_jb_full,
-                                trs_pair_representatives,
+                                trs_unique_pairs,
                                 direct_t2=t2_qi if compute_direct else None,
                                 exchange_t2=t2_qpi if compute_exchange else None,
                                 eijab_recip=eijab if compute_q4 else None,
@@ -1623,9 +1199,9 @@ class MP2StructureFactor(StructureFactor):
                             )
                         )
                     contraction_label = (
-                        "rijab/Lov TRS representative contraction"
+                        "rijab/Lov TRS unique-pair contraction"
                         if kikj_lov
-                        else "rijab/t2 TRS representative contraction"
+                        else "rijab/t2 TRS unique-pair contraction"
                     )
                     profile.stop(contraction_label, region_t0)
 
@@ -1679,7 +1255,8 @@ class MP2StructureFactor(StructureFactor):
                     if compute_q4:
                         region_t0 = profile.start()
                         scale = quadrature_product_scale / (nkpts * omega_cell)
-                        temp_SqG_k_q4 = self.contract_kikj_dG0(rijab, eijab, scale)
+                        temp_SqG_k_q4 = -2 * scale**2 * np.sum(
+                            np.abs(rijab)**2 * np.abs(eijab).ravel())
                         SqG_full_q4[qG] += temp_SqG_k_q4.real / nkpts
                         profile.stop("dG0 final contraction", region_t0)
 

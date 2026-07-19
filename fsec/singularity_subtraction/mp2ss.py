@@ -134,26 +134,22 @@ class MP2SSOptions:
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, ``"ki"``, and ``"kikj_lov"``.  The latter
         contracts density-fitting tensors without materializing amplitudes.
-    laplace_direct
-        Use the minimax Laplace denominator factorization for the direct and
-        direct-q4 components when ``t2_store_type="kikj_lov"``. An exact
-        contraction is used automatically if the minimax table cannot cover
-        the requested range and tolerance.
+    laplace
+        Use the minimax Laplace denominator factorization for all terms when
+        ``t2_store_type="kikj_lov"``. An exact contraction is used automatically
+        if the minimax table cannot cover the requested range and tolerance.
     laplace_direct_tol
         Maximum absolute error for ``1/x`` on the normalized direct minimax
         interval.
     laplace_direct_max_points
         Maximum permitted number of direct Laplace points before using the
         exact fallback.
-    laplace_exchange
-        Use the minimax Laplace denominator factorization for exchange when
-        ``t2_store_type="kikj_lov"``. An exact contraction is used automatically
-        if the minimax table cannot cover the requested range and tolerance.
     laplace_exchange_tol
-        Maximum absolute error for ``1/x`` on the normalized minimax interval.
+        Maximum absolute error for ``1/x`` on the normalized exchange minimax
+        interval.
     laplace_exchange_max_points
-        Maximum permitted number of Laplace points before using the exact
-        fallback.
+        Maximum permitted number of exchange Laplace points before using the
+        exact fallback.
     pair_density_eval_grid
         Real-space quadrature grid used to evaluate MP2 pair-density overlaps.
         Supported values are ``"uniform"`` and ``"becke"``. The default is
@@ -191,10 +187,9 @@ class MP2SSOptions:
     line_sampling_decay_consecutive_below: int = 3
     line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
-    laplace_direct: bool = True
+    laplace: bool = True
     laplace_direct_tol: float = 1e-8
     laplace_direct_max_points: int = 16
-    laplace_exchange: bool = True
     laplace_exchange_tol: float = 1e-8
     laplace_exchange_max_points: int = 16
     pair_density_eval_grid: str = 'becke'
@@ -1011,10 +1006,9 @@ class MP2SS:
         self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
         self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
-        self.laplace_direct = options.laplace_direct
+        self.laplace = options.laplace
         self.laplace_direct_tol = options.laplace_direct_tol
         self.laplace_direct_max_points = options.laplace_direct_max_points
-        self.laplace_exchange = options.laplace_exchange
         self.laplace_exchange_tol = options.laplace_exchange_tol
         self.laplace_exchange_max_points = options.laplace_exchange_max_points
         self.pair_density_eval_grid = options.pair_density_eval_grid
@@ -1108,10 +1102,9 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
-            laplace_direct=self.laplace_direct,
+            laplace=self.laplace,
             laplace_direct_tol=self.laplace_direct_tol,
             laplace_direct_max_points=self.laplace_direct_max_points,
-            laplace_exchange=self.laplace_exchange,
             laplace_exchange_tol=self.laplace_exchange_tol,
             laplace_exchange_max_points=self.laplace_exchange_max_points,
             pair_density_eval_grid=self.pair_density_eval_grid,

@@ -12,10 +12,17 @@ from fsec.singularity_subtraction.structure_factor.helpers_sf import (
     should_compute_line_sample,
     update_line_sampling_decay_mask,
 )
-from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
 from fsec.singularity_subtraction.structure_factor.laplace_minimax import (
     make_minimax_laplace_grid,
 )
+from fsec.singularity_subtraction.structure_factor.mp2_contractions import (
+    build_trs_unique_pairs,
+    contract_direct_q4_lov_laplace,
+    contract_trs_unique_pair_rijab,
+    contract_trs_unique_pair_rijab_lov,
+    contract_trs_unique_pair_rijab_lov_laplace,
+)
+from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
 
 
 class LineSamplingDecayHelpers(unittest.TestCase):
@@ -108,14 +115,14 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             self.assertEqual(len(segment["indices"]), 3)
             self.assertTrue(np.allclose(qG_full[segment["indices"][0]], segment["q_min"]))
 
-    def test_trs_pair_representatives_cover_each_pair_once(self):
+    def test_trs_unique_pairs_cover_each_pair_once(self):
         trs_map = np.array([0, 2, 1, 4, 3])
         nkpts = len(trs_map)
-        representatives = MP2StructureFactor._build_trs_pair_representatives(
+        trs_unique_pairs = build_trs_unique_pairs(
             trs_map, nkpts)
 
         covered = set()
-        for m, n, factor in representatives:
+        for m, n, factor in trs_unique_pairs:
             partner = (trs_map[n], trs_map[m])
             if (m, n) == partner:
                 self.assertEqual(factor, 1)
@@ -125,15 +132,15 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             covered.add(partner)
 
         self.assertEqual(len(covered), nkpts * nkpts)
-        self.assertEqual(sum(factor for _, _, factor in representatives), nkpts * nkpts)
+        self.assertEqual(sum(factor for _, _, factor in trs_unique_pairs), nkpts * nkpts)
 
-    def test_trs_representative_contractions_match_full_reductions(self):
+    def test_trs_unique_pair_contractions_match_full_reductions(self):
         rng = np.random.default_rng(14)
         trs_map = np.array([0, 2, 1, 3])
         nkpts = len(trs_map)
         nocc = 2
         nvir = 3
-        representatives = MP2StructureFactor._build_trs_pair_representatives(
+        trs_unique_pairs = build_trs_unique_pairs(
             trs_map, nkpts)
 
         rho_ia = (
@@ -146,7 +153,7 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         direct_t2 = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir), dtype=complex)
         exchange_t2 = np.zeros_like(direct_t2)
         eijab = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir))
-        for m, n, _ in representatives:
+        for m, n, _ in trs_unique_pairs:
             partner_m = trs_map[n]
             partner_n = trs_map[m]
             direct_block = (
@@ -170,10 +177,10 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         full_exchange = np.einsum("mnijab,mnijba->", rijab, exchange_t2).real
         full_q4 = np.sum(np.abs(rijab)**2 * np.abs(eijab))
 
-        direct, exchange, q4 = MP2StructureFactor._contract_trs_representative_rijab(
+        direct, exchange, q4 = contract_trs_unique_pair_rijab(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             direct_t2=direct_t2,
             exchange_t2=exchange_t2,
             eijab_recip=eijab,
@@ -183,14 +190,14 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         self.assertAlmostEqual(exchange, full_exchange, places=12)
         self.assertAlmostEqual(q4, full_q4, places=12)
 
-    def test_trs_representative_lov_contractions_match_t2_blocks(self):
+    def test_trs_unique_pair_lov_contractions_match_t2_blocks(self):
         rng = np.random.default_rng(37)
         trs_map = np.array([0, 2, 1])
         nkpts = len(trs_map)
         naux = 4
         nocc = 2
         nvir = 3
-        representatives = MP2StructureFactor._build_trs_pair_representatives(
+        trs_unique_pairs = build_trs_unique_pairs(
             trs_map, nkpts)
 
         rho_ia = (
@@ -226,7 +233,7 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         exchange_t2 = np.zeros_like(direct_t2)
         eijab_recip = np.zeros((nkpts, nkpts, nocc, nocc, nvir, nvir))
 
-        for m, n, _ in representatives:
+        for m, n, _ in trs_unique_pairs:
             ka = kas_at_qi[m]
             kb = kbs_at_qi[n]
             eia = mo_e_o[m, :, None] - mo_e_v[ka]
@@ -249,18 +256,18 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             )
             exchange_t2[m, n] = exchange_oovv.conj() * exchange_recip
 
-        reference = MP2StructureFactor._contract_trs_representative_rijab(
+        reference = contract_trs_unique_pair_rijab(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             direct_t2=direct_t2,
             exchange_t2=exchange_t2,
             eijab_recip=eijab_recip,
         )
-        actual = MP2StructureFactor._contract_trs_representative_rijab_lov(
+        actual = contract_trs_unique_pair_rijab_lov(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             Lov,
             Lov_b,
             kas_at_qi,
@@ -279,10 +286,13 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         for actual_value, reference_value in zip(actual, reference):
             self.assertAlmostEqual(actual_value, reference_value, places=12)
 
-        laplace_direct = MP2StructureFactor._contract_trs_representative_rijab_lov(
+        laplace_contract = (
+            contract_trs_unique_pair_rijab_lov_laplace
+        )
+        laplace_actual = laplace_contract(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             Lov,
             Lov_b,
             kas_at_qi,
@@ -294,21 +304,22 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             nonzero_vpadding,
             nkpts,
             compute_direct=True,
+            compute_exchange=True,
             compute_q4=True,
-            laplace_direct=True,
-            laplace_direct_tolerance=1e-8,
-            laplace_direct_max_points=16,
+            direct_tolerance=1e-8,
+            direct_max_points=16,
+            exchange_tolerance=1e-8,
+            exchange_max_points=16,
         )
-        np.testing.assert_allclose(
-            laplace_direct[0], reference[0], rtol=2e-8, atol=1e-10)
-        np.testing.assert_allclose(
-            laplace_direct[2], reference[2], rtol=2e-8, atol=1e-10)
+        for actual_value, reference_value in zip(laplace_actual, reference):
+            np.testing.assert_allclose(
+                actual_value, reference_value, rtol=2e-8, atol=1e-10)
 
         direct_profile = TimingProfile()
-        MP2StructureFactor._contract_trs_representative_rijab_lov(
+        laplace_contract(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             Lov,
             Lov_b,
             kas_at_qi,
@@ -322,9 +333,8 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             compute_direct=True,
             compute_q4=True,
             profile=direct_profile,
-            laplace_direct=True,
-            laplace_direct_tolerance=1e-8,
-            laplace_direct_max_points=16,
+            direct_tolerance=1e-8,
+            direct_max_points=16,
         )
         self.assertIn(
             "TRS Lov direct/q4 Laplace contraction", direct_profile._times)
@@ -332,10 +342,10 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             "TRS Lov direct/q4 denominator build", direct_profile._times)
         self.assertNotIn("TRS Lov direct X@denom", direct_profile._times)
 
-        laplace_exchange = MP2StructureFactor._contract_trs_representative_rijab_lov(
+        laplace_exchange = laplace_contract(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             Lov,
             Lov_b,
             kas_at_qi,
@@ -347,19 +357,18 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             nonzero_vpadding,
             nkpts,
             compute_exchange=True,
-            laplace_exchange=True,
-            laplace_tolerance=1e-8,
-            laplace_max_points=16,
+            exchange_tolerance=1e-8,
+            exchange_max_points=16,
         )
         np.testing.assert_allclose(
             laplace_exchange[1], reference[1], rtol=2e-8, atol=1e-10)
 
         # Insufficient Laplace rank must take the exact path, not return a
         # lower-accuracy approximation.
-        exact_fallback = MP2StructureFactor._contract_trs_representative_rijab_lov(
+        exact_fallback = laplace_contract(
             rho_ia,
             rho_jb,
-            representatives,
+            trs_unique_pairs,
             Lov,
             Lov_b,
             kas_at_qi,
@@ -371,33 +380,29 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             nonzero_vpadding,
             nkpts,
             compute_exchange=True,
-            laplace_exchange=True,
-            laplace_tolerance=1e-8,
-            laplace_max_points=1,
+            exchange_tolerance=1e-8,
+            exchange_max_points=1,
         )
         self.assertAlmostEqual(exact_fallback[1], reference[1], places=12)
 
-        direct_exact_fallback = (
-            MP2StructureFactor._contract_trs_representative_rijab_lov(
-                rho_ia,
-                rho_jb,
-                representatives,
-                Lov,
-                Lov_b,
-                kas_at_qi,
-                kbs_at_qi,
-                mo_e_o,
-                mo_e_v,
-                mo_e_v_b,
-                nonzero_opadding,
-                nonzero_vpadding,
-                nkpts,
-                compute_direct=True,
-                compute_q4=True,
-                laplace_direct=True,
-                laplace_direct_tolerance=1e-8,
-                laplace_direct_max_points=1,
-            )
+        direct_exact_fallback = laplace_contract(
+            rho_ia,
+            rho_jb,
+            trs_unique_pairs,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_direct=True,
+            compute_q4=True,
+            direct_tolerance=1e-8,
+            direct_max_points=1,
         )
         self.assertAlmostEqual(
             direct_exact_fallback[0], reference[0], places=12)
@@ -407,15 +412,16 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         # Exercise the independent allocation paths as well.  In particular,
         # exchange-only must not construct or depend on the (ia, jb) direct
         # denominator matrix.
-        for component, expected_index in (
-                ({"compute_direct": True, "laplace_direct": True}, 0),
-                ({"compute_exchange": True}, 1),
-                ({"compute_q4": True, "laplace_direct": True}, 2)):
+        for contraction, component, expected_index in (
+                (laplace_contract, {"compute_direct": True}, 0),
+                (contract_trs_unique_pair_rijab_lov,
+                 {"compute_exchange": True}, 1),
+                (laplace_contract, {"compute_q4": True}, 2)):
             component_actual = (
-                MP2StructureFactor._contract_trs_representative_rijab_lov(
+                contraction(
                     rho_ia,
                     rho_jb,
-                    representatives,
+                    trs_unique_pairs,
                     Lov,
                     Lov_b,
                     kas_at_qi,
@@ -465,7 +471,7 @@ class LineSamplingDecayHelpers(unittest.TestCase):
             (np.abs(rho_jb.conj().T)**2 * active_jb).ravel(),
         )
 
-        result = MP2StructureFactor._contract_direct_q4_lov_laplace(
+        result = contract_direct_q4_lov_laplace(
             rho_ia,
             rho_jb,
             Lov_mka,
@@ -488,7 +494,7 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         nonpositive_eia = eia.copy()
         nonpositive_eia[active_ia] = 0.1
         self.assertIsNone(
-            MP2StructureFactor._contract_direct_q4_lov_laplace(
+            contract_direct_q4_lov_laplace(
                 rho_ia,
                 rho_jb,
                 Lov_mka,
@@ -868,27 +874,30 @@ class KnownValues(unittest.TestCase):
         actual = lov_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
 
+        exact_lov_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=True,
+            t2_store_type="kikj_lov",
+            laplace=False,
+            pair_density_eval_grid="uniform",
+        )
+        exact = exact_lov_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
         np.testing.assert_allclose(actual["qG_full"], reference["qG_full"], atol=1e-12)
-        np.testing.assert_allclose(
-            actual["SqG_full_direct"],
-            reference["SqG_full_direct"],
-            rtol=1e-7,
-            atol=1e-10,
-        )
-        np.testing.assert_allclose(
-            actual["SqG_full_exchange"],
-            reference["SqG_full_exchange"],
-            rtol=1e-7,
-            atol=1e-10,
-        )
-        np.testing.assert_allclose(
-            actual["SqG_full_q4"],
-            reference["SqG_full_q4"],
-            rtol=1e-7,
-            atol=1e-10,
-        )
+        for key in (
+                "SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                actual[key], reference[key], rtol=1e-7, atol=1e-10)
+            np.testing.assert_allclose(
+                exact[key], reference[key], rtol=1e-7, atol=1e-10)
         self.assertIn(
-            "rijab/Lov TRS representative contraction",
+            "rijab/Lov TRS unique-pair contraction",
             lov_sf.last_build_timings,
         )
         self.assertIn(
@@ -908,10 +917,26 @@ class KnownValues(unittest.TestCase):
             "TRS Lov exchange ERI matmul",
             lov_sf.last_build_timings,
         )
+        self.assertIn(
+            "TRS Lov direct/q4 denominator build",
+            exact_lov_sf.last_build_timings,
+        )
+        self.assertIn(
+            "TRS Lov exchange ERI matmul",
+            exact_lov_sf.last_build_timings,
+        )
+        self.assertNotIn(
+            "TRS Lov direct/q4 Laplace contraction",
+            exact_lov_sf.last_build_timings,
+        )
+        self.assertNotIn(
+            "TRS Lov exchange Laplace contraction",
+            exact_lov_sf.last_build_timings,
+        )
         self.assertNotIn("direct t2 cache miss", lov_sf.last_build_timings)
         self.assertNotIn("exchange t2 cache miss", lov_sf.last_build_timings)
 
-    def test_trs_representative_kikjka_runs_with_exact_fallback_112_kmesh(self):
+    def test_trs_unique_pair_kikjka_runs_with_exact_fallback_112_kmesh(self):
         reciprocal = self.kmf_112.cell.reciprocal_vectors()
         qG_full = np.array([
             [0.0, 0.0, 0.0],
@@ -962,12 +987,12 @@ class KnownValues(unittest.TestCase):
             )
         )
         self.assertIn(
-            "rijab/t2 TRS representative contraction",
+            "rijab/t2 TRS unique-pair contraction",
             optimized_sf.last_build_timings,
         )
         self.assertIn("rijab tensor contraction", fallback_sf.last_build_timings)
 
-    def test_contract_kikj_dG0_matches_old_expression(self):
+    def test_kikj_dG0_reduction_matches_old_expression(self):
         rng = np.random.default_rng(12)
         rijab = rng.normal(size=24) + 1j * rng.normal(size=24)
         eijab = rng.normal(size=(2, 3, 4))
@@ -976,7 +1001,8 @@ class KnownValues(unittest.TestCase):
         rijab_ovr_e = rijab * np.sqrt(np.abs(eijab)).ravel()
         rijab_ovr_e = rijab_ovr_e * scale
         reference = -2 * np.einsum('i,i->', rijab_ovr_e, rijab_ovr_e.conj())
-        actual = MP2StructureFactor.contract_kikj_dG0(rijab, eijab, scale)
+        actual = -2 * scale**2 * np.sum(
+            np.abs(rijab)**2 * np.abs(eijab).ravel())
 
         self.assertAlmostEqual(actual.real, reference.real, places=14)
         self.assertAlmostEqual(actual.imag, reference.imag, places=14)
