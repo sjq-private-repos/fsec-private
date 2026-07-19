@@ -132,8 +132,17 @@ class MP2SSOptions:
         Supported values are ``"direct_q4"`` and ``"exchange"``.
     t2_store_type
         Storage strategy for MP2 amplitudes. Supported values are
-        ``"kikjka"``, ``"kikj"``, and ``"ki"``, ranging from largest to smallest
-        memory footprint.
+        ``"kikjka"``, ``"kikj"``, ``"ki"``, and ``"kikj_lov"``.  The latter
+        contracts density-fitting tensors without materializing amplitudes.
+    laplace_exchange
+        Use the minimax Laplace denominator factorization for exchange when
+        ``t2_store_type="kikj_lov"``. An exact contraction is used automatically
+        if the minimax table cannot cover the requested range and tolerance.
+    laplace_exchange_tol
+        Maximum absolute error for ``1/x`` on the normalized minimax interval.
+    laplace_exchange_max_points
+        Maximum permitted number of Laplace points before using the exact
+        fallback.
     pair_density_eval_grid
         Real-space quadrature grid used to evaluate MP2 pair-density overlaps.
         Supported values are ``"uniform"`` and ``"becke"``. The default is
@@ -171,6 +180,9 @@ class MP2SSOptions:
     line_sampling_decay_consecutive_below: int = 3
     line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
+    laplace_exchange: bool = True
+    laplace_exchange_tol: float = 1e-8
+    laplace_exchange_max_points: int = 16
     pair_density_eval_grid: str = 'becke'
     pair_density_becke_grid_level: int = 0
     correct_q2_q4_separately: bool = True
@@ -185,12 +197,21 @@ class MP2SSOptions:
         )
         if pair_density_becke_grid_level < 0:
             raise ValueError("pair_density_becke_grid_level must be non-negative")
+        laplace_exchange_tol = float(self.laplace_exchange_tol)
+        laplace_exchange_max_points = int(self.laplace_exchange_max_points)
+        if not np.isfinite(laplace_exchange_tol) or laplace_exchange_tol <= 0:
+            raise ValueError("laplace_exchange_tol must be finite and positive")
+        if laplace_exchange_max_points < 1:
+            raise ValueError("laplace_exchange_max_points must be positive")
         object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
         object.__setattr__(
             self,
             'pair_density_becke_grid_level',
             pair_density_becke_grid_level,
         )
+        object.__setattr__(self, 'laplace_exchange_tol', laplace_exchange_tol)
+        object.__setattr__(
+            self, 'laplace_exchange_max_points', laplace_exchange_max_points)
 
 
 @dataclass(frozen=True)
@@ -967,6 +988,9 @@ class MP2SS:
         self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
         self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
+        self.laplace_exchange = options.laplace_exchange
+        self.laplace_exchange_tol = options.laplace_exchange_tol
+        self.laplace_exchange_max_points = options.laplace_exchange_max_points
         self.pair_density_eval_grid = options.pair_density_eval_grid
         self.pair_density_becke_grid_level = options.pair_density_becke_grid_level
         
@@ -1058,6 +1082,9 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
+            laplace_exchange=self.laplace_exchange,
+            laplace_exchange_tol=self.laplace_exchange_tol,
+            laplace_exchange_max_points=self.laplace_exchange_max_points,
             pair_density_eval_grid=self.pair_density_eval_grid,
             pair_density_becke_grid_level=self.pair_density_becke_grid_level,
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,

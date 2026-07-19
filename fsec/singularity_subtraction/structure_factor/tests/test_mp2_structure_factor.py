@@ -12,9 +12,31 @@ from fsec.singularity_subtraction.structure_factor.helpers_sf import (
     update_line_sampling_decay_mask,
 )
 from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
+from fsec.singularity_subtraction.structure_factor.laplace_minimax import (
+    make_minimax_laplace_grid,
+)
 
 
 class LineSamplingDecayHelpers(unittest.TestCase):
+    def test_minimax_laplace_grid_meets_error_bound(self):
+        denominator_min = 0.4
+        denominator_max = 18.0
+        grid = make_minimax_laplace_grid(
+            denominator_min, denominator_max, tolerance=1e-8, max_points=16)
+
+        self.assertIsNotNone(grid)
+        self.assertEqual(grid.npoints, 12)
+        self.assertEqual(grid.table_ratio, 100.0)
+        denominators = np.geomspace(denominator_min, denominator_max, 20001)
+        approximate = (
+            np.exp(-denominators[:, None] * grid.points) @ grid.weights)
+        error = np.max(np.abs(approximate - 1 / denominators))
+        self.assertLessEqual(error, grid.normalized_error / denominator_min)
+
+        self.assertIsNone(make_minimax_laplace_grid(1.0, 1001.0))
+        self.assertIsNone(make_minimax_laplace_grid(
+            1.0, 100.0, tolerance=1e-8, max_points=8))
+
     def test_line_sampling_decay_rejects_unimplemented_components(self):
         with self.assertRaises(NotImplementedError):
             normalize_line_sampling_decay_components(
@@ -255,6 +277,51 @@ class LineSamplingDecayHelpers(unittest.TestCase):
 
         for actual_value, reference_value in zip(actual, reference):
             self.assertAlmostEqual(actual_value, reference_value, places=12)
+
+        laplace_exchange = MP2StructureFactor._contract_trs_representative_rijab_lov(
+            rho_ia,
+            rho_jb,
+            representatives,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_exchange=True,
+            laplace_exchange=True,
+            laplace_tolerance=1e-8,
+            laplace_max_points=16,
+        )
+        np.testing.assert_allclose(
+            laplace_exchange[1], reference[1], rtol=2e-8, atol=1e-10)
+
+        # Insufficient Laplace rank must take the exact path, not return a
+        # lower-accuracy approximation.
+        exact_fallback = MP2StructureFactor._contract_trs_representative_rijab_lov(
+            rho_ia,
+            rho_jb,
+            representatives,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_exchange=True,
+            laplace_exchange=True,
+            laplace_tolerance=1e-8,
+            laplace_max_points=1,
+        )
+        self.assertAlmostEqual(exact_fallback[1], reference[1], places=12)
 
         # Exercise the independent allocation paths as well.  In particular,
         # exchange-only must not construct or depend on the (ia, jb) direct
@@ -672,6 +739,14 @@ class KnownValues(unittest.TestCase):
         )
         self.assertIn(
             "rijab/Lov TRS representative contraction",
+            lov_sf.last_build_timings,
+        )
+        self.assertIn(
+            "TRS Lov exchange Laplace contraction",
+            lov_sf.last_build_timings,
+        )
+        self.assertNotIn(
+            "TRS Lov exchange ERI matmul",
             lov_sf.last_build_timings,
         )
         self.assertNotIn("direct t2 cache miss", lov_sf.last_build_timings)
