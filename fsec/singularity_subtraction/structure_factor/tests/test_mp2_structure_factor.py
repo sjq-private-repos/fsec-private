@@ -6,6 +6,7 @@ from pyscf.pbc import gto, scf
 
 from fsec.singularity_subtraction.grids import ExxSSGrids
 from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+    TimingProfile,
     make_line_sampling_decay_state,
     normalize_line_sampling_decay_components,
     should_compute_line_sample,
@@ -278,6 +279,59 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         for actual_value, reference_value in zip(actual, reference):
             self.assertAlmostEqual(actual_value, reference_value, places=12)
 
+        laplace_direct = MP2StructureFactor._contract_trs_representative_rijab_lov(
+            rho_ia,
+            rho_jb,
+            representatives,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_direct=True,
+            compute_q4=True,
+            laplace_direct=True,
+            laplace_direct_tolerance=1e-8,
+            laplace_direct_max_points=16,
+        )
+        np.testing.assert_allclose(
+            laplace_direct[0], reference[0], rtol=2e-8, atol=1e-10)
+        np.testing.assert_allclose(
+            laplace_direct[2], reference[2], rtol=2e-8, atol=1e-10)
+
+        direct_profile = TimingProfile()
+        MP2StructureFactor._contract_trs_representative_rijab_lov(
+            rho_ia,
+            rho_jb,
+            representatives,
+            Lov,
+            Lov_b,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+            compute_direct=True,
+            compute_q4=True,
+            profile=direct_profile,
+            laplace_direct=True,
+            laplace_direct_tolerance=1e-8,
+            laplace_direct_max_points=16,
+        )
+        self.assertIn(
+            "TRS Lov direct/q4 Laplace contraction", direct_profile._times)
+        self.assertNotIn(
+            "TRS Lov direct/q4 denominator build", direct_profile._times)
+        self.assertNotIn("TRS Lov direct X@denom", direct_profile._times)
+
         laplace_exchange = MP2StructureFactor._contract_trs_representative_rijab_lov(
             rho_ia,
             rho_jb,
@@ -323,13 +377,40 @@ class LineSamplingDecayHelpers(unittest.TestCase):
         )
         self.assertAlmostEqual(exact_fallback[1], reference[1], places=12)
 
+        direct_exact_fallback = (
+            MP2StructureFactor._contract_trs_representative_rijab_lov(
+                rho_ia,
+                rho_jb,
+                representatives,
+                Lov,
+                Lov_b,
+                kas_at_qi,
+                kbs_at_qi,
+                mo_e_o,
+                mo_e_v,
+                mo_e_v_b,
+                nonzero_opadding,
+                nonzero_vpadding,
+                nkpts,
+                compute_direct=True,
+                compute_q4=True,
+                laplace_direct=True,
+                laplace_direct_tolerance=1e-8,
+                laplace_direct_max_points=1,
+            )
+        )
+        self.assertAlmostEqual(
+            direct_exact_fallback[0], reference[0], places=12)
+        self.assertAlmostEqual(
+            direct_exact_fallback[2], reference[2], places=12)
+
         # Exercise the independent allocation paths as well.  In particular,
         # exchange-only must not construct or depend on the (ia, jb) direct
         # denominator matrix.
         for component, expected_index in (
-                ({"compute_direct": True}, 0),
+                ({"compute_direct": True, "laplace_direct": True}, 0),
                 ({"compute_exchange": True}, 1),
-                ({"compute_q4": True}, 2)):
+                ({"compute_q4": True, "laplace_direct": True}, 2)):
             component_actual = (
                 MP2StructureFactor._contract_trs_representative_rijab_lov(
                     rho_ia,
@@ -348,11 +429,80 @@ class LineSamplingDecayHelpers(unittest.TestCase):
                     **component,
                 )
             )
-            self.assertAlmostEqual(
+            np.testing.assert_allclose(
                 component_actual[expected_index],
                 reference[expected_index],
-                places=12,
+                rtol=2e-8,
+                atol=1e-10,
             )
+
+    def test_direct_q4_laplace_respects_padding_masks(self):
+        rng = np.random.default_rng(83)
+        naux, nocc, nvir = 3, 2, 3
+        rho_ia = rng.normal(size=(nocc, nvir)) + 1j * rng.normal(
+            size=(nocc, nvir))
+        rho_jb = rng.normal(size=(nvir, nocc)) + 1j * rng.normal(
+            size=(nvir, nocc))
+        Lov_mka = rng.normal(size=(naux, nocc, nvir)) + 1j * rng.normal(
+            size=(naux, nocc, nvir))
+        Lov_nkb = rng.normal(size=(naux, nocc, nvir)) + 1j * rng.normal(
+            size=(naux, nocc, nvir))
+        eia = -(0.5 + rng.random(size=(nocc, nvir)))
+        ejb = -(0.75 + rng.random(size=(nocc, nvir)))
+        active_ia = np.array([[True, False, True], [False, False, False]])
+        active_jb = np.array([[True, False, True], [False, False, False]])
+
+        x_lia = Lov_mka * rho_ia[None, :, :] * active_ia[None, :, :]
+        y_ljb = (
+            Lov_nkb * rho_jb.conj().T[None, :, :] * active_jb[None, :, :])
+        reciprocal = 1 / np.add.outer(eia.ravel(), ejb.ravel())
+        direct_reference = np.sum(
+            (x_lia.reshape(naux, -1) @ reciprocal)
+            * y_ljb.reshape(naux, -1)
+        )
+        q4_reference = np.dot(
+            (np.abs(rho_ia)**2 * active_ia).ravel() @ np.abs(reciprocal),
+            (np.abs(rho_jb.conj().T)**2 * active_jb).ravel(),
+        )
+
+        result = MP2StructureFactor._contract_direct_q4_lov_laplace(
+            rho_ia,
+            rho_jb,
+            Lov_mka,
+            Lov_nkb,
+            eia,
+            ejb,
+            active_ia,
+            active_jb,
+            True,
+            True,
+            1e-8,
+            16,
+        )
+        self.assertIsNotNone(result)
+        np.testing.assert_allclose(
+            result[0], direct_reference, rtol=2e-8, atol=1e-10)
+        np.testing.assert_allclose(
+            result[1], q4_reference, rtol=2e-8, atol=1e-10)
+
+        nonpositive_eia = eia.copy()
+        nonpositive_eia[active_ia] = 0.1
+        self.assertIsNone(
+            MP2StructureFactor._contract_direct_q4_lov_laplace(
+                rho_ia,
+                rho_jb,
+                Lov_mka,
+                Lov_nkb,
+                nonpositive_eia,
+                ejb,
+                active_ia,
+                active_jb,
+                True,
+                True,
+                1e-8,
+                16,
+            )
+        )
 
 
 class KnownValues(unittest.TestCase):
@@ -745,6 +895,15 @@ class KnownValues(unittest.TestCase):
             "TRS Lov exchange Laplace contraction",
             lov_sf.last_build_timings,
         )
+        self.assertIn(
+            "TRS Lov direct/q4 Laplace contraction",
+            lov_sf.last_build_timings,
+        )
+        self.assertNotIn(
+            "TRS Lov direct/q4 denominator build",
+            lov_sf.last_build_timings,
+        )
+        self.assertNotIn("TRS Lov direct X@denom", lov_sf.last_build_timings)
         self.assertNotIn(
             "TRS Lov exchange ERI matmul",
             lov_sf.last_build_timings,

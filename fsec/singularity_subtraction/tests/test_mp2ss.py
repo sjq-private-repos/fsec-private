@@ -83,6 +83,27 @@ class PrintResultsTests(unittest.TestCase):
 
 
 class MP2SSOptionsTests(unittest.TestCase):
+    def test_laplace_direct_options(self):
+        defaults = MP2SSOptions()
+        self.assertTrue(defaults.laplace_direct)
+        self.assertEqual(defaults.laplace_direct_tol, 1e-8)
+        self.assertEqual(defaults.laplace_direct_max_points, 16)
+
+        options = MP2SSOptions(
+            laplace_direct=False,
+            laplace_direct_tol="1e-7",
+            laplace_direct_max_points="12",
+        )
+        self.assertFalse(options.laplace_direct)
+        self.assertEqual(options.laplace_direct_tol, 1e-7)
+        self.assertEqual(options.laplace_direct_max_points, 12)
+
+        for tolerance in (0, -1, np.inf, np.nan):
+            with self.assertRaises(ValueError):
+                MP2SSOptions(laplace_direct_tol=tolerance)
+        with self.assertRaises(ValueError):
+            MP2SSOptions(laplace_direct_max_points=0)
+
     def test_adaptive_sq_ke_cutoff_options(self):
         options = MP2SSOptions(
             sq_ke_cutoff=100.0,

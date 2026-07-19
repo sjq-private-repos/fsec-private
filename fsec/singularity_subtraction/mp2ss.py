@@ -134,6 +134,17 @@ class MP2SSOptions:
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, ``"ki"``, and ``"kikj_lov"``.  The latter
         contracts density-fitting tensors without materializing amplitudes.
+    laplace_direct
+        Use the minimax Laplace denominator factorization for the direct and
+        direct-q4 components when ``t2_store_type="kikj_lov"``. An exact
+        contraction is used automatically if the minimax table cannot cover
+        the requested range and tolerance.
+    laplace_direct_tol
+        Maximum absolute error for ``1/x`` on the normalized direct minimax
+        interval.
+    laplace_direct_max_points
+        Maximum permitted number of direct Laplace points before using the
+        exact fallback.
     laplace_exchange
         Use the minimax Laplace denominator factorization for exchange when
         ``t2_store_type="kikj_lov"``. An exact contraction is used automatically
@@ -180,6 +191,9 @@ class MP2SSOptions:
     line_sampling_decay_consecutive_below: int = 3
     line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
+    laplace_direct: bool = True
+    laplace_direct_tol: float = 1e-8
+    laplace_direct_max_points: int = 16
     laplace_exchange: bool = True
     laplace_exchange_tol: float = 1e-8
     laplace_exchange_max_points: int = 16
@@ -197,6 +211,12 @@ class MP2SSOptions:
         )
         if pair_density_becke_grid_level < 0:
             raise ValueError("pair_density_becke_grid_level must be non-negative")
+        laplace_direct_tol = float(self.laplace_direct_tol)
+        laplace_direct_max_points = int(self.laplace_direct_max_points)
+        if not np.isfinite(laplace_direct_tol) or laplace_direct_tol <= 0:
+            raise ValueError("laplace_direct_tol must be finite and positive")
+        if laplace_direct_max_points < 1:
+            raise ValueError("laplace_direct_max_points must be positive")
         laplace_exchange_tol = float(self.laplace_exchange_tol)
         laplace_exchange_max_points = int(self.laplace_exchange_max_points)
         if not np.isfinite(laplace_exchange_tol) or laplace_exchange_tol <= 0:
@@ -209,6 +229,9 @@ class MP2SSOptions:
             'pair_density_becke_grid_level',
             pair_density_becke_grid_level,
         )
+        object.__setattr__(self, 'laplace_direct_tol', laplace_direct_tol)
+        object.__setattr__(
+            self, 'laplace_direct_max_points', laplace_direct_max_points)
         object.__setattr__(self, 'laplace_exchange_tol', laplace_exchange_tol)
         object.__setattr__(
             self, 'laplace_exchange_max_points', laplace_exchange_max_points)
@@ -988,6 +1011,9 @@ class MP2SS:
         self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
         self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
+        self.laplace_direct = options.laplace_direct
+        self.laplace_direct_tol = options.laplace_direct_tol
+        self.laplace_direct_max_points = options.laplace_direct_max_points
         self.laplace_exchange = options.laplace_exchange
         self.laplace_exchange_tol = options.laplace_exchange_tol
         self.laplace_exchange_max_points = options.laplace_exchange_max_points
@@ -1082,6 +1108,9 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
+            laplace_direct=self.laplace_direct,
+            laplace_direct_tol=self.laplace_direct_tol,
+            laplace_direct_max_points=self.laplace_direct_max_points,
             laplace_exchange=self.laplace_exchange,
             laplace_exchange_tol=self.laplace_exchange_tol,
             laplace_exchange_max_points=self.laplace_exchange_max_points,
