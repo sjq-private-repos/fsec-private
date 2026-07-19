@@ -12,7 +12,7 @@ from fsec.singularity_subtraction.structure_factor.helpers_sf import (
     should_compute_line_sample,
     update_line_sampling_decay_mask,
 )
-from fsec.singularity_subtraction.structure_factor.laplace_minimax import (
+from fsec.singularity_subtraction.structure_factor.laplace import (
     make_minimax_laplace_grid,
 )
 from fsec.singularity_subtraction.structure_factor.mp2_contractions import (

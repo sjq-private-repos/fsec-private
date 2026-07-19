@@ -3,7 +3,7 @@
 import numpy as np
 from pyscf.lib.parameters import LARGE_DENOM
 
-from fsec.singularity_subtraction.structure_factor.laplace_minimax import (
+from fsec.singularity_subtraction.structure_factor.laplace import (
     make_minimax_laplace_grid,
 )
 
