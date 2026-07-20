@@ -180,10 +180,10 @@ def contract_exchange_lov_laplace(
         # Both intermediates have shape (naux, nocc, nocc).  The work is
         # O(naux * nocc**2 * nvir) per Laplace point and the peak scratch
         # is O(naux * nocc**2), independent of nvir**2.
-        left_lij = Lov_mkb @ scaled_rho_bj
-        right_lij = np.matmul(scaled_rho_ia, Lov_nka_t)
+        left_Lij = Lov_mkb @ scaled_rho_bj # O(A O^2 V)
+        right_Lij = scaled_rho_ia @ Lov_nka_t
         exchange_block -= weight * np.einsum(
-            'Lij,Lij->', left_lij, right_lij, optimize=True)
+            'Lij,Lij->', left_Lij, right_Lij, optimize=True)
 
     return exchange_block, grid
 
@@ -235,17 +235,17 @@ def contract_direct_q4_lov_laplace(
     if compute_direct:
         rho_ia_weighted = exp_ia * rho_ia.ravel()[None, :]
         rho_jb_weighted = exp_jb * rho_jb.conj().T.ravel()[None, :]
-        left_ln = Lov_mka.reshape(Lov_mka.shape[0], -1) @ rho_ia_weighted.T
-        right_ln = Lov_nkb.reshape(Lov_nkb.shape[0], -1) @ rho_jb_weighted.T
-        direct_by_point = np.einsum(
-            'Ln,Ln->n', left_ln, right_ln, optimize=True)
-        direct_block = -np.dot(grid.weights, direct_by_point)
+        left_Ln = Lov_mka.reshape(Lov_mka.shape[0], -1) @ rho_ia_weighted.T # CPU: O(A O V nlaplace)
+        right_Ln = Lov_nkb.reshape(Lov_nkb.shape[0], -1) @ rho_jb_weighted.T
+        direct_laplace = np.einsum(
+            'Ln,Ln->n', left_Ln, right_Ln, optimize=True) # L is naux, n is Laplace points
+        direct_block = -np.dot(grid.weights, direct_laplace)
 
     q4_block = 0.0
     if compute_q4:
         rho_ia_abs = np.abs(rho_ia.ravel())**2
         rho_jb_abs = np.abs(rho_jb.conj().T.ravel())**2
-        q4_ia = exp_ia @ rho_ia_abs
+        q4_ia = exp_ia @ rho_ia_abs # O(nlaplace O V)
         q4_jb = exp_jb @ rho_jb_abs
         q4_block = np.dot(grid.weights, q4_ia * q4_jb)
 
