@@ -7,7 +7,7 @@ from pyscf.pbc.tools import get_monkhorst_pack_size
 from fsec.singularity_subtraction.grids import ExxSSGrids, minimum_image
 
 from fsec.singularity_subtraction.structure_factor import StructureFactor
-from fsec.singularity_subtraction.structure_factor.helpers_sf import build_uKpts, TimingProfile
+from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts, TimingProfile
 
 
 class ExxStructureFactor(StructureFactor):

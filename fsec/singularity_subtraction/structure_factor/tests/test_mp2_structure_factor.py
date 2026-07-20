@@ -5,7 +5,7 @@ from pyscf.pbc import df, mp
 from pyscf.pbc import gto, scf
 
 from fsec.singularity_subtraction.grids import ExxSSGrids
-from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+from fsec.singularity_subtraction.structure_factor.helpers import (
     TimingProfile,
     make_line_sampling_decay_state,
     normalize_line_sampling_decay_components,

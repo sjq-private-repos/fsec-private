@@ -19,7 +19,7 @@ from pyscf.lib.numpy_helper import einsum as pyscf_einsum
 
 
 from fsec.singularity_subtraction.structure_factor import StructureFactor
-from fsec.singularity_subtraction.structure_factor.helpers_sf import (
+from fsec.singularity_subtraction.structure_factor.helpers import (
     TimingProfile,
     build_uKpts,
     filter_line_sampling_segments,

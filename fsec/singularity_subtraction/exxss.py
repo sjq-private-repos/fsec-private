@@ -4,7 +4,7 @@ from fsec.singularity_subtraction import model_function
 # import traceback
 from fsec.singularity_subtraction.function_fitting import ExxScipyMinimize, ExxScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import ExxStructureFactor
-from fsec.singularity_subtraction.structure_factor.helpers_sf import build_uKpts as _build_uKpts
+from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts as _build_uKpts
 from fsec.singularity_subtraction import SingularitySubtraction
 
 import numpy as np
