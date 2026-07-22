@@ -936,61 +936,74 @@ class KnownValues(unittest.TestCase):
         self.assertNotIn("direct t2 cache miss", lov_sf.last_build_timings)
         self.assertNotIn("exchange t2 cache miss", lov_sf.last_build_timings)
 
-    def test_trs_unique_pair_kikjka_runs_with_exact_fallback_112_kmesh(self):
-        reciprocal = self.kmf_112.cell.reciprocal_vectors()
-        qG_full = np.array([
-            [0.0, 0.0, 0.0],
-            0.5 * reciprocal[2],
-            -0.5 * reciprocal[2],
-        ])
-
+    def test_trs_unique_pair_matches_full_contraction_112_kmesh(self):
         fallback_sf = MP2StructureFactor(
             self.kmf_112,
             self.kmp_112,
-            t2=self.t2_112,
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
             check_trs=False,
-            t2_store_type="kikjka",
+            t2_store_type="kikj",
             pair_density_eval_grid="uniform",
         )
+        fallback_sf.set_grids(min_fit_points=10)
+        qG_candidates = fallback_sf.grids.qG_grid_local
+        qG_candidates = qG_candidates[
+            np.linalg.norm(qG_candidates, axis=1) < self.qG_cutoff + 1e-8
+        ]
+        qG_full = qG_candidates[self._closest_10_indices(qG_candidates)]
         fallback = fallback_sf.build_structure_factor(
-            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+            qG_full=qG_full,
+            grids=fallback_sf.grids,
+            direct=True,
+            exchange=True,
+            dG0=True,
+        )
 
         optimized_sf = MP2StructureFactor(
             self.kmf_112,
             self.kmp_112,
-            t2=self.t2_112,
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
             sq_inversion_symm=False,
             check_trs=True,
-            t2_store_type="kikjka",
+            t2_store_type="kikj",
             pair_density_eval_grid="uniform",
         )
         optimized = optimized_sf.build_structure_factor(
-            qG_full=qG_full, direct=True, exchange=True, dG0=True)
-
-        np.testing.assert_allclose(optimized["qG_full"], fallback["qG_full"], atol=1e-12)
-        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
-            self.assertTrue(np.all(np.isfinite(optimized[key])))
-            self.assertTrue(np.all(np.isfinite(fallback[key])))
-        self.assertFalse(
-            np.allclose(
-                optimized["SqG_full_direct"],
-                fallback["SqG_full_direct"],
-                rtol=1e-7,
-                atol=1e-10,
-            )
+            qG_full=qG_full,
+            grids=fallback_sf.grids,
+            direct=True,
+            exchange=True,
+            dG0=True,
         )
+
+        np.testing.assert_allclose(
+            optimized["qG_full"], fallback["qG_full"], atol=1e-12)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            with self.subTest(structure_factor=key):
+                np.testing.assert_allclose(
+                    optimized[key],
+                    fallback[key],
+                    rtol=1e-7,
+                    atol=1e-10,
+                )
         self.assertIn(
             "rijab/t2 TRS unique-pair contraction",
             optimized_sf.last_build_timings,
         )
+        self.assertNotIn(
+            "rijab tensor contraction",
+            optimized_sf.last_build_timings,
+        )
         self.assertIn("rijab tensor contraction", fallback_sf.last_build_timings)
+        self.assertNotIn(
+            "rijab/t2 TRS unique-pair contraction",
+            fallback_sf.last_build_timings,
+        )
 
     def test_kikj_dG0_reduction_matches_old_expression(self):
         rng = np.random.default_rng(12)
