@@ -1,9 +1,13 @@
 from dataclasses import dataclass, replace
+from typing import Optional
+import warnings
+
 from pyscf.pbc.tools import get_monkhorst_pack_size
 import time
 from fsec.singularity_subtraction import model_function
 from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
+from fsec.singularity_subtraction.structure_factor.mp2_smallq import MP2SmallQ
 from fsec.singularity_subtraction.grids import MP2SSGrids
 from fsec.singularity_subtraction import SingularitySubtraction
 from pyscf.pbc import df
@@ -157,6 +161,13 @@ class MP2SSOptions:
     pair_density_becke_grid_level
         PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
         Lower values use fewer atom-centered grid points. The default is 0.
+    smallq_band_df
+        Density-fitting backend used for the half-shifted non-SCF bands.
+        Supported values are ``"FFTDF"`` and ``"GDF"``. ``None`` disables
+        the small-q fitting point.
+    smallq_band_exxdiv
+        Exchange-divergence treatment used only for the half-shifted bands
+        calculation. GDF supports only ``None`` and ``"ewald"``.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
@@ -194,6 +205,8 @@ class MP2SSOptions:
     laplace_exchange_max_points: int = 16
     pair_density_eval_grid: str = 'becke'
     pair_density_becke_grid_level: int = 0
+    smallq_band_df: Optional[str] = None
+    smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
 
     def __post_init__(self):
@@ -206,6 +219,25 @@ class MP2SSOptions:
         )
         if pair_density_becke_grid_level < 0:
             raise ValueError("pair_density_becke_grid_level must be non-negative")
+        smallq_band_df = self.smallq_band_df
+        if smallq_band_df is not None:
+            smallq_band_df = str(smallq_band_df).strip().upper()
+            if smallq_band_df not in ('FFTDF', 'GDF'):
+                raise ValueError(
+                    "smallq_band_df must be None, 'FFTDF', or 'GDF'"
+                )
+        smallq_band_exxdiv = self.smallq_band_exxdiv
+        if isinstance(smallq_band_exxdiv, str):
+            smallq_band_exxdiv = smallq_band_exxdiv.strip().lower()
+        if (
+            smallq_band_df == 'GDF'
+            and smallq_band_exxdiv is not None
+            and str(smallq_band_exxdiv).strip().lower() != 'ewald'
+        ):
+            raise ValueError(
+                "GDF bands only support smallq_band_exxdiv=None or 'ewald'; "
+                f"got {smallq_band_exxdiv!r}"
+            )
         laplace_direct_tol = float(self.laplace_direct_tol)
         laplace_direct_max_points = int(self.laplace_direct_max_points)
         if not np.isfinite(laplace_direct_tol) or laplace_direct_tol <= 0:
@@ -223,6 +255,10 @@ class MP2SSOptions:
             self,
             'pair_density_becke_grid_level',
             pair_density_becke_grid_level,
+        )
+        object.__setattr__(self, 'smallq_band_df', smallq_band_df)
+        object.__setattr__(
+            self, 'smallq_band_exxdiv', smallq_band_exxdiv
         )
         object.__setattr__(self, 'laplace_direct_tol', laplace_direct_tol)
         object.__setattr__(
@@ -650,7 +686,8 @@ class MP2DirectFullSS(SingularitySubtraction):
 
         return m, initial_params, spec.get('fit_multipliers')
 
-    def optimize_parameters(self, *, SqG_full_direct, qG_full, grids, nks):
+    def optimize_parameters(self, *, SqG_full_direct, qG_full, grids, nks,
+                            fit_SqG_full_direct=None, fit_qG_full=None):
         config = self.config
 
         Lvec_recip = config.cell.reciprocal_vectors()
@@ -660,7 +697,18 @@ class MP2DirectFullSS(SingularitySubtraction):
         if config.fit_method is None or config.fit_method == 'Disabled':
             return None
 
-        qGlocal_fit = qG_full
+        qGlocal_fit = (
+            qG_full if fit_qG_full is None else np.asarray(fit_qG_full)
+        )
+        SqGlocal_fit = (
+            SqG_full_direct
+            if fit_SqG_full_direct is None
+            else np.asarray(fit_SqG_full_direct)
+        )
+        if len(qGlocal_fit) != len(SqGlocal_fit):
+            raise ValueError(
+                "fit_qG_full and fit_SqG_full_direct must have equal lengths"
+            )
         qGlocal_grid_correction = grids.build_qG_grid(grids.qGrid, grids.GptGrid3D, faster_dim='G')
         f_gauss, initial_params, fit_multipliers = self._create_direct_model(
             config.auxfunc_direct, grids
@@ -678,10 +726,10 @@ class MP2DirectFullSS(SingularitySubtraction):
             print(f"Fitting with {len(qGlocal_fit[mask])} points")
             print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
         else:
-            mask = np.ones_like(SqG_full_direct, dtype=bool)
+            mask = np.ones_like(SqGlocal_fit, dtype=bool)
 
         fitted_params = fit_method.fit_model(
-            qGlocal_fit[mask], SqG_full_direct[mask],
+            qGlocal_fit[mask], SqGlocal_fit[mask],
             fit_multipliers=fit_multipliers,
             fixed_params=fixed_params,
             force_positive_params=True,
@@ -702,7 +750,9 @@ class MP2DirectFullSS(SingularitySubtraction):
         prefactor = 4 * np.pi * numKpt3D / omega_star
         return prefactor * f_gauss.coulomb_integral()
 
-    def compute_correction(self, *, SqG_full_direct=None, qG_full=None, grids=None, nks=None):
+    def compute_correction(self, *, SqG_full_direct=None, qG_full=None,
+                           grids=None, nks=None,
+                           fit_SqG_full_direct=None, fit_qG_full=None):
         print("MP2SS: Computing direct correction...")
         ss_start = time.time()
         if SqG_full_direct is None:
@@ -724,6 +774,8 @@ class MP2DirectFullSS(SingularitySubtraction):
             qG_full=qG_full,
             grids=grids,
             nks=nks,
+            fit_SqG_full_direct=fit_SqG_full_direct,
+            fit_qG_full=fit_qG_full,
         )
         if optimized is None:
             return None
@@ -755,12 +807,17 @@ class MP2DirectFullSS(SingularitySubtraction):
 
         return result
 
-    def compute_direct_correction(self, *, SqG_full_direct, qG_full, SqG_full_q4, grids, nks):
+    def compute_direct_correction(self, *, SqG_full_direct, qG_full,
+                                  SqG_full_q4, grids, nks,
+                                  fit_SqG_full_direct=None,
+                                  fit_qG_full=None):
         return self.compute_correction(
             SqG_full_direct=SqG_full_direct,
             qG_full=qG_full,
             grids=grids,
             nks=nks,
+            fit_SqG_full_direct=fit_SqG_full_direct,
+            fit_qG_full=fit_qG_full,
         )
 
 
@@ -945,6 +1002,13 @@ class MP2SS:
         self.kmf = kmf
         self.kmp = kmp
         self.cell = kmf.cell
+        if self.cell.dimension < 3:
+            warnings.warn(
+                "MP2SS for cell.dimension < 3 has not been validated; "
+                "this includes non-SCF half-shifted band calculations.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.nks = get_monkhorst_pack_size(self.cell, kmf.kpts)
         self.t2 = t2
         self.options = options
@@ -1013,6 +1077,8 @@ class MP2SS:
         self.laplace_exchange_max_points = options.laplace_exchange_max_points
         self.pair_density_eval_grid = options.pair_density_eval_grid
         self.pair_density_becke_grid_level = options.pair_density_becke_grid_level
+        self.smallq_band_df = options.smallq_band_df
+        self.smallq_band_exxdiv = options.smallq_band_exxdiv
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
@@ -1020,6 +1086,7 @@ class MP2SS:
         self.correct_q2_part = self.correct_q2_q4_separately
         
         self.mp2_structure_factor = None
+        self.smallq_result = None
         self.grids = None
 
         self.exchange_correction = MP2ExchangeSS(
@@ -1134,6 +1201,24 @@ class MP2SS:
         if self.t2_store_type == 'kikjka':
             convert_t2_to_kikjq_format(mp2_structure_factor.t2, kpts, qGrid, self.cell)
 
+        self.smallq_result = None
+        if direct and self.smallq_band_df is not None:
+            smallq = MP2SmallQ(
+                self.kmf,
+                self.kmp,
+                band_df=self.smallq_band_df,
+                band_exxdiv=self.smallq_band_exxdiv,
+                N_local=self.N_local,
+                sq_ke_cutoff=self.sq_ke_cutoff,
+                check_trs=self.check_trs,
+                pair_density_eval_grid=self.pair_density_eval_grid,
+                pair_density_becke_grid_level=self.pair_density_becke_grid_level,
+                sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
+                outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+            )
+            self.smallq_result = smallq.kernel()
+        mp2_structure_factor.smallq_result = self.smallq_result
+
         self.mp2_structure_factor = mp2_structure_factor
         return self.mp2_structure_factor
     
@@ -1146,6 +1231,7 @@ class MP2SS:
         SqG_full_q4 = self.mp2_structure_factor.SqG_full_q4 if self.dG0 else None
         SqG_full_direct_mask = getattr(self.mp2_structure_factor, "SqG_full_direct_mask", None)
         SqG_full_q4_mask = getattr(self.mp2_structure_factor, "SqG_full_q4_mask", None)
+        smallq_result = getattr(self.mp2_structure_factor, "smallq_result", None)
 
         self.direct_integral_term_q2 = None
         self.direct_quadrature_term_q2 = None
@@ -1170,6 +1256,43 @@ class MP2SS:
             if SqG_full_direct_mask is not None:
                 q2_fit_mask &= SqG_full_direct_mask
             SqG_full_q2_part = SqG_full_direct - (4 * np.pi) * SqG_full_q4_for_q2 / denominator
+            q2_qG_fit = qG_full[q2_fit_mask]
+            q2_SqG_fit = SqG_full_q2_part[q2_fit_mask]
+            q4_qG_fit = qG_full
+            q4_SqG_fit = SqG_full_q4
+            q4_fit_mask = (
+                np.ones(len(qG_full), dtype=bool)
+                if SqG_full_q4_mask is None
+                else np.asarray(SqG_full_q4_mask, dtype=bool)
+            )
+            if smallq_result is not None:
+                smallq_norm2 = float(np.dot(
+                    smallq_result.qprime, smallq_result.qprime
+                ))
+                smallq_q2 = (
+                    smallq_result.sq_direct
+                    - 4 * np.pi * smallq_result.sq_q4 / smallq_norm2
+                )
+                q2_qG_fit = np.concatenate((
+                    q2_qG_fit,
+                    smallq_result.qprime.reshape(1, 3),
+                ))
+                q2_SqG_fit = np.concatenate((
+                    q2_SqG_fit,
+                    np.asarray([smallq_q2]),
+                ))
+                q4_qG_fit = np.concatenate((
+                    q4_qG_fit,
+                    smallq_result.qprime.reshape(1, 3),
+                ))
+                q4_SqG_fit = np.concatenate((
+                    q4_SqG_fit,
+                    np.asarray([smallq_result.sq_q4]),
+                ))
+                q4_fit_mask = np.concatenate((
+                    q4_fit_mask,
+                    np.asarray([True]),
+                ))
 
             second_order_config = self._build_direct_second_order_correction_config()
             fourth_order_config = self._build_direct_fourth_order_correction_config()
@@ -1177,18 +1300,18 @@ class MP2SS:
 
             self.direct_second_order_correction = MP2DirectSecondOrderSS(second_order_config)
             q2_result = self.direct_second_order_correction.compute_correction(
-                SqG_full_q2_part=SqG_full_q2_part[q2_fit_mask],
-                qG_full=qG_full[q2_fit_mask],
+                SqG_full_q2_part=q2_SqG_fit,
+                qG_full=q2_qG_fit,
                 grids=self.grids,
                 nks=self.nks,
             )
             self.direct_fourth_order_correction = MP2DirectFourthOrderSS(fourth_order_config)
             q4_result = self.direct_fourth_order_correction.compute_correction(
-                SqG_full_q4=SqG_full_q4,
-                qG_full=qG_full,
+                SqG_full_q4=q4_SqG_fit,
+                qG_full=q4_qG_fit,
                 grids=self.grids,
                 nks=self.nks,
-                q4_fit_mask=SqG_full_q4_mask,
+                q4_fit_mask=q4_fit_mask,
             )
             if q2_result is None or q4_result is None:
                 return None
@@ -1219,12 +1342,25 @@ class MP2SS:
             self.direct_correction = MP2DirectFullSS(
                 self._build_direct_full_correction_config(),
             )
+            fit_qG_full = qG_full
+            fit_SqG_full_direct = SqG_full_direct
+            if smallq_result is not None:
+                fit_qG_full = np.concatenate((
+                    fit_qG_full,
+                    smallq_result.qprime.reshape(1, 3),
+                ))
+                fit_SqG_full_direct = np.concatenate((
+                    fit_SqG_full_direct,
+                    np.asarray([smallq_result.sq_direct]),
+                ))
             result = self.direct_correction.compute_direct_correction(
                 SqG_full_direct=SqG_full_direct,
                 qG_full=qG_full,
                 SqG_full_q4=SqG_full_q4,
                 grids=self.grids,
                 nks=self.nks,
+                fit_SqG_full_direct=fit_SqG_full_direct,
+                fit_qG_full=fit_qG_full,
             )
             if result is None:
                 return None

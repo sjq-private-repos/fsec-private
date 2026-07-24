@@ -5,6 +5,7 @@ from pyscf.pbc import df, mp
 from pyscf.pbc import gto, scf
 
 from fsec.singularity_subtraction.grids import ExxSSGrids
+from fsec.singularity_subtraction.mp2ss import convert_t2_to_kikjq_format
 from fsec.singularity_subtraction.structure_factor.helpers import (
     TimingProfile,
     make_line_sampling_decay_state,
@@ -1003,6 +1004,80 @@ class KnownValues(unittest.TestCase):
         self.assertNotIn(
             "rijab/t2 TRS unique-pair contraction",
             fallback_sf.last_build_timings,
+        )
+
+    def test_kikjka_trs_matches_non_trs_112_kmesh(self):
+        non_trs_sf = MP2StructureFactor(
+            self.kmf_112,
+            self.kmp_112,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=False,
+            t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
+        )
+        non_trs_sf.set_grids(min_fit_points=10)
+        t2_kikjq = self.t2_112.copy()
+        convert_t2_to_kikjq_format(
+            t2_kikjq,
+            self.kmp_112.kpts,
+            non_trs_sf.grids.qGrid,
+            self.kmf_112.cell,
+        )
+        non_trs_sf.t2 = t2_kikjq
+        qG_candidates = non_trs_sf.grids.qG_grid_local
+        qG_candidates = qG_candidates[
+            np.linalg.norm(qG_candidates, axis=1) < self.qG_cutoff + 1e-8
+        ]
+        qG_full = qG_candidates[self._closest_10_indices(qG_candidates)]
+        non_trs = non_trs_sf.build_structure_factor(
+            qG_full=qG_full,
+            grids=non_trs_sf.grids,
+            direct=True,
+            exchange=True,
+            dG0=True,
+        )
+
+        trs_sf = MP2StructureFactor(
+            self.kmf_112,
+            self.kmp_112,
+            t2=t2_kikjq,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            min_points=10,
+            sq_inversion_symm=False,
+            check_trs=True,
+            t2_store_type="kikjka",
+            pair_density_eval_grid="uniform",
+        )
+        trs = trs_sf.build_structure_factor(
+            qG_full=qG_full,
+            grids=non_trs_sf.grids,
+            direct=True,
+            exchange=True,
+            dG0=True,
+        )
+
+        np.testing.assert_allclose(trs["qG_full"], non_trs["qG_full"], atol=1e-12)
+        for key in ("SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            with self.subTest(structure_factor=key):
+                np.testing.assert_allclose(
+                    trs[key],
+                    non_trs[key],
+                    rtol=1e-7,
+                    atol=1e-10,
+                )
+        self.assertIn(
+            "rijab/t2 TRS unique-pair contraction",
+            trs_sf.last_build_timings,
+        )
+        self.assertNotIn("rijab tensor contraction", trs_sf.last_build_timings)
+        self.assertIn("rijab tensor contraction", non_trs_sf.last_build_timings)
+        self.assertNotIn(
+            "rijab/t2 TRS unique-pair contraction",
+            non_trs_sf.last_build_timings,
         )
 
     def test_kikj_dG0_reduction_matches_old_expression(self):

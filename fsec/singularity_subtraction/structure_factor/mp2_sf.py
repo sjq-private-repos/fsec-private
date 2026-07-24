@@ -950,10 +950,15 @@ class MP2StructureFactor(StructureFactor):
                             
                             if Lov.ndim == 4:
                                 Lov_linear_scaling = True
+                            elif Lov.ndim == 1 and Lov.dtype == object:
+                                Lov_linear_scaling = True
                             elif Lov.ndim == 2: # HACK: should in principle be a 5D array.
                                 Lov_linear_scaling = False
                             else: 
-                                raise ValueError("Lov must be a 3D or 4D array")
+                                raise ValueError(
+                                    "Lov must be a linear list of 3D blocks, "
+                                    "a dense 4D array, or a 2D pair array"
+                                )
 
                             if compute_direct:
                                 Lov_kika = None
@@ -1056,6 +1061,7 @@ class MP2StructureFactor(StructureFactor):
                 # O(Nk^2) or O(Nk^3) memory scaling pathway
                 t2_qpi = None
                 eijab = None
+
                 if compute_direct:
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('direct', int(qi))
@@ -1087,7 +1093,7 @@ class MP2StructureFactor(StructureFactor):
                             profile.stop("direct t2 cache miss", region_t0)
                     elif kikj_lov:
                         pass
-
+                # Compute t2 exchange for kikj route, or set it based on provided t2
                 if compute_exchange:
                     if t2_store_type == 'kikj' and not t2_given:
                         cache_key = ('exchange', int(qi))
@@ -1113,6 +1119,8 @@ class MP2StructureFactor(StructureFactor):
                         t2_qpi = t2[qpis, kii, kjj]
                         profile.stop("exchange t2 gather", region_t0)
 
+
+                # Energy denominator for q4 if going kikj route
                 if compute_q4:
                     region_t0 = profile.start()
                     if t2_store_type == 'kikj':
@@ -1146,6 +1154,7 @@ class MP2StructureFactor(StructureFactor):
 
                 if use_trs_unique_pair_rijab:
                     region_t0 = profile.start()
+
                     if kikj_lov:
                         contraction = (
                             contract_trs_unique_pair_rijab_lov_laplace

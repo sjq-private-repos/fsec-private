@@ -88,3 +88,7 @@ class StructureFactor(ABC):
 
 from fsec.singularity_subtraction.structure_factor.exx_sf import ExxStructureFactor
 from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
+from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
+    MP2SmallQ,
+    MP2SmallQResult,
+)
