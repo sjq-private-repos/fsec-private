@@ -35,11 +35,11 @@ class TimingProfile:
         return summary
 
     @staticmethod
-    def log_summary(log, summary):
+    def log_summary(log, summary, title="build_structure_factor"):
         total = summary["total"]
         log.note(
-            "build_structure_factor CPU %.2f sec, wall %.2f sec",
-            total["cpu"], total["wall"],
+            "%s CPU %.2f sec, wall %.2f sec",
+            title, total["cpu"], total["wall"],
         )
         for label, values in sorted(
                 ((key, value) for key, value in summary.items() if key != "total"),

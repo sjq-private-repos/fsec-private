@@ -331,11 +331,22 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
         cn_coeffs = self.parameters[0]
 
         coords_FBZ = minimum_image(self.cell, coords)
-        idxs_coords_FBZ_in_qGrid = self.kdtree_qGrid.query(coords_FBZ, k=1, distance_upper_bound=1e-8)[1]
-        if np.any(idxs_coords_FBZ_in_qGrid == len(self.qGrid)):
-            raise ValueError("Cannot locate coords in qGrid")
-
-        sum_g_q_deltaG = self.sum_g_q_deltaG[idxs_coords_FBZ_in_qGrid]
+        idxs_coords_FBZ_in_qGrid = self.kdtree_qGrid.query(
+            coords_FBZ, k=1, distance_upper_bound=1e-8
+        )[1]
+        cached = idxs_coords_FBZ_in_qGrid != len(self.qGrid)
+        sum_g_q_deltaG = np.empty(coords.shape[0], dtype=float)
+        sum_g_q_deltaG[cached] = self.sum_g_q_deltaG[
+            idxs_coords_FBZ_in_qGrid[cached]
+        ]
+        if np.any(~cached):
+            q_plus_dG = (
+                coords_FBZ[~cached, None, :] + self.deltaGs[None, :, :]
+            )
+            sum_g_q_deltaG[~cached] = np.sum(
+                self.decay_func(np.linalg.norm(q_plus_dG, axis=2)),
+                axis=1,
+            )
 
         q_norm = np.linalg.norm(coords, axis=1)
         result = -cn_coeffs * q_norm**2 * self.decay_func(q_norm) * sum_g_q_deltaG

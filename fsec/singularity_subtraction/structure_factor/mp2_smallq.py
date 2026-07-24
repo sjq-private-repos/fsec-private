@@ -8,12 +8,14 @@ from scipy.spatial import KDTree
 
 from pyscf import lib
 from pyscf.ao2mo import _ao2mo
+from pyscf.lib import logger
 from pyscf.pbc import df
 from pyscf.pbc.df.df import CDERIArray
 from pyscf.pbc.mp import kmp2
 from pyscf.pbc.tools import get_monkhorst_pack_size
 
 from fsec.singularity_subtraction.grids import MP2SSGrids, minimum_image
+from fsec.singularity_subtraction.structure_factor.helpers import TimingProfile
 from fsec.singularity_subtraction.structure_factor.mp2_sf import (
     MP2StructureFactor,
 )
@@ -77,6 +79,7 @@ class MP2SmallQ:
         self.verbose = verbose
         self.result = None
         self.smallq_structure_factor = None
+        self.last_kernel_timings = None
 
         self._validate_band_exxdiv()
 
@@ -135,14 +138,21 @@ class MP2SmallQ:
         band_df.build(kpts_band=shifted_kpts)
         return band_df
 
-    def _get_shifted_bands(self, shifted_kpts):
+    def _get_shifted_bands(self, shifted_kpts, profile=None):
+        phase_t0 = profile.start() if profile is not None else None
         band_df = self._make_band_df(shifted_kpts)
+        if profile is not None:
+            profile.stop("shifted-band DF construction", phase_t0)
+
+        phase_t0 = profile.start() if profile is not None else None
         with lib.temporary_env(
             self.kmf,
             with_df=band_df,
             exxdiv=self.band_exxdiv,
         ):
             mo_energy, mo_coeff = self.kmf.get_bands(shifted_kpts)
+        if profile is not None:
+            profile.stop("shifted-band Fock diagonalization", phase_t0)
         return list(np.asarray(mo_energy)), list(np.asarray(mo_coeff))
 
     @staticmethod
@@ -171,11 +181,17 @@ class MP2SmallQ:
         qprime,
         mo_coeff_occ,
         mo_coeff_shifted,
+        profile=None,
     ):
         """Build only the occupied-to-shifted GDF tensors needed at qprime."""
         nkpts = len(grids.kGrid1)
         combined_kpts = np.concatenate((grids.kGrid1, grids.kGrid2), axis=0)
+        phase_t0 = profile.start() if profile is not None else None
         correlation_df = self._make_correlation_gdf(combined_kpts)
+        if profile is not None:
+            profile.stop("correlation GDF construction", phase_t0)
+
+        phase_t0 = profile.start() if profile is not None else None
         cderi_array = CDERIArray(correlation_df._cderi)
 
         ka_map = self._map_kpts(
@@ -190,6 +206,8 @@ class MP2SmallQ:
             grids.kGrid3,
             "k_j - qprime",
         )
+        if profile is not None:
+            profile.stop("Lov setup and k-point mapping", phase_t0)
 
         nocc = self.kmp.nocc
         nmo = self.kmp.nmo
@@ -203,11 +221,16 @@ class MP2SmallQ:
         lov_b = np.empty(nkpts, dtype=object)
 
         def transform(ko, kv):
+            phase_t0 = profile.start() if profile is not None else None
             Lpq_ao = cderi_array[ko, nkpts + kv]
             mo = np.hstack((mo_coeff_occ[ko], mo_coeff_shifted[kv]))
             mo = np.asarray(mo, dtype=dtype, order="F")
             if Lpq_ao[0].size != nao**2:
                 Lpq_ao = lib.unpack_tril(Lpq_ao).astype(np.complex128)
+            if profile is not None:
+                profile.stop("Lov CDERI load/unpack", phase_t0)
+
+            phase_t0 = profile.start() if profile is not None else None
             out = _ao2mo.r_e2(
                 Lpq_ao,
                 mo,
@@ -215,6 +238,8 @@ class MP2SmallQ:
                 [],
                 None,
             )
+            if profile is not None:
+                profile.stop("Lov AO-to-MO transformation", phase_t0)
             return out.reshape(-1, nocc, nvir)
 
         for ki, ka in enumerate(ka_map):
@@ -224,9 +249,20 @@ class MP2SmallQ:
         return lov_a, lov_b
 
     def kernel(self):
-        qprime, grids = self._build_grids()
-        shifted_energy, shifted_coeff = self._get_shifted_bands(grids.kGrid2)
+        log = logger.new_logger(self.kmp, self.verbose)
+        profile = TimingProfile()
+        total_t0 = profile.start()
 
+        phase_t0 = profile.start()
+        qprime, grids = self._build_grids()
+        profile.stop("small-q grid construction", phase_t0)
+
+        shifted_energy, shifted_coeff = self._get_shifted_bands(
+            grids.kGrid2,
+            profile=profile,
+        )
+
+        phase_t0 = profile.start()
         mo_coeff_occ, mo_energy_occ = kmp2._add_padding(
             self.kmp, self.kmp.mo_coeff, self.kmp.mo_energy
         )
@@ -247,6 +283,7 @@ class MP2SmallQ:
         nocc = self.kmp.nocc
         mo_e_o = np.asarray(mo_energy_occ)[:, :nocc]
         mo_e_v = np.asarray(mo_energy_shifted)[:, nocc:]
+        profile.stop("MO padding and dtype preparation", phase_t0)
 
         lov = lov_b = None
         if (
@@ -258,8 +295,10 @@ class MP2SmallQ:
                 qprime,
                 mo_coeff_occ,
                 mo_coeff_shifted,
+                profile=profile,
             )
 
+        phase_t0 = profile.start()
         structure_factor = MP2StructureFactor(
             self.kmf,
             self.kmp,
@@ -275,6 +314,9 @@ class MP2SmallQ:
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
             outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
         )
+        profile.stop("structure-factor setup", phase_t0)
+
+        phase_t0 = profile.start()
         values = structure_factor.build_structure_factor(
             direct=True,
             exchange=False,
@@ -296,6 +338,9 @@ class MP2SmallQ:
             kmp=self.kmp,
             verbose=self.verbose,
         )
+        profile.stop("single-point structure factor", phase_t0)
+
+        phase_t0 = profile.start()
         self.smallq_structure_factor = structure_factor
         self.result = MP2SmallQResult(
             qprime=qprime.copy(),
@@ -303,5 +348,12 @@ class MP2SmallQ:
             sq_q4=float(values["SqG_full_q4"][0]),
             band_df=self.band_df,
             band_exxdiv=self.band_exxdiv,
+        )
+        profile.stop("result packaging", phase_t0)
+        self.last_kernel_timings = profile.summary(total_t0)
+        profile.log_summary(
+            log,
+            self.last_kernel_timings,
+            title="MP2 small-q kernel",
         )
         return self.result
