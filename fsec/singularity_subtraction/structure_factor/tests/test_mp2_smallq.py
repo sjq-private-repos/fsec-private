@@ -10,6 +10,9 @@ from fsec.singularity_subtraction.mp2ss import MP2SS, MP2SSOptions
 from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
     MP2SmallQ,
 )
+from fsec.singularity_subtraction.structure_factor.mp2_sf import (
+    MP2StructureFactor,
+)
 
 
 class MP2SmallQOptionsTests(unittest.TestCase):
@@ -205,6 +208,141 @@ class MP2SmallQKnownValues(unittest.TestCase):
         smallq_class.assert_not_called()
         self.assertIsNone(mp2ss.smallq_result)
         self.assertIsNone(result.smallq_result)
+
+
+class MP2SmallQ112KnownValues(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cell = gto.Cell()
+        cell.unit = "Bohr"
+        cell.atom = """
+            H 0.00 0.00 0.00
+            H 0.00 0.00 1.80
+        """
+        cell.a = np.eye(3) * 6.0
+        cell.spin = 0
+        cell.charge = 0
+        cell.basis = "gth-szv"
+        cell.pseudo = "gth-hf"
+        cell.ke_cutoff = 100.0
+        cell.precision = 1e-8
+        cell.verbose = 0
+        cell.build()
+
+        kpts = cell.make_kpts(
+            (1, 1, 2),
+            wrap_around=True,
+            with_gamma_point=True,
+        )
+        kmf = scf.KRHF(cell, kpts, exxdiv="ewald")
+        kmf.with_df = df.GDF(cell, kpts).build()
+        kmf.conv_tol = 1e-10
+        kmf.kernel()
+        if not kmf.converged:
+            raise RuntimeError("Small-q 1x1x2 H2 reference KRHF did not converge")
+
+        kmp = mp.KMP2(kmf)
+        _, t2 = kmp.kernel(with_t2=True)
+
+        cls.cell = cell
+        cls.kmf = kmf
+        cls.kmp = kmp
+        cls.t2 = t2
+        cls.N_local = cell.cutoff_to_mesh(100.0)
+
+    @staticmethod
+    def _closest_10_indices(qG):
+        qG_norm = np.linalg.norm(qG, axis=1)
+        return np.lexsort(
+            (qG[:, 2], qG[:, 1], qG[:, 0], qG_norm)
+        )[:10]
+
+    def test_build_structure_factor_112_kmesh_with_smallq(self):
+        mp2_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            t2=self.t2,
+            N_local=self.N_local,
+            qG_cutoff=8.0,
+            min_points=10,
+            pair_density_eval_grid="uniform",
+        )
+        result = mp2_sf.build_structure_factor(
+            direct=True,
+            exchange=False,
+            dG0=True,
+        )
+        smallq = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="GDF",
+            band_exxdiv="ewald",
+            N_local=self.N_local,
+            pair_density_eval_grid="uniform",
+        ).kernel()
+
+        idx10 = self._closest_10_indices(result["qG_full"])
+        qG_11 = np.vstack((result["qG_full"][idx10], smallq.qprime))
+        direct_11 = np.append(
+            result["SqG_full_direct"][idx10],
+            smallq.sq_direct,
+        )
+        q4_11 = np.append(
+            result["SqG_full_q4"][idx10],
+            smallq.sq_q4,
+        )
+
+        reference_qG_11 = [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, -0.5235987755982988],
+            [0.0, 0.0, 0.5235987755982988],
+            [-1.0471975511965976, 0.0, 0.0],
+            [0.0, -1.0471975511965976, 0.0],
+            [0.0, 0.0, -1.0471975511965976],
+            [0.0, 0.0, 1.0471975511965976],
+            [0.0, 1.0471975511965976, 0.0],
+            [1.0471975511965976, 0.0, 0.0],
+            [-1.0471975511965976, 0.0, -0.5235987755982988],
+            [0.5235987755982988, 0.5235987755982988, 0.2617993877991494],
+        ]
+        reference_direct_11 = [
+            -6.031483988853451e-22,
+            -0.0001331479670959755,
+            -0.0001331479670959755,
+            -5.837718619008481e-22,
+            -5.83757449261307e-22,
+            -0.000152965545669427,
+            -0.000152965545669427,
+            -5.83757449261307e-22,
+            -5.837718619008481e-22,
+            -5.043690481546798e-05,
+            -1.6729723494295827e-05,
+        ]
+        reference_q4_11 = [
+            -3.82095320889316e-41,
+            -8.559020498960629e-07,
+            -8.559020498960629e-07,
+            -3.579441904733104e-41,
+            -3.5792634797576904e-41,
+            -2.437964679354982e-06,
+            -2.437964679354982e-06,
+            -3.5792634797576904e-41,
+            -3.579441904733104e-41,
+            -1.2343680816144883e-07,
+            -3.205983111109113e-08,
+        ]
+
+        np.testing.assert_allclose(qG_11, reference_qG_11, atol=1e-12)
+        np.testing.assert_allclose(
+            direct_11,
+            reference_direct_11,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            q4_11,
+            reference_q4_11,
+            atol=1e-10,
+        )
 
 
 if __name__ == "__main__":
