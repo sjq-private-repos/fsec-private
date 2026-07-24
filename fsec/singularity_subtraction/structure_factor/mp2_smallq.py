@@ -145,12 +145,18 @@ class MP2SmallQ:
             profile.stop("shifted-band DF construction", phase_t0)
 
         phase_t0 = profile.start() if profile is not None else None
-        with lib.temporary_env(
-            self.kmf,
-            with_df=band_df,
-            exxdiv=self.band_exxdiv,
-        ):
-            mo_energy, mo_coeff = self.kmf.get_bands(shifted_kpts)
+        try:
+            with lib.temporary_env(
+                self.kmf,
+                with_df=band_df,
+                exxdiv=self.band_exxdiv,
+            ):
+                mo_energy, mo_coeff = self.kmf.get_bands(shifted_kpts)
+        finally:
+            if isinstance(band_df, df.GDF):
+                cderi_temp = band_df._cderi_to_save
+                if not isinstance(cderi_temp, str):
+                    cderi_temp.close()
         if profile is not None:
             profile.stop("shifted-band Fock diagonalization", phase_t0)
         return list(np.asarray(mo_energy)), list(np.asarray(mo_coeff))
@@ -163,7 +169,7 @@ class MP2SmallQ:
             raise ValueError(f"Cannot map {label} points onto the shifted k-grid")
         return np.asarray(indices, dtype=int)
 
-    def _make_correlation_gdf(self, combined_kpts):
+    def _make_correlation_gdf(self, combined_kpts, kpt_pairs=None):
         source_df = self.kmf.with_df
         correlation_df = df.GDF(self.cell, combined_kpts)
         correlation_df.auxbasis = source_df.auxbasis
@@ -172,8 +178,39 @@ class MP2SmallQ:
         correlation_df.linear_dep_threshold = source_df.linear_dep_threshold
         correlation_df.exp_to_discard = source_df.exp_to_discard
         correlation_df._prefer_ccdf = source_df._prefer_ccdf
-        correlation_df.build()
+        # Initializing without j3c constructs the auxiliary basis while
+        # avoiding the full Cartesian product of the combined k-point grid.
+        correlation_df.build(j_only=False, with_j3c=False)
+        cderi_file = correlation_df._cderi_to_save
+        if not isinstance(cderi_file, str):
+            cderi_file = cderi_file.name
+        kptij_lst = np.asarray(
+            [
+                (combined_kpts[ki], combined_kpts[kj])
+                for ki, kj in kpt_pairs
+            ]
+        )
+        correlation_df._make_j3c(
+            kptij_lst=kptij_lst,
+            cderi_file=cderi_file,
+        )
+        correlation_df._cderi = cderi_file
         return correlation_df
+
+    @staticmethod
+    def _required_lov_pairs(ka_map, kb_map, nkpts):
+        """Return unique combined-grid indices required by Lov and Lov_b."""
+        pairs = [
+            (ki, nkpts + int(ka))
+            for ki, ka in enumerate(ka_map)
+        ]
+        pairs.extend(
+            (kj, nkpts + int(kb))
+            for kj, kb in enumerate(kb_map)
+        )
+        # dict preserves the first occurrence and therefore keeps the output
+        # deterministic without sorting the two physical pair families.
+        return list(dict.fromkeys(pairs))
 
     def _build_lov(
         self,
@@ -187,13 +224,6 @@ class MP2SmallQ:
         nkpts = len(grids.kGrid1)
         combined_kpts = np.concatenate((grids.kGrid1, grids.kGrid2), axis=0)
         phase_t0 = profile.start() if profile is not None else None
-        correlation_df = self._make_correlation_gdf(combined_kpts)
-        if profile is not None:
-            profile.stop("correlation GDF construction", phase_t0)
-
-        phase_t0 = profile.start() if profile is not None else None
-        cderi_array = CDERIArray(correlation_df._cderi)
-
         ka_map = self._map_kpts(
             self.cell,
             grids.kGrid1 + qprime,
@@ -206,8 +236,27 @@ class MP2SmallQ:
             grids.kGrid3,
             "k_j - qprime",
         )
+        kpt_pairs = self._required_lov_pairs(ka_map, kb_map, nkpts)
+        log = logger.new_logger(self.kmp, self.verbose)
+        log.note(
+            "MP2 small-q selective Lov GDF pairs: %d unique of %d "
+            "requested (%d full ordered pairs)",
+            len(kpt_pairs),
+            len(ka_map) + len(kb_map),
+            len(combined_kpts) ** 2,
+        )
         if profile is not None:
             profile.stop("Lov setup and k-point mapping", phase_t0)
+
+        phase_t0 = profile.start() if profile is not None else None
+        correlation_df = self._make_correlation_gdf(
+            combined_kpts,
+            kpt_pairs,
+        )
+        if profile is not None:
+            profile.stop("correlation GDF construction", phase_t0)
+
+        cderi_array = CDERIArray(correlation_df._cderi)
 
         nocc = self.kmp.nocc
         nmo = self.kmp.nmo
@@ -219,8 +268,13 @@ class MP2SmallQ:
 
         lov_a = np.empty(nkpts, dtype=object)
         lov_b = np.empty(nkpts, dtype=object)
+        transform_cache = {}
 
         def transform(ko, kv):
+            key = (int(ko), int(kv))
+            if key in transform_cache:
+                return transform_cache[key]
+
             phase_t0 = profile.start() if profile is not None else None
             Lpq_ao = cderi_array[ko, nkpts + kv]
             mo = np.hstack((mo_coeff_occ[ko], mo_coeff_shifted[kv]))
@@ -240,12 +294,20 @@ class MP2SmallQ:
             )
             if profile is not None:
                 profile.stop("Lov AO-to-MO transformation", phase_t0)
-            return out.reshape(-1, nocc, nvir)
+            out = out.reshape(-1, nocc, nvir)
+            transform_cache[key] = out
+            return out
 
-        for ki, ka in enumerate(ka_map):
-            lov_a[ki] = transform(ki, ka)
-        for kj, kb in enumerate(kb_map):
-            lov_b[kj] = transform(kj, kb)
+        try:
+            for ki, ka in enumerate(ka_map):
+                lov_a[ki] = transform(ki, ka)
+            for kj, kb in enumerate(kb_map):
+                lov_b[kj] = transform(kj, kb)
+        finally:
+            cderi_array.data_group.close()
+            cderi_temp = correlation_df._cderi_to_save
+            if not isinstance(cderi_temp, str):
+                cderi_temp.close()
         return lov_a, lov_b
 
     def kernel(self):

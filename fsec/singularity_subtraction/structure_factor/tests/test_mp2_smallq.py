@@ -4,6 +4,7 @@ from unittest import mock
 import numpy as np
 
 from pyscf.pbc import df, gto, mp, scf
+from pyscf.pbc.lib import kpts_helper
 
 from fsec.singularity_subtraction.grids import minimum_image
 from fsec.singularity_subtraction.mp2ss import MP2SS, MP2SSOptions
@@ -179,6 +180,37 @@ class MP2SmallQKnownValues(unittest.TestCase):
                 ) - grids.kGrid3[kb_map]
                 self.assertLess(np.max(np.abs(ka_error)), 1e-10)
                 self.assertLess(np.max(np.abs(kb_error)), 1e-10)
+                trs_occ = kpts_helper.conj_mapping(
+                    self.cell,
+                    grids.kGrid1,
+                )
+                trs_shifted = kpts_helper.conj_mapping(
+                    self.cell,
+                    grids.kGrid2,
+                )
+                np.testing.assert_array_equal(
+                    trs_shifted[ka_map[trs_occ]],
+                    kb_map,
+                )
+
+    def test_required_lov_pairs_are_exact_and_unique(self):
+        pairs = MP2SmallQ._required_lov_pairs(
+            ka_map=np.array([0, 1]),
+            kb_map=np.array([1, 0]),
+            nkpts=2,
+        )
+        self.assertEqual(
+            pairs,
+            [(0, 2), (1, 3), (0, 3), (1, 2)],
+        )
+        self.assertEqual(
+            MP2SmallQ._required_lov_pairs(
+                ka_map=np.array([0]),
+                kb_map=np.array([0]),
+                nkpts=1,
+            ),
+            [(0, 1)],
+        )
 
     def test_disabled_option_does_not_construct_smallq(self):
         options = MP2SSOptions(
