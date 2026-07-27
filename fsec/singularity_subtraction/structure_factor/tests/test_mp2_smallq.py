@@ -10,6 +10,11 @@ from fsec.singularity_subtraction.grids import minimum_image
 from fsec.singularity_subtraction.mp2ss import MP2SS, MP2SSOptions
 from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
     MP2SmallQ,
+    _TRSCDERIArray,
+    map_kpts,
+    required_lov_pairs,
+    s2_pair_closure,
+    trs_pair_representatives,
 )
 from fsec.singularity_subtraction.structure_factor.mp2_sf import (
     MP2StructureFactor,
@@ -158,13 +163,13 @@ class MP2SmallQKnownValues(unittest.TestCase):
                     atol=1e-12,
                 ))
 
-                ka_map = calculation._map_kpts(
+                ka_map = map_kpts(
                     self.cell,
                     grids.kGrid1 + qprime,
                     grids.kGrid2,
                     "ka",
                 )
-                kb_map = calculation._map_kpts(
+                kb_map = map_kpts(
                     self.cell,
                     grids.kGrid1 - qprime,
                     grids.kGrid3,
@@ -194,7 +199,7 @@ class MP2SmallQKnownValues(unittest.TestCase):
                 )
 
     def test_required_lov_pairs_are_exact_and_unique(self):
-        pairs = MP2SmallQ._required_lov_pairs(
+        pairs = required_lov_pairs(
             ka_map=np.array([0, 1]),
             kb_map=np.array([1, 0]),
             nkpts=2,
@@ -204,12 +209,38 @@ class MP2SmallQKnownValues(unittest.TestCase):
             [(0, 2), (1, 3), (0, 3), (1, 2)],
         )
         self.assertEqual(
-            MP2SmallQ._required_lov_pairs(
+            required_lov_pairs(
                 ka_map=np.array([0]),
                 kb_map=np.array([0]),
                 nkpts=1,
             ),
             [(0, 1)],
+        )
+
+    def test_trs_s2_pair_representatives(self):
+        requested = [(0, 2), (1, 3), (0, 3), (1, 2)]
+        closure = s2_pair_closure(requested)
+        self.assertEqual(
+            closure,
+            [
+                (0, 2), (1, 3), (0, 3), (1, 2),
+                (2, 0), (3, 1), (3, 0), (2, 1),
+            ],
+        )
+        evaluated = trs_pair_representatives(
+            closure,
+            np.array([0, 1, 3, 2]),
+        )
+        self.assertEqual(
+            evaluated,
+            [(0, 2), (1, 2), (2, 0), (2, 1)],
+        )
+        self.assertEqual(
+            trs_pair_representatives(
+                [(0, 1), (1, 0)],
+                np.array([0, 1]),
+            ),
+            [(0, 1), (1, 0)],
         )
 
     def test_disabled_option_does_not_construct_smallq(self):
@@ -288,6 +319,125 @@ class MP2SmallQ112KnownValues(unittest.TestCase):
         return np.lexsort(
             (qG[:, 2], qG[:, 1], qG[:, 0], qG_norm)
         )[:10]
+
+    def test_selective_trs_cderi_matches_full_gdf(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="GDF",
+            band_exxdiv="ewald",
+            N_local=self.N_local,
+            pair_density_eval_grid="uniform",
+        )
+        qprime, grids = calculation._build_grids()
+        nkpts = len(grids.kGrid1)
+        ka_map = map_kpts(
+            self.cell,
+            grids.kGrid1 + qprime,
+            grids.kGrid2,
+            "ka",
+        )
+        kb_map = map_kpts(
+            self.cell,
+            grids.kGrid1 - qprime,
+            grids.kGrid3,
+            "kb",
+        )
+        # Identify the original-to-shifted k-point pairs needed by Lov and
+        # include their reverses so the s2 AO blocks can be reconstructed.
+        requested = required_lov_pairs(
+            ka_map,
+            kb_map,
+            nkpts,
+        )
+        closure = s2_pair_closure(requested)
+        trs_occ = kpts_helper.conj_mapping(
+            self.cell,
+            grids.kGrid1,
+        )
+        trs_shifted = kpts_helper.conj_mapping(
+            self.cell,
+            grids.kGrid2,
+        )
+        combined_trs = np.concatenate(
+            (trs_occ, nkpts + trs_shifted)
+        )
+        # Build only one transpose-closed representative set; its omitted
+        # time-reversed partners will be recovered by complex conjugation.
+        evaluated = trs_pair_representatives(
+            closure,
+            combined_trs,
+        )
+        combined_kpts = np.concatenate(
+            (grids.kGrid1, grids.kGrid2),
+            axis=0,
+        )
+
+        selective_df = calculation._make_correlation_gdf(
+            combined_kpts,
+            evaluated,
+        )
+        selective = _TRSCDERIArray(
+            selective_df._cderi,
+            evaluated,
+            combined_trs,
+        )
+
+        # Use an otherwise identical, all-k-point-pair GDF build as the
+        # numerical reference for the selective construction.
+        source_df = self.kmf.with_df
+        full_df = df.GDF(self.cell, combined_kpts)
+        full_df.auxbasis = source_df.auxbasis
+        if source_df.mesh is not None:
+            full_df.mesh = np.asarray(source_df.mesh).copy()
+        full_df.linear_dep_threshold = source_df.linear_dep_threshold
+        full_df.exp_to_discard = source_df.exp_to_discard
+        full_df._prefer_ccdf = source_df._prefer_ccdf
+        full_df.build(j_only=False)
+        full = _TRSCDERIArray(
+            full_df._cderi,
+            [
+                (ki, kj)
+                for ki in range(len(combined_kpts))
+                for kj in range(len(combined_kpts))
+            ],
+            np.arange(len(combined_kpts)),
+        )
+
+        try:
+            self.assertEqual(selective.aosym, "s2")
+            # Confirm that the optimization stored exactly the selected
+            # representatives, rather than silently building every pair.
+            stored_keys = {
+                int(key) for key in selective._array.j3c.keys()
+            }
+            self.assertEqual(
+                stored_keys,
+                {
+                    ki * len(combined_kpts) + kj
+                    for ki, kj in evaluated
+                },
+            )
+            # Ensure the comparison below exercises at least one CDERI block
+            # reconstructed through time-reversal symmetry.
+            self.assertTrue(
+                any(pair not in set(evaluated) for pair in requested)
+            )
+            for pair in requested:
+                with self.subTest(pair=pair):
+                    np.testing.assert_allclose(
+                        selective[pair],
+                        full[pair],
+                        rtol=1e-10,
+                        atol=1e-10,
+                    )
+        finally:
+            selective.close()
+            full.close()
+            for gdf_object in (selective_df, full_df):
+                cderi_temp = gdf_object._cderi_to_save
+                if not isinstance(cderi_temp, str):
+                    cderi_temp.close()
 
     def test_build_structure_factor_112_kmesh_with_smallq(self):
         mp2_sf = MP2StructureFactor(

@@ -18,6 +18,42 @@ Measured on the ammonia \(1\times1\times2\) benchmark:
 The occupied grid has TR map `[0, 1]`, the shifted grid `[1, 0]`, and the
 `ia` and `jb` pairs form exact TR-partner sets.
 
+## Pair Counting
+
+A \(1\times1\times2\) mesh does contain only two k-points in the original
+grid. Small-\(q\), however, introduces a second, half-shifted grid containing
+two virtual k-points. The correlation GDF object is built on the union of
+these grids, so its internal k-point list has four entries:
+
+| Quantity | Count |
+| --- | ---: |
+| Original/occupied k-points | 2 |
+| Half-shifted/virtual k-points | 2 |
+| K-points in the combined correlation GDF | 4 |
+| All ordered pairs in a generic full GDF, \(4^2\) | 16 |
+| Physical Lov pairs requested by small-\(q\) | 4 |
+| Orientations after Hermitian `s2` closure | 8 |
+| Orientations evaluated after TR reduction | 4 |
+
+Thus, four is indeed the number of physical Lov pairs. For each of the two
+\(k_i\) values, fixed \(q'\) determines exactly one \(k_a\), giving two `ia`
+pairs. Likewise, each of the two \(k_j\) values determines exactly one
+\(k_b\), giving two `jb` pairs. In the combined-grid indexing used by the
+ammonia calculation, these four requested ordered pairs are
+`(0,2)`, `(1,3)`, `(0,3)`, and `(1,2)`.
+
+The count of 16 is only the full-GDF baseline: a generic build on the four
+combined k-points constructs every ordered pair, including
+original--original and shifted--shifted pairs that Lov never uses.
+
+The count temporarily rises from four to eight because retaining Hermitian
+AO-pair symmetry (`aosym="s2"`) requires the reverse orientation of every
+requested pair. Those reverse orientations are bookkeeping/integral blocks,
+not four additional physical Lov contractions. Time-reversal symmetry groups
+the eight orientations into four conjugate pairs, so only four half-AO
+orientations require explicit integral evaluation; the other four are
+reconstructed by conjugation.
+
 ## Implementation
 
 - Compute `ka_map` and `kb_map` before constructing correlation GDF. Validate
@@ -67,3 +103,24 @@ No public API or benchmark-option changes are required.
 - If TR validation fails, retain the correct transpose-closed `s2` sparse
   build but disable TR reconstruction and emit a clear diagnostic.
 
+## Implementation Results
+
+Implemented and profiled on the ammonia \(1\times1\times2\) benchmark:
+
+- Four requested pairs produce eight transpose-closed `s2` orientations and
+  four explicitly evaluated TR representatives.
+- Stored ammonia CDERI blocks are byte-identical to the full build; blocks
+  reconstructed through TR agree within \(9.5\times10^{-14}\).
+- The isolated CDERI file is 231 MiB versus 893 MiB for the full build.
+- Correlation GDF construction is 12.09 s versus 22.26 s for a full 16-pair
+  control through the same code path, a 1.84x speedup.
+- The complete small-\(q\) kernel is 44.80 s versus 53.87 s, a 16.8% reduction.
+- The end-to-end benchmark is 1:58.85 versus 2:07.69.
+- All 31 structure-factor tests pass, including full-versus-selective CDERI
+  checks for stored and reconstructed pairs.
+
+The independently executed heavy runs show approximately \(2.6\times10^{-6}\)
+Ha variation in the fitted \(q_2\) correction. The integral-level comparison,
+which holds the physical inputs fixed, agrees to the tolerances above; the
+independent-run variation is therefore reported separately from CDERI
+correctness.

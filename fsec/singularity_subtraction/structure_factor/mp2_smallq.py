@@ -10,7 +10,12 @@ from pyscf import lib
 from pyscf.ao2mo import _ao2mo
 from pyscf.lib import logger
 from pyscf.pbc import df
-from pyscf.pbc.df.df import CDERIArray
+from pyscf.pbc.df.df import (
+    CDERIArray,
+    _CCGDFBuilder,
+    _RSGDFBuilder,
+)
+from pyscf.pbc.lib import kpts_helper
 from pyscf.pbc.mp import kmp2
 from pyscf.pbc.tools import get_monkhorst_pack_size
 
@@ -19,6 +24,182 @@ from fsec.singularity_subtraction.structure_factor.helpers import TimingProfile
 from fsec.singularity_subtraction.structure_factor.mp2_sf import (
     MP2StructureFactor,
 )
+
+
+def normalize_band_df(value):
+    if value is None:
+        raise ValueError("band_df must be 'FFTDF' or 'GDF'")
+    value = str(value).strip().upper()
+    if value not in ("FFTDF", "GDF"):
+        raise ValueError("band_df must be 'FFTDF' or 'GDF'")
+    return value
+
+
+def map_kpts(cell, targets, grid, label):
+    targets = minimum_image(cell, np.asarray(targets).reshape(-1, 3))
+    _, indices = KDTree(grid).query(targets, distance_upper_bound=1e-8)
+    if np.any(indices == len(grid)):
+        raise ValueError(f"Cannot map {label} points onto the shifted k-grid")
+    return np.asarray(indices, dtype=int)
+
+
+def required_lov_pairs(ka_map, kb_map, nkpts):
+    """Return unique combined-grid indices required by Lov and Lov_b."""
+    pairs = [
+        (ki, nkpts + int(ka))
+        for ki, ka in enumerate(ka_map)
+    ]
+    pairs.extend(
+        (kj, nkpts + int(kb))
+        for kj, kb in enumerate(kb_map)
+    )
+    # dict preserves the first occurrence and therefore keeps the output
+    # deterministic without sorting the two physical pair families.
+    return list(dict.fromkeys(pairs))
+
+
+def s2_pair_closure(kpt_pairs):
+    """Add reverse orientations required to reconstruct s2 AO blocks."""
+    pairs = list(kpt_pairs)
+    pairs.extend((kj, ki) for ki, kj in kpt_pairs)
+    return list(dict.fromkeys(pairs))
+
+
+def trs_pair_representatives(s2_pairs, trs_map):
+    """Choose a transpose-closed half of a TR-closed pair set."""
+    s2_pairs = {
+        (int(ki), int(kj)) for ki, kj in s2_pairs
+    }
+    trs_map = np.asarray(trs_map, dtype=int)
+
+    def transpose(pair):
+        return pair[1], pair[0]
+
+    def time_reverse(pair):
+        return int(trs_map[pair[0]]), int(trs_map[pair[1]])
+
+    evaluated = set()
+    visited = set()
+    for pair in sorted(s2_pairs):
+        if pair in visited:
+            continue
+        pair_t = transpose(pair)
+        pair_tr = time_reverse(pair)
+        pair_tr_t = transpose(pair_tr)
+        symmetry_group = {pair, pair_t, pair_tr, pair_tr_t}
+        if not symmetry_group.issubset(s2_pairs):
+            raise ValueError(
+                "s2 pair closure is not closed under time reversal"
+            )
+        direct_choice = {pair, pair_t}
+        tr_choice = {pair_tr, pair_tr_t}
+        chosen = min(
+            (direct_choice, tr_choice),
+            key=lambda choice: tuple(sorted(choice)),
+        )
+        evaluated.update(chosen)
+        visited.update(symmetry_group)
+    return sorted(evaluated)
+
+
+class _SelectiveKPairBuilderMixin:
+    """Restrict j3c work while retaining PySCF's s2 and q/-q symmetry."""
+
+    selective_kk_idx = None
+
+    def outcore_auxe2(
+        self,
+        cderi_file,
+        intor="int3c2e",
+        aosym="s2",
+        comp=None,
+        j_only=False,
+        dataname="j3c",
+        shls_slice=None,
+        fft_dd_block=None,
+        kk_idx=None,
+    ):
+        if kk_idx is not None:
+            raise ValueError("selective kk_idx must be configured on the builder")
+        return super().outcore_auxe2(
+            cderi_file,
+            intor,
+            aosym,
+            comp,
+            j_only,
+            dataname,
+            shls_slice,
+            fft_dd_block,
+            kk_idx=self.selective_kk_idx,
+        )
+
+    def gen_uniq_kpts_groups(self, j_only, h5swap, kk_idx=None):
+        if kk_idx is not None:
+            raise ValueError("selective kk_idx must be configured on the builder")
+        selected = set(np.asarray(self.selective_kk_idx, dtype=int))
+        # Use the normal full-grid metric grouping. It factorizes one member
+        # of each q/-q pair and generates the other by conjugation, preserving
+        # the auxiliary gauge used by a regular GDF build.
+        for kpt, group_indices, cd_j2c in super().gen_uniq_kpts_groups(
+            j_only,
+            h5swap,
+            kk_idx=None,
+        ):
+            filtered = np.asarray(
+                [idx for idx in group_indices if idx in selected],
+                dtype=np.int32,
+            )
+            if filtered.size:
+                yield kpt, filtered, cd_j2c
+
+
+class _SelectiveRSGDFBuilder(
+    _SelectiveKPairBuilderMixin,
+    _RSGDFBuilder,
+):
+    pass
+
+
+class _SelectiveCCGDFBuilder(
+    _SelectiveKPairBuilderMixin,
+    _CCGDFBuilder,
+):
+    pass
+
+
+class _TRSCDERIArray:
+    """Expose omitted time-reversal CDERI blocks by conjugation."""
+
+    def __init__(self, cderi, evaluated_pairs, trs_map):
+        self._array = CDERIArray(cderi)
+        self.aosym = self._array.aosym
+        self.evaluated_pairs = {
+            (int(ki), int(kj)) for ki, kj in evaluated_pairs
+        }
+        self.trs_map = np.asarray(trs_map, dtype=int)
+
+    def __getitem__(self, indices):
+        if not (
+            isinstance(indices, tuple)
+            and len(indices) == 2
+            and all(isinstance(index, (int, np.integer)) for index in indices)
+        ):
+            raise TypeError("selective CDERI access requires two integer indices")
+        pair = (int(indices[0]), int(indices[1]))
+        if pair in self.evaluated_pairs:
+            return self._array[pair]
+        partner = (
+            int(self.trs_map[pair[0]]),
+            int(self.trs_map[pair[1]]),
+        )
+        if partner not in self.evaluated_pairs:
+            raise KeyError(
+                f"CDERI pair {pair} and its TR partner {partner} were not built"
+            )
+        return self._array[partner].conj()
+
+    def close(self):
+        self._array.data_group.close()
 
 
 @dataclass(frozen=True)
@@ -59,7 +240,7 @@ class MP2SmallQ:
         self.kmf = kmf
         self.kmp = kmp
         self.cell = kmf.cell
-        self.band_df = self._normalize_band_df(band_df)
+        self.band_df = normalize_band_df(band_df)
         self.band_exxdiv = (
             band_exxdiv.strip().lower()
             if isinstance(band_exxdiv, str)
@@ -82,15 +263,6 @@ class MP2SmallQ:
         self.last_kernel_timings = None
 
         self._validate_band_exxdiv()
-
-    @staticmethod
-    def _normalize_band_df(value):
-        if value is None:
-            raise ValueError("band_df must be 'FFTDF' or 'GDF'")
-        value = str(value).strip().upper()
-        if value not in ("FFTDF", "GDF"):
-            raise ValueError("band_df must be 'FFTDF' or 'GDF'")
-        return value
 
     def _validate_band_exxdiv(self):
         if (
@@ -161,15 +333,7 @@ class MP2SmallQ:
             profile.stop("shifted-band Fock diagonalization", phase_t0)
         return list(np.asarray(mo_energy)), list(np.asarray(mo_coeff))
 
-    @staticmethod
-    def _map_kpts(cell, targets, grid, label):
-        targets = minimum_image(cell, np.asarray(targets).reshape(-1, 3))
-        _, indices = KDTree(grid).query(targets, distance_upper_bound=1e-8)
-        if np.any(indices == len(grid)):
-            raise ValueError(f"Cannot map {label} points onto the shifted k-grid")
-        return np.asarray(indices, dtype=int)
-
-    def _make_correlation_gdf(self, combined_kpts, kpt_pairs=None):
+    def _make_correlation_gdf(self, combined_kpts, evaluated_pairs):
         source_df = self.kmf.with_df
         correlation_df = df.GDF(self.cell, combined_kpts)
         correlation_df.auxbasis = source_df.auxbasis
@@ -184,33 +348,37 @@ class MP2SmallQ:
         cderi_file = correlation_df._cderi_to_save
         if not isinstance(cderi_file, str):
             cderi_file = cderi_file.name
-        kptij_lst = np.asarray(
-            [
-                (combined_kpts[ki], combined_kpts[kj])
-                for ki, kj in kpt_pairs
-            ]
+        nkpts = len(combined_kpts)
+        kk_idx = np.asarray(
+            [ki * nkpts + kj for ki, kj in evaluated_pairs],
+            dtype=np.int32,
         )
-        correlation_df._make_j3c(
-            kptij_lst=kptij_lst,
-            cderi_file=cderi_file,
+        if correlation_df._prefer_ccdf or self.cell.omega > 0:
+            builder = _SelectiveCCGDFBuilder(
+                self.cell,
+                correlation_df.auxcell,
+                combined_kpts,
+            )
+            builder.eta = correlation_df.eta
+        else:
+            builder = _SelectiveRSGDFBuilder(
+                self.cell,
+                correlation_df.auxcell,
+                combined_kpts,
+            )
+        builder.mesh = correlation_df.mesh
+        builder.linear_dep_threshold = (
+            correlation_df.linear_dep_threshold
+        )
+        builder.selective_kk_idx = kk_idx
+        builder.make_j3c(
+            cderi_file,
+            j_only=False,
+            dataname=correlation_df._dataname,
+            aosym="s2",
         )
         correlation_df._cderi = cderi_file
         return correlation_df
-
-    @staticmethod
-    def _required_lov_pairs(ka_map, kb_map, nkpts):
-        """Return unique combined-grid indices required by Lov and Lov_b."""
-        pairs = [
-            (ki, nkpts + int(ka))
-            for ki, ka in enumerate(ka_map)
-        ]
-        pairs.extend(
-            (kj, nkpts + int(kb))
-            for kj, kb in enumerate(kb_map)
-        )
-        # dict preserves the first occurrence and therefore keeps the output
-        # deterministic without sorting the two physical pair families.
-        return list(dict.fromkeys(pairs))
 
     def _build_lov(
         self,
@@ -224,25 +392,63 @@ class MP2SmallQ:
         nkpts = len(grids.kGrid1)
         combined_kpts = np.concatenate((grids.kGrid1, grids.kGrid2), axis=0)
         phase_t0 = profile.start() if profile is not None else None
-        ka_map = self._map_kpts(
+        ka_map = map_kpts(
             self.cell,
             grids.kGrid1 + qprime,
             grids.kGrid2,
             "k_i + qprime",
         )
-        kb_map = self._map_kpts(
+        kb_map = map_kpts(
             self.cell,
             grids.kGrid1 - qprime,
             grids.kGrid3,
             "k_j - qprime",
         )
-        kpt_pairs = self._required_lov_pairs(ka_map, kb_map, nkpts)
+        kpt_pairs = required_lov_pairs(ka_map, kb_map, nkpts)
+        s2_pairs = s2_pair_closure(kpt_pairs)
         log = logger.new_logger(self.kmp, self.verbose)
+
+        trs_enabled = True
+        try:
+            trs_occ = kpts_helper.conj_mapping(
+                self.cell,
+                grids.kGrid1,
+            )
+            trs_shifted = kpts_helper.conj_mapping(
+                self.cell,
+                grids.kGrid2,
+            )
+            if not np.array_equal(
+                trs_shifted[ka_map],
+                kb_map[trs_occ],
+            ):
+                raise ValueError(
+                    "ia and jb mappings are not time-reversal equivariant"
+                )
+            combined_trs = np.concatenate(
+                (trs_occ, nkpts + trs_shifted)
+            )
+            evaluated_pairs = trs_pair_representatives(
+                s2_pairs,
+                combined_trs,
+            )
+        except (kpts_helper.KPointSymmetryError, ValueError) as err:
+            trs_enabled = False
+            combined_trs = np.arange(len(combined_kpts), dtype=int)
+            evaluated_pairs = s2_pairs
+            log.warn(
+                "Cannot reduce selective Lov GDF with time reversal (%s); "
+                "using the transpose-closed s2 pair set",
+                err,
+            )
+
         log.note(
-            "MP2 small-q selective Lov GDF pairs: %d unique of %d "
-            "requested (%d full ordered pairs)",
+            "MP2 small-q selective Lov GDF pairs: %d requested, %d s2 "
+            "closure, %d evaluated%s (%d full ordered pairs)",
             len(kpt_pairs),
-            len(ka_map) + len(kb_map),
+            len(s2_pairs),
+            len(evaluated_pairs),
+            " with TRS" if trs_enabled else "",
             len(combined_kpts) ** 2,
         )
         if profile is not None:
@@ -251,12 +457,20 @@ class MP2SmallQ:
         phase_t0 = profile.start() if profile is not None else None
         correlation_df = self._make_correlation_gdf(
             combined_kpts,
-            kpt_pairs,
+            evaluated_pairs,
         )
         if profile is not None:
             profile.stop("correlation GDF construction", phase_t0)
 
-        cderi_array = CDERIArray(correlation_df._cderi)
+        cderi_array = _TRSCDERIArray(
+            correlation_df._cderi,
+            evaluated_pairs,
+            combined_trs,
+        )
+        if cderi_array.aosym != "s2":
+            raise RuntimeError(
+                "selective Lov GDF must retain aosym='s2'"
+            )
 
         nocc = self.kmp.nocc
         nmo = self.kmp.nmo
@@ -304,7 +518,7 @@ class MP2SmallQ:
             for kj, kb in enumerate(kb_map):
                 lov_b[kj] = transform(kj, kb)
         finally:
-            cderi_array.data_group.close()
+            cderi_array.close()
             cderi_temp = correlation_df._cderi_to_save
             if not isinstance(cderi_temp, str):
                 cderi_temp.close()
