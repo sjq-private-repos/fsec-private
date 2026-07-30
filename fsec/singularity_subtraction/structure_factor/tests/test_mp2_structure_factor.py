@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 import gc
+import importlib.util
 import weakref
 
 import numpy as np
@@ -34,6 +35,11 @@ from fsec.singularity_subtraction.structure_factor.mp2_rsdf_direct_helpers impor
     select_direct_rsdf_occ_block_size,
 )
 from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
+
+
+HAS_KMP2_DIRECT = (
+    importlib.util.find_spec("pyscf.pbc.mp.kmp2_direct") is not None
+)
 
 
 class LineSamplingDecayHelpers(unittest.TestCase):
@@ -1313,6 +1319,176 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(requested_slices, [(0, self.kmp.nocc)])
         self.assertEqual(
             actual["direct_rsdf_block_stats"]["lov_build_count"], 1)
+        self.assertEqual(
+            actual["direct_rsdf_block_stats"]["block_size"], 1)
+
+    @unittest.skipUnless(
+        HAS_KMP2_DIRECT,
+        "requires the PySCF fork with pyscf.pbc.mp.kmp2_direct",
+    )
+    def test_direct_rsdf_real_backend_matches_stored_gdf(self):
+        systems = (
+            ("gamma", self.kmf, self.kmp),
+            ("1x1x2", self.kmf_112, self.kmp_112),
+        )
+        for label, kmf, kmp_object in systems:
+            with self.subTest(system=label):
+                nonzero_q = (
+                    kmf.kpts[1]
+                    if len(kmf.kpts) > 1
+                    else kmf.cell.reciprocal_vectors()[0]
+                )
+                qG_full = np.array([
+                    [0.0, 0.0, 0.0],
+                    nonzero_q,
+                    -nonzero_q,
+                ])
+                reference_sf = MP2StructureFactor(
+                    kmf,
+                    kmp_object,
+                    N_local=self.N_local,
+                    qG_cutoff=self.qG_cutoff,
+                    sq_inversion_symm=True,
+                    t2_store_type="kikj_lov",
+                    pair_density_eval_grid="uniform",
+                )
+                reference = reference_sf.build_structure_factor(
+                    qG_full=qG_full,
+                    direct=True,
+                    exchange=True,
+                    dG0=True,
+                )
+
+                original_df = kmf.with_df
+                direct_df = df.RSDF(kmf.cell, kmf.kpts)
+                direct_df.direct = True
+                direct_df.semidirect = False
+                direct_df.ksym = "s2"
+                direct_df.build()
+                try:
+                    kmf.with_df = direct_df
+                    direct_kmp = mp.KMP2(kmf)
+                    direct_sf = MP2StructureFactor(
+                        kmf,
+                        direct_kmp,
+                        N_local=self.N_local,
+                        qG_cutoff=self.qG_cutoff,
+                        sq_inversion_symm=True,
+                        t2_store_type="kikjka",
+                        rsdf_occ_block_size=1,
+                        pair_density_eval_grid="uniform",
+                    )
+                    actual = direct_sf.build_structure_factor(
+                        qG_full=qG_full,
+                        direct=True,
+                        exchange=True,
+                        dG0=True,
+                    )
+                finally:
+                    kmf.with_df = original_df
+
+                np.testing.assert_allclose(
+                    actual["qG_full"], reference["qG_full"])
+                for key in (
+                        "SqG_full_direct",
+                        "SqG_full_exchange",
+                        "SqG_full_q4"):
+                    np.testing.assert_allclose(
+                        actual[key],
+                        reference[key],
+                        rtol=1e-7,
+                        atol=1e-10,
+                    )
+                self.assertEqual(
+                    actual["direct_rsdf_block_stats"]["lov_build_count"], 1)
+                self.assertEqual(
+                    actual["direct_rsdf_block_stats"]["block_size"], 1)
+
+    @unittest.skipUnless(
+        HAS_KMP2_DIRECT,
+        "requires the PySCF fork with pyscf.pbc.mp.kmp2_direct",
+    )
+    def test_direct_rsdf_real_backend_occupied_blocks_match_stored_gdf(self):
+        cell = gto.Cell()
+        cell.unit = "Bohr"
+        cell.atom = """
+            H 0.0 0.0 0.0
+            H 0.0 0.0 1.6
+            H 3.0 3.0 3.0
+            H 3.0 3.0 4.6
+        """
+        cell.a = np.eye(3) * 8.0
+        cell.spin = 0
+        cell.charge = 0
+        cell.basis = "gth-szv"
+        cell.pseudo = "gth-hf"
+        cell.ke_cutoff = 60.0
+        cell.precision = 1e-8
+        cell.verbose = 0
+        cell.build()
+        kpts = cell.make_kpts(
+            (1, 1, 1), wrap_around=True, with_gamma_point=True)
+        kmf = scf.KRHF(cell, kpts)
+        kmf.exxdiv = "ewald"
+        kmf.with_df = df.GDF(cell, kpts).build()
+        kmf.conv_tol = 1e-10
+        kmf.kernel()
+        self.assertTrue(kmf.converged)
+        stored_kmp = mp.KMP2(kmf)
+        self.assertEqual(stored_kmp.nocc, 2)
+
+        reciprocal = cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            -reciprocal[0],
+        ])
+        N_local = cell.cutoff_to_mesh(cell.ke_cutoff)
+        reference_sf = MP2StructureFactor(
+            kmf,
+            stored_kmp,
+            N_local=N_local,
+            qG_cutoff=8.0,
+            sq_inversion_symm=True,
+            t2_store_type="kikj_lov",
+            pair_density_eval_grid="uniform",
+        )
+        reference = reference_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+
+        original_df = kmf.with_df
+        direct_df = df.RSDF(cell, kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        direct_df.build()
+        try:
+            kmf.with_df = direct_df
+            direct_kmp = mp.KMP2(kmf)
+            direct_sf = MP2StructureFactor(
+                kmf,
+                direct_kmp,
+                N_local=N_local,
+                qG_cutoff=8.0,
+                sq_inversion_symm=True,
+                rsdf_occ_block_size=1,
+                pair_density_eval_grid="uniform",
+            )
+            actual = direct_sf.build_structure_factor(
+                qG_full=qG_full,
+                direct=True,
+                exchange=True,
+                dG0=True,
+            )
+        finally:
+            kmf.with_df = original_df
+
+        for key in (
+                "SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                actual[key], reference[key], rtol=1e-7, atol=1e-10)
+        self.assertEqual(
+            actual["direct_rsdf_block_stats"]["lov_build_count"], 3)
         self.assertEqual(
             actual["direct_rsdf_block_stats"]["block_size"], 1)
 

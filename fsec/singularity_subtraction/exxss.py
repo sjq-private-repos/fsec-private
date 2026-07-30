@@ -1,4 +1,5 @@
 from pyscf.pbc.tools import get_monkhorst_pack_size, madelung
+from pyscf.pbc import df
 import time
 from fsec.singularity_subtraction import model_function
 # import traceback
@@ -138,7 +139,22 @@ class ExxSS(SingularitySubtraction):
 
 
             mf.exxdiv = None  # so that standard energy is computed without madelung
-            J, K = mf.get_jk(cell=mf.cell, dm_kpts=dm_kpts, kpts=kpts, kpts_band=kpts, with_j=False, exxdiv=None)
+            jk_kwargs = {
+                "cell": mf.cell,
+                "dm_kpts": dm_kpts,
+                "kpts": kpts,
+                "with_j": False,
+                "exxdiv": None,
+            }
+            # Direct RSDF does not implement the band-k-point interface.  This
+            # calculation evaluates K on the SCF mesh itself, so kpts_band=kpts
+            # is redundant and can be omitted for that backend.
+            if not (
+                isinstance(mf.with_df, df.RSDF)
+                and bool(getattr(mf.with_df, "direct", False))
+            ):
+                jk_kwargs["kpts_band"] = kpts
+            J, K = mf.get_jk(**jk_kwargs)
             mf.exxdiv = 'ewald'
 
             Ek_uncorr = -1. / nk * np.einsum('kij,kji', dm_kpts, K) * 0.5
