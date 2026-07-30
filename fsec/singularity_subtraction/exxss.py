@@ -143,7 +143,11 @@ class ExxSS(SingularitySubtraction):
                 "cell": mf.cell,
                 "dm_kpts": dm_kpts,
                 "kpts": kpts,
-                "with_j": False,
+                # RSJK caches the combined J/K result from SCF.  Requesting
+                # only K here can make its incremental cache shapes
+                # incompatible (one output versus two), so retain the SCF
+                # J/K call shape and discard J below.
+                "with_j": True,
                 "exxdiv": None,
             }
             # Direct RSDF does not implement the band-k-point interface.  This
