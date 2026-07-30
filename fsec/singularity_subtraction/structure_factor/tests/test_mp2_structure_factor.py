@@ -1,7 +1,12 @@
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+import gc
+import weakref
 
 import numpy as np
 from pyscf.pbc import df, mp
+from pyscf.pbc.mp import kmp2
 from pyscf.pbc import gto, scf
 
 from fsec.singularity_subtraction.grids import ExxSSGrids
@@ -23,10 +28,167 @@ from fsec.singularity_subtraction.structure_factor.mp2_contractions import (
     contract_trs_unique_pair_rijab_lov,
     contract_trs_unique_pair_rijab_lov_laplace,
 )
+from fsec.singularity_subtraction.structure_factor.mp2_rsdf_direct_helpers import (
+    accumulate_direct_rsdf_occ_blocks,
+    estimate_direct_rsdf_block_memory_bytes,
+    select_direct_rsdf_occ_block_size,
+)
 from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
 
 
 class LineSamplingDecayHelpers(unittest.TestCase):
+    def test_direct_rsdf_block_memory_selection_and_preflight(self):
+        dimensions = {
+            "nocc": 4,
+            "nkpts": 2,
+            "naux": 11,
+            "nvir": 3,
+            "ngrid": 17,
+            "laplace": True,
+            "max_laplace_points": 8,
+        }
+        estimates = {
+            block_size: estimate_direct_rsdf_block_memory_bytes(
+                dimensions["nkpts"],
+                dimensions["naux"],
+                dimensions["nvir"],
+                block_size,
+                dimensions["ngrid"],
+                nocc=dimensions["nocc"],
+                laplace=dimensions["laplace"],
+                max_laplace_points=dimensions["max_laplace_points"],
+            )
+            for block_size in range(1, dimensions["nocc"] + 1)
+        }
+        available = estimates[2]
+        expected = max(
+            block_size
+            for block_size, estimate in estimates.items()
+            if estimate <= available
+        )
+        selected, estimate = select_direct_rsdf_occ_block_size(
+            available_bytes=available, **dimensions)
+        self.assertEqual(selected, expected)
+        self.assertEqual(estimate, estimates[expected])
+
+        selected, estimate = select_direct_rsdf_occ_block_size(
+            available_bytes=estimates[1],
+            requested=1,
+            **dimensions,
+        )
+        self.assertEqual(selected, 1)
+        self.assertEqual(estimate, estimates[1])
+        with self.assertRaisesRegex(MemoryError, "B=2"):
+            select_direct_rsdf_occ_block_size(
+                available_bytes=estimates[2] - 1,
+                requested=2,
+                **dimensions,
+            )
+        with self.assertRaisesRegex(MemoryError, "even B=1"):
+            select_direct_rsdf_occ_block_size(
+                available_bytes=estimates[1] - 1,
+                **dimensions,
+            )
+
+    def test_direct_rsdf_scheduler_retains_at_most_two_lov_blocks(self):
+        cell = gto.Cell()
+        cell.unit = "Bohr"
+        cell.atom = "H 0 0 0"
+        cell.a = np.eye(3) * 5
+        cell.basis = "gth-szv"
+        cell.pseudo = "gth-hf"
+        cell.spin = 1
+        cell.verbose = 0
+        cell.build()
+        nocc, nvir, naux, ngrid = 3, 1, 2, 2
+        auxcell = SimpleNamespace(nao_nr=lambda: naux)
+        mydf = SimpleNamespace(auxcell=auxcell)
+        scf_stub = SimpleNamespace(cell=cell, with_df=mydf)
+        kmp_stub = SimpleNamespace(
+            nkpts=1,
+            nocc=nocc,
+            nmo=nocc + nvir,
+            max_memory=10000,
+            _scf=scf_stub,
+        )
+        kmf_stub = SimpleNamespace(cell=cell)
+        mesh_context = {
+            "rptGrid3D": np.zeros((ngrid, 3)),
+            "quadrature_weights": None,
+            "quadrature_product_scale": 1.0,
+            "uKpts_i": np.ones((1, nocc, ngrid), dtype=complex),
+            "uKpts_a": np.ones((1, nvir, ngrid), dtype=complex),
+        }
+        live = {"count": 0, "maximum": 0}
+        requested_slices = []
+
+        def release_block():
+            live["count"] -= 1
+
+        def provider(_kmp, occ_slice):
+            requested_slices.append(tuple(occ_slice))
+            live["count"] += 1
+            live["maximum"] = max(live["maximum"], live["count"])
+            result = np.empty((1, 1), dtype=object)
+            result[0, 0] = np.ones((naux, 1, nvir), dtype=complex)
+            weakref.finalize(result, release_block)
+            return result
+
+        outputs = [np.zeros(1) for _ in range(3)]
+        masks = [np.ones(1, dtype=bool) for _ in range(3)]
+        with patch(
+            "fsec.singularity_subtraction.structure_factor."
+            "mp2_rsdf_direct_helpers."
+            "build_direct_rsdf_lov_block",
+            side_effect=provider,
+        ):
+            stats = accumulate_direct_rsdf_occ_blocks(
+                kmp=kmp_stub,
+                kmf=kmf_stub,
+                qG_full=np.zeros((1, 3)),
+                qi_map=np.zeros(1, dtype=int),
+                qGrid=np.zeros((1, 3)),
+                kGrid1=np.zeros((1, 3)),
+                kas=np.zeros((1, 1), dtype=int),
+                kbs=np.zeros((1, 1), dtype=int),
+                qG_uses_outer_mesh=np.zeros(1, dtype=bool),
+                mesh_contexts={"inner": mesh_context},
+                trs_map=np.zeros(1, dtype=int),
+                trs_unique_pairs=[(0, 0, 1)],
+                mo_e_o=np.array([[-1.0, -0.9, -0.8]]),
+                mo_e_v=np.array([[0.5]]),
+                mo_e_v_b=np.array([[0.5]]),
+                nonzero_opadding=[np.arange(nocc)],
+                nonzero_vpadding=[np.arange(nvir)],
+                omega_cell=125.0,
+                direct=True,
+                exchange=True,
+                dG0=True,
+                sq_inversion_symm=False,
+                inversion_partner=None,
+                requested_block_size=1,
+                laplace=False,
+                laplace_direct_tol=1e-8,
+                laplace_direct_max_points=16,
+                laplace_exchange_tol=1e-8,
+                laplace_exchange_max_points=16,
+                SqG_full_direct=outputs[0],
+                SqG_full_exchange=outputs[1],
+                SqG_full_q4=outputs[2],
+                SqG_full_direct_mask=masks[0],
+                SqG_full_exchange_mask=masks[1],
+                SqG_full_q4_mask=masks[2],
+                q4_decay_state=None,
+                exchange_decay_state=None,
+                profile=TimingProfile(),
+                log=SimpleNamespace(note=lambda *args, **kwargs: None),
+            )
+        gc.collect()
+        self.assertEqual(stats[3], 6)
+        self.assertEqual(len(requested_slices), 6)
+        self.assertLessEqual(live["maximum"], 2)
+        self.assertEqual(live["count"], 0)
+
     def test_minimax_laplace_grid_meets_error_bound(self):
         denominator_min = 0.4
         denominator_max = 18.0
@@ -442,6 +604,148 @@ class LineSamplingDecayHelpers(unittest.TestCase):
                 rtol=2e-8,
                 atol=1e-10,
             )
+
+    def test_rectangular_occupied_lov_blocks_sum_to_full_contraction(self):
+        rng = np.random.default_rng(913)
+        trs_map = np.array([0, 2, 1])
+        nkpts = len(trs_map)
+        naux, nocc, nvir = 4, 3, 2
+        trs_unique_pairs = build_trs_unique_pairs(trs_map, nkpts)
+        rho_ia = (
+            rng.normal(size=(nkpts, nocc, nvir))
+            + 1j * rng.normal(size=(nkpts, nocc, nvir))
+        )
+        rho_jb = (
+            rng.normal(size=(nkpts, nvir, nocc))
+            + 1j * rng.normal(size=(nkpts, nvir, nocc))
+        )
+        Lov = np.empty((nkpts, nkpts), dtype=object)
+        for ko in range(nkpts):
+            for kv in range(nkpts):
+                Lov[ko, kv] = (
+                    rng.normal(size=(naux, nocc, nvir))
+                    + 1j * rng.normal(size=(naux, nocc, nvir))
+                )
+        kas_at_qi = np.array([0, 1, 2])
+        kbs_at_qi = np.array([2, 0, 1])
+        mo_e_o = -rng.random(size=(nkpts, nocc)) - 0.5
+        mo_e_v = rng.random(size=(nkpts, nvir)) + 0.5
+        mo_e_v_b = mo_e_v.copy()
+        nonzero_opadding = [
+            np.array([0, 1, 2]),
+            np.array([0, 2]),
+            np.array([1, 2]),
+        ]
+        nonzero_vpadding = [np.arange(nvir) for _ in range(nkpts)]
+        for ko, occupied in enumerate(nonzero_opadding):
+            padded = np.setdiff1d(np.arange(nocc), occupied)
+            rho_ia[ko, padded, :] = 0
+            rho_jb[ko, :, padded] = 0
+            for kv in range(nkpts):
+                Lov[ko, kv][:, padded, :] = 0
+        common = (
+            trs_unique_pairs,
+            kas_at_qi,
+            kbs_at_qi,
+            mo_e_o,
+            mo_e_v,
+            mo_e_v_b,
+            nonzero_opadding,
+            nonzero_vpadding,
+            nkpts,
+        )
+
+        def sliced_lov(occ_slice):
+            start, stop = occ_slice
+            result = np.empty_like(Lov)
+            for ko in range(nkpts):
+                for kv in range(nkpts):
+                    result[ko, kv] = Lov[ko, kv][:, start:stop, :]
+            return result
+
+        def blocked_sum(contraction, **extra):
+            slices = [(0, 1), (1, 3)]
+            tables = [sliced_lov(occ_slice) for occ_slice in slices]
+            total = np.zeros(3)
+            for block_i, occ_slice_i in enumerate(slices):
+                for block_j in range(block_i + 1):
+                    occ_slice_j = slices[block_j]
+                    directed = contraction(
+                        rho_ia[:, occ_slice_i[0]:occ_slice_i[1], :],
+                        rho_jb[:, :, occ_slice_j[0]:occ_slice_j[1]],
+                        common[0],
+                        tables[block_i],
+                        tables[block_j],
+                        *common[1:],
+                        compute_direct=True,
+                        compute_exchange=True,
+                        compute_q4=True,
+                        occ_slice_i=occ_slice_i,
+                        occ_slice_j=occ_slice_j,
+                        Lov_exchange_i=tables[block_i],
+                        Lov_exchange_j=tables[block_j],
+                        **extra,
+                    )
+                    total += directed
+                    if block_i != block_j:
+                        reverse = contraction(
+                            rho_ia[:, occ_slice_j[0]:occ_slice_j[1], :],
+                            rho_jb[:, :, occ_slice_i[0]:occ_slice_i[1]],
+                            common[0],
+                            tables[block_j],
+                            tables[block_i],
+                            *common[1:],
+                            compute_direct=True,
+                            compute_exchange=True,
+                            compute_q4=True,
+                            occ_slice_i=occ_slice_j,
+                            occ_slice_j=occ_slice_i,
+                            Lov_exchange_i=tables[block_j],
+                            Lov_exchange_j=tables[block_i],
+                            **extra,
+                        )
+                        total += reverse
+            return total
+
+        exact_full = contract_trs_unique_pair_rijab_lov(
+            rho_ia,
+            rho_jb,
+            common[0],
+            Lov,
+            Lov,
+            *common[1:],
+            compute_direct=True,
+            compute_exchange=True,
+            compute_q4=True,
+        )
+        np.testing.assert_allclose(
+            blocked_sum(contract_trs_unique_pair_rijab_lov),
+            exact_full,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            blocked_sum(
+                contract_trs_unique_pair_rijab_lov_laplace,
+                direct_tolerance=1e-8,
+                direct_max_points=16,
+                exchange_tolerance=1e-8,
+                exchange_max_points=16,
+            ),
+            exact_full,
+            rtol=2e-8,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            blocked_sum(
+                contract_trs_unique_pair_rijab_lov_laplace,
+                direct_max_points=1,
+                exchange_max_points=1,
+            ),
+            exact_full,
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
     def test_direct_q4_laplace_respects_padding_masks(self):
         rng = np.random.default_rng(83)
@@ -936,6 +1240,81 @@ class KnownValues(unittest.TestCase):
         )
         self.assertNotIn("direct t2 cache miss", lov_sf.last_build_timings)
         self.assertNotIn("exchange t2 cache miss", lov_sf.last_build_timings)
+
+    def test_direct_rsdf_uses_occupied_lov_provider(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            -reciprocal[0],
+        ])
+        reference_sf = MP2StructureFactor(
+            self.kmf,
+            self.kmp,
+            N_local=self.N_local,
+            qG_cutoff=self.qG_cutoff,
+            sq_inversion_symm=True,
+            t2_store_type="kikj_lov",
+            pair_density_eval_grid="uniform",
+        )
+        reference = reference_sf.build_structure_factor(
+            qG_full=qG_full, direct=True, exchange=True, dG0=True)
+        full_lov = kmp2._init_mp_df_eris(self.kmp)
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        requested_slices = []
+
+        def block_provider(_kmp, occ_slice):
+            requested_slices.append(tuple(occ_slice))
+            start, stop = occ_slice
+            result = np.empty_like(full_lov)
+            for ko in range(self.kmp.nkpts):
+                for kv in range(self.kmp.nkpts):
+                    result[ko, kv] = full_lov[ko, kv][:, start:stop, :]
+                    self.assertEqual(
+                        result[ko, kv].shape[1], stop - start)
+            return result
+
+        try:
+            self.kmf.with_df = direct_df
+            direct_sf = MP2StructureFactor(
+                self.kmf,
+                self.kmp,
+                N_local=self.N_local,
+                qG_cutoff=self.qG_cutoff,
+                sq_inversion_symm=True,
+                t2_store_type="kikjka",
+                rsdf_occ_block_size=1,
+                pair_density_eval_grid="uniform",
+            )
+            with patch(
+                "fsec.singularity_subtraction.structure_factor."
+                "mp2_rsdf_direct_helpers."
+                "build_direct_rsdf_lov_block",
+                side_effect=block_provider,
+            ):
+                actual = direct_sf.build_structure_factor(
+                    qG_full=qG_full,
+                    direct=True,
+                    exchange=True,
+                    dG0=True,
+                )
+        finally:
+            self.kmf.with_df = original_df
+
+        np.testing.assert_allclose(actual["qG_full"], reference["qG_full"])
+        for key in (
+                "SqG_full_direct", "SqG_full_exchange", "SqG_full_q4"):
+            np.testing.assert_allclose(
+                actual[key], reference[key], rtol=1e-7, atol=1e-10)
+        self.assertEqual(requested_slices, [(0, self.kmp.nocc)])
+        self.assertEqual(
+            actual["direct_rsdf_block_stats"]["lov_build_count"], 1)
+        self.assertEqual(
+            actual["direct_rsdf_block_stats"]["block_size"], 1)
 
     def test_trs_unique_pair_matches_full_contraction_112_kmesh(self):
         fallback_sf = MP2StructureFactor(

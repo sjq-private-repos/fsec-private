@@ -138,6 +138,11 @@ class MP2SSOptions:
         Storage strategy for MP2 amplitudes. Supported values are
         ``"kikjka"``, ``"kikj"``, ``"ki"``, and ``"kikj_lov"``.  The latter
         contracts density-fitting tensors without materializing amplitudes.
+    rsdf_occ_block_size
+        Padded occupied-orbital block size used by the fully direct RSDF
+        ``kikj_lov`` route. A positive integer selects the block size
+        explicitly. ``None`` selects the largest block that passes the
+        ``max_memory`` preflight estimate.
     laplace
         Use the minimax Laplace denominator factorization for all terms when
         ``t2_store_type="kikj_lov"``. An exact contraction is used automatically
@@ -198,6 +203,7 @@ class MP2SSOptions:
     line_sampling_decay_consecutive_below: int = 3
     line_sampling_decay_components: object = ("direct_q4", "exchange")
     t2_store_type: str = 'kikjka'
+    rsdf_occ_block_size: Optional[int] = None
     laplace: bool = True
     laplace_direct_tol: float = 1e-8
     laplace_direct_max_points: int = 16
@@ -250,6 +256,11 @@ class MP2SSOptions:
             raise ValueError("laplace_exchange_tol must be finite and positive")
         if laplace_exchange_max_points < 1:
             raise ValueError("laplace_exchange_max_points must be positive")
+        rsdf_occ_block_size = self.rsdf_occ_block_size
+        if rsdf_occ_block_size is not None:
+            rsdf_occ_block_size = int(rsdf_occ_block_size)
+            if rsdf_occ_block_size < 1:
+                raise ValueError("rsdf_occ_block_size must be positive or None")
         object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
         object.__setattr__(
             self,
@@ -266,6 +277,8 @@ class MP2SSOptions:
         object.__setattr__(self, 'laplace_exchange_tol', laplace_exchange_tol)
         object.__setattr__(
             self, 'laplace_exchange_max_points', laplace_exchange_max_points)
+        object.__setattr__(
+            self, 'rsdf_occ_block_size', rsdf_occ_block_size)
 
 
 @dataclass(frozen=True)
@@ -994,6 +1007,20 @@ class MP2SS:
             if kwargs:
                 options = replace(options, **kwargs)
 
+        direct_rsdf = (
+            isinstance(kmp._scf.with_df, df.RSDF)
+            and bool(getattr(kmp._scf.with_df, "direct", False))
+        )
+        if direct_rsdf:
+            if t2 is not None:
+                raise NotImplementedError(
+                    "MP2SS with RSDF(direct=True) does not accept "
+                    "precomputed t2 amplitudes")
+            # The direct backend has no persistent _cderi for the ordinary
+            # routes. Select the occupied-block Lov implementation
+            # automatically, regardless of the general-purpose default.
+            options = replace(options, t2_store_type="kikj_lov")
+
         if auxfunc_direct is None:
             auxfunc_direct = options.auxfunc_direct
         if auxfunc_exchange is None:
@@ -1070,6 +1097,7 @@ class MP2SS:
         self.line_sampling_decay_consecutive_below = options.line_sampling_decay_consecutive_below
         self.line_sampling_decay_components = options.line_sampling_decay_components
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
+        self.rsdf_occ_block_size = options.rsdf_occ_block_size
         self.laplace = options.laplace
         self.laplace_direct_tol = options.laplace_direct_tol
         self.laplace_direct_max_points = options.laplace_direct_max_points
@@ -1169,6 +1197,7 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
+            rsdf_occ_block_size=self.rsdf_occ_block_size,
             laplace=self.laplace,
             laplace_direct_tol=self.laplace_direct_tol,
             laplace_direct_max_points=self.laplace_direct_max_points,

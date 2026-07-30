@@ -83,6 +83,14 @@ class PrintResultsTests(unittest.TestCase):
 
 
 class MP2SSOptionsTests(unittest.TestCase):
+    def test_direct_rsdf_occupied_block_option(self):
+        self.assertIsNone(MP2SSOptions().rsdf_occ_block_size)
+        self.assertEqual(
+            MP2SSOptions(rsdf_occ_block_size="3").rsdf_occ_block_size, 3)
+        for invalid in (0, -1):
+            with self.assertRaises(ValueError):
+                MP2SSOptions(rsdf_occ_block_size=invalid)
+
     def test_laplace_options(self):
         defaults = MP2SSOptions()
         self.assertTrue(defaults.laplace)
@@ -295,6 +303,28 @@ class KnownValues(unittest.TestCase):
 
         self.assertFalse(mp2ss.mp2_structure_factor.check_trs)
         self._assert_matches_references(mp2ss, correction)
+
+    def test_direct_rsdf_automatically_selects_blocked_lov_route(self):
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        try:
+            self.kmf.with_df = direct_df
+            mp2ss = MP2SS(
+                kmf=self.kmf,
+                kmp=self.kmp,
+                options=MP2SSOptions(rsdf_occ_block_size=1),
+            )
+            self.assertEqual(mp2ss.options.t2_store_type, "kikj_lov")
+            self.assertEqual(mp2ss.t2_store_type, "kikj_lov")
+            self.assertEqual(mp2ss.rsdf_occ_block_size, 1)
+            with self.assertRaisesRegex(
+                    NotImplementedError, "precomputed t2"):
+                MP2SS(kmf=self.kmf, kmp=self.kmp, t2=self.t2)
+        finally:
+            self.kmf.with_df = original_df
 
 
 if __name__ == "__main__":

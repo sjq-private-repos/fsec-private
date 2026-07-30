@@ -34,6 +34,12 @@ from fsec.singularity_subtraction.structure_factor.mp2_contractions import (
     contract_trs_unique_pair_rijab_lov,
     contract_trs_unique_pair_rijab_lov_laplace,
 )
+from fsec.singularity_subtraction.structure_factor.mp2_rsdf_direct_helpers import (
+    accumulate_direct_rsdf_occ_blocks,
+    is_direct_rsdf,
+    validate_direct_rsdf_structure_factor,
+)
+
 
 
 def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=None,
@@ -279,6 +285,12 @@ class MP2StructureFactor(StructureFactor):
         )
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
+        self.rsdf_occ_block_size = kwargs.get('rsdf_occ_block_size', None)
+        if self.rsdf_occ_block_size is not None:
+            self.rsdf_occ_block_size = int(self.rsdf_occ_block_size)
+            if self.rsdf_occ_block_size < 1:
+                raise ValueError(
+                    "rsdf_occ_block_size must be positive or None")
         legacy_laplace_switches = {
             name for name in ('laplace_direct', 'laplace_exchange')
             if name in kwargs
@@ -361,7 +373,8 @@ class MP2StructureFactor(StructureFactor):
                                sq_ke_cutoff_switch_radius=None,
                                outer_sq_ke_cutoff_scale=None,
                                pair_density_eval_grid=None,
-                               pair_density_becke_grid_level=None):
+                               pair_density_becke_grid_level=None,
+                               rsdf_occ_block_size=None):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -484,6 +497,8 @@ class MP2StructureFactor(StructureFactor):
         
         if t2_store_type is None:
             t2_store_type = self.t2_store_type
+        if rsdf_occ_block_size is None:
+            rsdf_occ_block_size = self.rsdf_occ_block_size
         
         kGrid1 = grids.kGrid1 # occupied
         kGrid2 = grids.kGrid2 # virtual
@@ -509,9 +524,21 @@ class MP2StructureFactor(StructureFactor):
         
         t2_required = True # if full t2 in kikjka format is needed
         t2_given = t2 is not None
+        direct_rsdf_blocked = is_direct_rsdf(kmp)
+        if direct_rsdf_blocked:
+            validate_direct_rsdf_structure_factor(kmp, grids)
+            if t2_given:
+                raise NotImplementedError(
+                    "The occupied-block direct-RSDF structure factor does not "
+                    "accept precomputed t2 amplitudes")
+            if Lov is not None or Lov_b is not None:
+                raise NotImplementedError(
+                    "The occupied-block direct-RSDF route intentionally does "
+                    "not accept or retain full Lov tables")
+            t2_store_type = "kikj_lov"
         kikj_lov = t2_store_type == 'kikj_lov'
         
-        with_df_ints = self.kmp.with_df_ints and isinstance(self.kmp._scf.with_df, df.GDF)
+        with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
         if kikj_lov:
             if t2_given:
                 raise NotImplementedError("t2_store_type='kikj_lov' does not accept precomputed t2 amplitudes")
@@ -519,13 +546,18 @@ class MP2StructureFactor(StructureFactor):
                 raise NotImplementedError("t2_store_type='kikj_lov' requires GDF integrals")
             if grids.kGrid3_neq_kGrid2:
                 raise NotImplementedError("t2_store_type='kikj_lov' is not implemented for kGrid3_neq_kGrid2")
-            phase_t0 = profile.start()
-            Lov = kmp2._init_mp_df_eris(kmp) if Lov is None else Lov
-            # Lov is read-only in this path.  Avoid duplicating a dense Lov
-            # tensor when the a and b virtual grids are identical.
-            Lov_b = Lov if Lov_b is None else Lov_b
-            profile.stop("DF Lov initialization", phase_t0)
-            print("Using Lov-backed kikj contractions without materializing t2.")
+            if direct_rsdf_blocked:
+                print(
+                    "Using occupied-block direct-RSDF Lov contractions "
+                    "without materializing t2 or full Lov.")
+            else:
+                phase_t0 = profile.start()
+                Lov = kmp2._init_mp_df_eris(kmp) if Lov is None else Lov
+                # Lov is read-only in this path. Avoid duplicating a dense Lov
+                # tensor when the a and b virtual grids are identical.
+                Lov_b = Lov if Lov_b is None else Lov_b
+                profile.stop("DF Lov initialization", phase_t0)
+                print("Using Lov-backed kikj contractions without materializing t2.")
             if (direct or exchange or dG0) and self.laplace:
                 print(
                     "Using minimax Laplace denominators for all terms."
@@ -625,7 +657,10 @@ class MP2StructureFactor(StructureFactor):
                 'uKpts_j': uKpts_j_local[:,:nocc,:],
                 'uKpts_a': uKpts_a_local[:,nocc:,:],
                 'uKpts_b': uKpts_b_local[:,nocc:,:],
-                'conj_uKpts_i': np.conj(uKpts_i_local[:,:nocc,:]),
+                'conj_uKpts_i': (
+                    None if direct_rsdf_blocked
+                    else np.conj(uKpts_i_local[:,:nocc,:])
+                ),
             }
 
         full_context = build_mesh_context(
@@ -810,7 +845,53 @@ class MP2StructureFactor(StructureFactor):
             _, inversion_partner = qg_tree.query(-qG_full, distance_upper_bound=1e-8)
 
         loop_t0 = profile.start()
-        for qG in range(qG_full.shape[0]):
+        direct_rsdf_stats = None
+        qG_loop_indices = range(qG_full.shape[0])
+        if direct_rsdf_blocked:
+            direct_rsdf_stats = accumulate_direct_rsdf_occ_blocks(
+                kmp=kmp,
+                kmf=kmf,
+                qG_full=qG_full,
+                qi_map=qi_map,
+                qGrid=qGrid,
+                kGrid1=kGrid1,
+                kas=kas,
+                kbs=kbs,
+                qG_uses_outer_mesh=qG_uses_outer_mesh,
+                mesh_contexts=mesh_contexts,
+                trs_map=trs_map,
+                trs_unique_pairs=trs_unique_pairs,
+                mo_e_o=mo_e_o,
+                mo_e_v=mo_e_v,
+                mo_e_v_b=mo_e_v_b,
+                nonzero_opadding=nonzero_opadding,
+                nonzero_vpadding=nonzero_vpadding,
+                omega_cell=omega_cell,
+                direct=direct,
+                exchange=exchange,
+                dG0=dG0,
+                sq_inversion_symm=self.sq_inversion_symm,
+                inversion_partner=inversion_partner,
+                requested_block_size=rsdf_occ_block_size,
+                laplace=self.laplace,
+                laplace_direct_tol=self.laplace_direct_tol,
+                laplace_direct_max_points=self.laplace_direct_max_points,
+                laplace_exchange_tol=self.laplace_exchange_tol,
+                laplace_exchange_max_points=self.laplace_exchange_max_points,
+                SqG_full_direct=SqG_full_direct,
+                SqG_full_exchange=SqG_full_exchange,
+                SqG_full_q4=SqG_full_q4,
+                SqG_full_direct_mask=SqG_full_direct_mask,
+                SqG_full_exchange_mask=SqG_full_exchange_mask,
+                SqG_full_q4_mask=SqG_full_q4_mask,
+                q4_decay_state=q4_decay_state,
+                exchange_decay_state=exchange_decay_state,
+                profile=profile,
+                log=log,
+            )
+            num_equiv_qG = direct_rsdf_stats[0]
+            qG_loop_indices = ()
+        for qG in qG_loop_indices:
             if qG % interval == 0:
                 print(f"Progress: {qG/nqG_full*100:.2f}%")
                 print(f"Wall time: {logger.perf_counter()-total_t0[1]:.2f}s")
@@ -1338,6 +1419,13 @@ class MP2StructureFactor(StructureFactor):
                 key: value['N_local'].copy()
                 for key, value in mesh_contexts.items()
             }
+            self.direct_rsdf_block_stats = (
+                None if direct_rsdf_stats is None else {
+                    'block_size': direct_rsdf_stats[1],
+                    'estimated_incremental_peak_bytes': direct_rsdf_stats[2],
+                    'lov_build_count': direct_rsdf_stats[3],
+                }
+            )
             profile.stop("class result update", phase_t0)
                 
         # Find zero index
@@ -1363,6 +1451,13 @@ class MP2StructureFactor(StructureFactor):
                 for key, value in mesh_contexts.items()
             },
             'qG_full': qG_full,
+            'direct_rsdf_block_stats': (
+                None if direct_rsdf_stats is None else {
+                    'block_size': direct_rsdf_stats[1],
+                    'estimated_incremental_peak_bytes': direct_rsdf_stats[2],
+                    'lov_build_count': direct_rsdf_stats[3],
+                }
+            ),
         }
         self.last_build_timings = profile.summary(total_t0)
         profile.log_summary(log, self.last_build_timings)

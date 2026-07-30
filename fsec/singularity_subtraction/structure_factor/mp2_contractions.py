@@ -119,15 +119,46 @@ def lov_block(Lov, ko, kv):
     raise ValueError("Lov must be a 2D object array or a dense 4D array")
 
 
+def _normalize_occ_slice(occ_slice, nocc):
+    if occ_slice is None:
+        return 0, nocc
+    start, stop = (int(value) for value in occ_slice)
+    if start < 0 or stop < start or stop > nocc:
+        raise ValueError(
+            f"occupied slice {(start, stop)} is outside [0, {nocc}]")
+    return start, stop
+
+
 def build_eov_pair(
-        ko, kv, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding):
+        ko, kv, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding,
+        occ_slice=None):
     """Build a padded occupied-virtual energy difference block."""
     nocc = mo_e_o.shape[1]
     nvir = mo_e_v.shape[1]
-    eov = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_e_o.dtype)
-    nonzero_idx = np.ix_(nonzero_opadding[ko], nonzero_vpadding[kv])
-    eov[nonzero_idx] = (mo_e_o[ko][:, None] - mo_e_v[kv])[nonzero_idx]
+    start, stop = _normalize_occ_slice(occ_slice, nocc)
+    eov = LARGE_DENOM * np.ones((stop - start, nvir), dtype=mo_e_o.dtype)
+
+    occupied = np.asarray(nonzero_opadding[ko], dtype=int)
+    occupied = occupied[(occupied >= start) & (occupied < stop)]
+    occupied_local = occupied - start
+    virtual = np.asarray(nonzero_vpadding[kv], dtype=int)
+    nonzero_idx = np.ix_(occupied_local, virtual)
+    energy_block = mo_e_o[ko, start:stop, None] - mo_e_v[kv]
+    eov[nonzero_idx] = energy_block[nonzero_idx]
     return eov
+
+
+def build_active_eov_mask(
+        ko, kv, nocc, nvir, nonzero_opadding, nonzero_vpadding,
+        occ_slice=None):
+    """Return the non-padding mask for an occupied-virtual block."""
+    start, stop = _normalize_occ_slice(occ_slice, nocc)
+    active = np.zeros((stop - start, nvir), dtype=bool)
+    occupied = np.asarray(nonzero_opadding[ko], dtype=int)
+    occupied = occupied[(occupied >= start) & (occupied < stop)] - start
+    virtual = np.asarray(nonzero_vpadding[kv], dtype=int)
+    active[np.ix_(occupied, virtual)] = True
+    return active
 
 
 def contract_exchange_lov_laplace(
@@ -257,7 +288,8 @@ def contract_trs_unique_pair_rijab_lov(
         Lov, Lov_b, kas_at_qi, kbs_at_qi, mo_e_o, mo_e_v, mo_e_v_b,
         nonzero_opadding, nonzero_vpadding, nkpts,
         compute_direct=False, compute_exchange=False, compute_q4=False,
-        profile=None):
+        profile=None, occ_slice_i=None, occ_slice_j=None,
+        Lov_exchange_i=None, Lov_exchange_j=None):
     """Contract TRS-unique pairs exactly from DF Lov blocks."""
     direct_value = 0.0
     exchange_value = 0.0
@@ -270,9 +302,11 @@ def contract_trs_unique_pair_rijab_lov(
         if compute_direct or compute_exchange or compute_q4:
             region_t0 = profile.start() if profile is not None else None
             eia = build_eov_pair(
-                m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
+                m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding,
+                occ_slice=occ_slice_i)
             ejb = build_eov_pair(
-                n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding)
+                n, kb, mo_e_o, mo_e_v_b, nonzero_opadding, nonzero_vpadding,
+                occ_slice=occ_slice_j)
             if profile is not None:
                 profile.stop("TRS Lov denominator eov build", region_t0)
 
@@ -320,23 +354,26 @@ def contract_trs_unique_pair_rijab_lov(
 
         if compute_exchange:
             region_t0 = profile.start() if profile is not None else None
-            Lov_mkb = lov_block(Lov_b, m, kb).conj()
-            Lov_nka = lov_block(Lov, n, ka).conj()
+            exchange_i = Lov_b if Lov_exchange_i is None else Lov_exchange_i
+            exchange_j = Lov if Lov_exchange_j is None else Lov_exchange_j
+            Lov_mkb = lov_block(exchange_i, m, kb).conj()
+            Lov_nka = lov_block(exchange_j, n, ka).conj()
             if profile is not None:
                 profile.stop("TRS Lov exchange Lov fetch/conj", region_t0)
 
             region_t0 = profile.start() if profile is not None else None
-            naux, nocc, nvir = Lov_mkb.shape
+            naux, nocc_i, nvir = Lov_mkb.shape
+            nocc_j = Lov_nka.shape[1]
             eris_ijba = (
-                Lov_mkb.transpose(1, 2, 0).reshape(nocc * nvir, naux)
-                @ Lov_nka.reshape(naux, nocc * nvir)
+                Lov_mkb.transpose(1, 2, 0).reshape(nocc_i * nvir, naux)
+                @ Lov_nka.reshape(naux, nocc_j * nvir)
             )
             if profile is not None:
                 profile.stop("TRS Lov exchange ERI matmul", region_t0)
 
             region_t0 = profile.start() if profile is not None else None
             exchange_edenom = np.empty(
-                (nocc, nvir, nocc, nvir), dtype=eia.dtype)
+                (nocc_i, nvir, nocc_j, nvir), dtype=eia.dtype)
             np.add(
                 eia[:, None, None, :],
                 ejb.T[None, :, :, None],
@@ -347,7 +384,8 @@ def contract_trs_unique_pair_rijab_lov(
                 profile.stop("TRS Lov exchange denominator build", region_t0)
 
             region_t0 = profile.start() if profile is not None else None
-            eris_ib_ja = eris_ijba.reshape(nocc, nvir, nocc, nvir)
+            eris_ib_ja = eris_ijba.reshape(
+                nocc_i, nvir, nocc_j, nvir)
             np.multiply(eris_ib_ja, exchange_edenom, out=eris_ib_ja)
             if profile is not None:
                 profile.stop("TRS Lov exchange denom scale", region_t0)
@@ -393,7 +431,9 @@ def contract_trs_unique_pair_rijab_lov_laplace(
         compute_direct=False, compute_exchange=False, compute_q4=False,
         profile=None,
         direct_tolerance=1e-8, direct_max_points=16,
-        exchange_tolerance=1e-8, exchange_max_points=16):
+        exchange_tolerance=1e-8, exchange_max_points=16,
+        occ_slice_i=None, occ_slice_j=None,
+        Lov_exchange_i=None, Lov_exchange_j=None):
     """Contract TRS-unique pairs with Laplace denominators.
 
     Any unique pair that is not covered by the minimax grid is passed
@@ -409,19 +449,20 @@ def contract_trs_unique_pair_rijab_lov_laplace(
 
         region_t0 = profile.start() if profile is not None else None
         eia = build_eov_pair(
-            m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding)
+            m, ka, mo_e_o, mo_e_v, nonzero_opadding, nonzero_vpadding,
+            occ_slice=occ_slice_i)
         ejb = build_eov_pair(
             n, kb, mo_e_o, mo_e_v_b,
-            nonzero_opadding, nonzero_vpadding)
+            nonzero_opadding, nonzero_vpadding, occ_slice=occ_slice_j)
         if profile is not None:
             profile.stop("TRS Lov denominator eov build", region_t0)
 
-        active_ia = np.zeros(eia.shape, dtype=bool)
-        active_jb = np.zeros(ejb.shape, dtype=bool)
-        active_ia[np.ix_(
-            nonzero_opadding[m], nonzero_vpadding[ka])] = True
-        active_jb[np.ix_(
-            nonzero_opadding[n], nonzero_vpadding[kb])] = True
+        active_ia = build_active_eov_mask(
+            m, ka, mo_e_o.shape[1], mo_e_v.shape[1],
+            nonzero_opadding, nonzero_vpadding, occ_slice=occ_slice_i)
+        active_jb = build_active_eov_mask(
+            n, kb, mo_e_o.shape[1], mo_e_v_b.shape[1],
+            nonzero_opadding, nonzero_vpadding, occ_slice=occ_slice_j)
 
         direct_result = None
         if compute_direct or compute_q4:
@@ -472,9 +513,10 @@ def contract_trs_unique_pair_rijab_lov_laplace(
         exchange_result = None
         if compute_exchange:
             region_t0 = profile.start() if profile is not None else None
-            Lov_mkb = lov_block(
-                Lov_b, m, kb).conj()
-            Lov_nka = lov_block(Lov, n, ka).conj()
+            exchange_i = Lov_b if Lov_exchange_i is None else Lov_exchange_i
+            exchange_j = Lov if Lov_exchange_j is None else Lov_exchange_j
+            Lov_mkb = lov_block(exchange_i, m, kb).conj()
+            Lov_nka = lov_block(exchange_j, n, ka).conj()
             if profile is not None:
                 profile.stop("TRS Lov exchange Lov fetch/conj", region_t0)
 
@@ -528,6 +570,10 @@ def contract_trs_unique_pair_rijab_lov_laplace(
                     compute_exchange=fallback_exchange,
                     compute_q4=compute_q4 and fallback_direct_q4,
                     profile=profile,
+                    occ_slice_i=occ_slice_i,
+                    occ_slice_j=occ_slice_j,
+                    Lov_exchange_i=Lov_exchange_i,
+                    Lov_exchange_j=Lov_exchange_j,
                 )
             )
             direct_value += fallback[0]
