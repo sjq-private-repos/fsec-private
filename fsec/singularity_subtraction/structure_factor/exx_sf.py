@@ -3,11 +3,34 @@ import scipy
 
 from pyscf.lib import logger
 from pyscf.pbc.tools import get_monkhorst_pack_size
+from pyscf.pbc.dft import gen_grid as pbc_gen_grid
 
 from fsec.singularity_subtraction.grids import ExxSSGrids, minimum_image
 
 from fsec.singularity_subtraction.structure_factor import StructureFactor
 from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts, TimingProfile
+
+
+def normalize_pair_density_eval_grid(pair_density_eval_grid):
+    pair_density_eval_grid = str(pair_density_eval_grid).strip().lower()
+    if pair_density_eval_grid not in ("uniform", "becke"):
+        raise ValueError(
+            "pair_density_eval_grid must be 'uniform' or 'becke'"
+        )
+    return pair_density_eval_grid
+
+
+def normalize_pair_density_becke_grid_level(
+        pair_density_becke_grid_level):
+    pair_density_becke_grid_level = (
+        0 if pair_density_becke_grid_level is None
+        else int(pair_density_becke_grid_level)
+    )
+    if pair_density_becke_grid_level < 0:
+        raise ValueError(
+            "pair_density_becke_grid_level must be non-negative"
+        )
+    return pair_density_becke_grid_level
 
 
 class ExxStructureFactor(StructureFactor):
@@ -25,6 +48,14 @@ class ExxStructureFactor(StructureFactor):
         self.relative_shift = relative_shift
         self.min_points = kwargs.get("min_points", 6)
         self.line_sampling = kwargs.get("line_sampling", False)
+        self.pair_density_eval_grid = normalize_pair_density_eval_grid(
+            kwargs.get("pair_density_eval_grid", "becke")
+        )
+        self.pair_density_becke_grid_level = (
+            normalize_pair_density_becke_grid_level(
+                kwargs.get("pair_density_becke_grid_level", 0)
+            )
+        )
 
         self.debug_options = kwargs.get("debug_options", {})
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
@@ -50,11 +81,40 @@ class ExxStructureFactor(StructureFactor):
                 )
             self.grids.qG_grid_truncated = qG_line
 
-    def build_structure_factor(self, verbose=None):
+    def build_structure_factor(
+            self, verbose=None, pair_density_eval_grid=None,
+            pair_density_becke_grid_level=None):
+        """Build the exchange structure factor.
+
+        Parameters
+        ----------
+        pair_density_eval_grid : {"uniform", "becke"}, optional
+            Real-space quadrature grid used to evaluate pair-density
+            overlaps. The default is the value supplied at construction,
+            which defaults to ``"becke"``.
+        pair_density_becke_grid_level : int, optional
+            PySCF periodic Becke grid level. The construction-time default is
+            0.
+        """
         kmf = self.kmf
         log = logger.new_logger(kmf, verbose)
         profile = TimingProfile()
         total_t0 = profile.start()
+
+        if pair_density_eval_grid is None:
+            pair_density_eval_grid = self.pair_density_eval_grid
+        pair_density_eval_grid = normalize_pair_density_eval_grid(
+            pair_density_eval_grid
+        )
+        if pair_density_becke_grid_level is None:
+            pair_density_becke_grid_level = (
+                self.pair_density_becke_grid_level
+            )
+        pair_density_becke_grid_level = (
+            normalize_pair_density_becke_grid_level(
+                pair_density_becke_grid_level
+            )
+        )
 
         phase_t0 = profile.start()
         self.set_grids(min_fit_points=self.min_points)
@@ -63,12 +123,18 @@ class ExxStructureFactor(StructureFactor):
         kGrid1 = self.grids.kGrid1
         kGrid2 = self.grids.kGrid2
         rptGrid3D = self.grids.RptGrid3D_coarse
+        quadrature_weights = None
+        if pair_density_eval_grid == "becke":
+            pair_grid = pbc_gen_grid.BeckeGrids(kmf.cell)
+            pair_grid.level = pair_density_becke_grid_level
+            pair_grid.build(with_non0tab=False)
+            rptGrid3D = np.asarray(pair_grid.coords)
+            quadrature_weights = np.asarray(pair_grid.weights)
 
         nocc = kmf.cell.tot_electrons() // 2
         phase_t0 = profile.start()
         uKpts1 = build_uKpts(kmf, kGrid1, self.mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nocc)
         uKpts2 = build_uKpts(kmf, kGrid2, self.mo_coeff_kpts2, rptGrid3D=rptGrid3D, nbands=nocc)
-        conj_uKpts1 = np.conj(uKpts1)
         profile.stop("uKpts construction", phase_t0)
 
         phase_t0 = profile.start()
@@ -79,9 +145,12 @@ class ExxStructureFactor(StructureFactor):
         Lvec_real = kmf.cell.lattice_vectors()
         L_delta = Lvec_real / NsCell[:, None]
         dvol = np.abs(np.linalg.det(L_delta))
+        quadrature_product_scale = (
+            dvol**2 if pair_density_eval_grid == "uniform" else 1.0
+        )
 
         nqG = qG_full.shape[0]
-        nG = np.prod(NsCell)
+        nG = rptGrid3D.shape[0]
         print("ExxStructureFactor nG: ", nG)
         print("ExxStructureFactor nqG: ", nqG)
         SqG_full = np.zeros(nqG, dtype=np.float64)
@@ -118,15 +187,19 @@ class ExxStructureFactor(StructureFactor):
 
             region_t0 = profile.start()
             u2 = uKpts2[idx_kpt2s] * exp_terms[:, None, :]
+            if quadrature_weights is not None:
+                u2 *= quadrature_weights[None, None, :]
             profile.stop("pair-density orbital setup", region_t0)
 
             region_t0 = profile.start()
-            rho12 = conj_uKpts1 @ u2.transpose(0, 2, 1)
+            rho12 = np.conj(uKpts1) @ u2.transpose(0, 2, 1)
             profile.stop("pair-density matrix multiply", region_t0)
 
             region_t0 = profile.start()
             rho12 = np.abs(rho12) ** 2
-            SqG_full[qG] = np.sum(rho12) * dvol**2 / nkpts
+            SqG_full[qG] = (
+                np.sum(rho12) * quadrature_product_scale / nkpts
+            )
             profile.stop("pair-density square/reduction", region_t0)
 
         profile.stop("main qG loop (inclusive)", loop_t0)

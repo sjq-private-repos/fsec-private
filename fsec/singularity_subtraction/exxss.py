@@ -5,6 +5,10 @@ from fsec.singularity_subtraction import model_function
 # import traceback
 from fsec.singularity_subtraction.function_fitting import ExxScipyMinimize, ExxScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import ExxStructureFactor
+from fsec.singularity_subtraction.structure_factor.exx_sf import (
+    normalize_pair_density_becke_grid_level,
+    normalize_pair_density_eval_grid,
+)
 from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts as _build_uKpts
 from fsec.singularity_subtraction import SingularitySubtraction
 
@@ -53,6 +57,11 @@ class ExxSS(SingularitySubtraction):
             sq_ke_cutoff (float or None): kecutoff to control real space grid for the structure factor calculation. 
             sq_inversion_symm (bool): Whether to enforce inversion symmetry in the structure factor. Default is True.
             line_sampling (bool): Whether to sample q+G along reciprocal-lattice directions only. Default is False.
+            pair_density_eval_grid (str): Real-space quadrature grid used for
+                pair-density overlaps. Supported values are "uniform" and
+                "becke". Default is "becke".
+            pair_density_becke_grid_level (int): PySCF periodic Becke grid
+                level. Default is 0.
         """
 
 
@@ -91,6 +100,14 @@ class ExxSS(SingularitySubtraction):
         self.sq_ke_cutoff = kwargs.get('sq_ke_cutoff', None) 
         self.sq_inversion_symm = kwargs.get('sq_inversion_symm', True)
         self.line_sampling = kwargs.get('line_sampling', False)
+        self.pair_density_eval_grid = normalize_pair_density_eval_grid(
+            kwargs.get('pair_density_eval_grid', 'becke')
+        )
+        self.pair_density_becke_grid_level = (
+            normalize_pair_density_becke_grid_level(
+                kwargs.get('pair_density_becke_grid_level', 0)
+            )
+        )
 
         if self.sq_ke_cutoff is not None:
             print("sq_ke_cutoff provided to ExxSS, overriding N_local")
@@ -121,7 +138,9 @@ class ExxSS(SingularitySubtraction):
                                                             line_sampling=(
                                                                 self.line_sampling
                                                                 and self.qG_norm_cutoff is not None
-                                                            ))
+                                                            ),
+                                                            pair_density_eval_grid=self.pair_density_eval_grid,
+                                                            pair_density_becke_grid_level=self.pair_density_becke_grid_level)
 
         self.SqG = self.structure_factor.build_structure_factor()
 
@@ -287,7 +306,9 @@ class ExxSS(SingularitySubtraction):
         temp_structure_factor = ExxStructureFactor(self.kmf, self.N_local,self.sq_ke_cutoff,
                                                             self.qG_norm_cutoff,
                                                             min_points=self.min_points,
-                                                            sq_inversion_symm=self.sq_inversion_symm)
+                                                            sq_inversion_symm=self.sq_inversion_symm,
+                                                            pair_density_eval_grid=self.pair_density_eval_grid,
+                                                            pair_density_becke_grid_level=self.pair_density_becke_grid_level)
         temp_SqG = temp_structure_factor.build_structure_factor()
         temp_qG_grid = temp_structure_factor.grids.qG_grid_truncated
 
@@ -373,7 +394,9 @@ class ExxSSQuarticExponential(ExxSS):
             temp_structure_factor = ExxStructureFactor(self.kmf, self.N_local,self.sq_ke_cutoff,
                                                                 self.qG_norm_cutoff,
                                                                 min_points=self.min_points,
-                                                                sq_inversion_symm=self.sq_inversion_symm)
+                                                                sq_inversion_symm=self.sq_inversion_symm,
+                                                                pair_density_eval_grid=self.pair_density_eval_grid,
+                                                                pair_density_becke_grid_level=self.pair_density_becke_grid_level)
             temp_SqG = temp_structure_factor.build_structure_factor()
             temp_qG_grid = temp_structure_factor.grids.qG_grid_truncated
 

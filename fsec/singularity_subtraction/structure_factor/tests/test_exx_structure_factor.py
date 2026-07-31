@@ -40,7 +40,13 @@ class KnownValues(unittest.TestCase):
         cls.N_local = cls.kmf.cell.cutoff_to_mesh(cls.sq_ke_cutoff)
 
     def test_build_structure_factor_10_closest_qg_points(self):
-        exx_sf = ExxStructureFactor(self.kmf, N_local=self.N_local, qG_cutoff=None, min_points=10)
+        exx_sf = ExxStructureFactor(
+            self.kmf,
+            N_local=self.N_local,
+            qG_cutoff=None,
+            min_points=10,
+            pair_density_eval_grid="uniform",
+        )
         SqG = exx_sf.build_structure_factor()
         qG = exx_sf.grids.qG_grid_truncated
 
@@ -76,6 +82,62 @@ class KnownValues(unittest.TestCase):
         ]
         for actual, reference in zip(SqG_10, reference_SqG_10):
             self.assertAlmostEqual(actual, reference, places=8)
+
+    def test_build_structure_factor_10_closest_qg_points_becke_level0(self):
+        exx_sf = ExxStructureFactor(
+            self.kmf,
+            N_local=self.N_local,
+            qG_cutoff=None,
+            min_points=10,
+            pair_density_eval_grid="becke",
+            pair_density_becke_grid_level=0,
+        )
+        SqG = exx_sf.build_structure_factor()
+        qG = exx_sf.grids.qG_grid_truncated
+
+        self.assertEqual(exx_sf.pair_density_eval_grid, "becke")
+        self.assertEqual(exx_sf.pair_density_becke_grid_level, 0)
+        self.assertEqual(len(SqG), len(qG))
+        self.assertTrue(np.all(np.isfinite(SqG)))
+        self.assertTrue(np.isrealobj(SqG))
+
+        qG_norm = np.linalg.norm(qG, axis=1)
+        idx10 = np.lexsort(
+            (qG[:, 2], qG[:, 1], qG[:, 0], qG_norm)
+        )[:10]
+        qG_10 = qG[idx10]
+        SqG_10 = SqG[idx10]
+
+        reference_qG_10 = [
+            [0.0, 0.0, 0.0],
+            [-1.0471975511965976, 0.0, 0.0],
+            [0.0, -1.0471975511965976, 0.0],
+            [0.0, 0.0, -1.0471975511965976],
+            [0.0, 0.0, 1.0471975511965976],
+            [0.0, 1.0471975511965976, 0.0],
+            [1.0471975511965976, 0.0, 0.0],
+            [-1.0471975511965976, -1.0471975511965976, 0.0],
+            [-1.0471975511965976, 0.0, -1.0471975511965976],
+            [-1.0471975511965976, 0.0, 1.0471975511965976],
+        ]
+        reference_SqG_10 = [
+            1.025594044491799,
+            0.32080246854753114,
+            0.32080246854757505,
+            0.1410420306642308,
+            0.1410420306642308,
+            0.32080246854757505,
+            0.32080246854753114,
+            0.1343308340579883,
+            0.05359100249973835,
+            0.053591002499736945,
+        ]
+
+        np.testing.assert_allclose(qG_10, reference_qG_10, atol=1e-12)
+        np.testing.assert_allclose(
+            SqG_10, reference_SqG_10, rtol=0.0, atol=1e-8
+        )
+        self.assertAlmostEqual(SqG_10[0], 1.0, delta=3e-2)
 
     def test_build_structure_factor_with_line_sampling(self):
         exx_sf = ExxStructureFactor(
