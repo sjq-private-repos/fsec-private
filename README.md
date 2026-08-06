@@ -69,6 +69,30 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## MP2SS correlation variants
+
+`MP2SSOptions` keeps ordinary MP2 as the default and accepts case-insensitive
+aliases for SOS-MP2, SCS-MP2, SCS-MI-MP2, kappa-MP2, sigma-MP2, and
+sigma-squared-MP2. Regularized methods use the defaults
+`kappa=1.1 Eh^-1`, `sigma=0.7 Eh^-1`, and `sigma2=0.4 Eh^-2`; pass a
+non-negative `regularization_strength` to override one.
+
+```python
+from fsec.singularity_subtraction import MP2SS, MP2SSOptions
+
+options = MP2SSOptions(
+    correlation_method="kappa-MP2",
+    regularization_strength=1.1,
+)
+mp2ss = MP2SS(kmf, kmp, t2=t2, options=options)
+mp2ss.compute_correction()
+print(mp2ss.e_corr_uncorrected, mp2ss.e_corr_corrected)
+```
+
+The spin-only presets use `(cOS, cSS) = (1.3, 0)`, `(1.2, 1/3)`, and
+`(0.40, 1.29)` for SOS, SCS, and SCS-MI MP2, respectively. These options
+remain restricted to gapped closed-shell references.
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,

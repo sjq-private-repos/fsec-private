@@ -7,9 +7,13 @@ import time
 from fsec.singularity_subtraction import model_function
 from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
+from fsec.singularity_subtraction.structure_factor.mp2_sf import (
+    compute_mp2_variant_energies,
+)
 from fsec.singularity_subtraction.structure_factor.mp2_smallq import MP2SmallQ
 from fsec.singularity_subtraction.grids import MP2SSGrids
 from fsec.singularity_subtraction import SingularitySubtraction
+from fsec.singularity_subtraction.mp2_variants import get_mp2_variant
 from pyscf.pbc import df
 from pyscf import lib
 import numpy as np
@@ -176,6 +180,15 @@ class MP2SSOptions:
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
+    correlation_method
+        Correlation method or regularization policy. Supported values are
+        ``"mp2"``, ``"sos-mp2"``, ``"scs-mp2"``, ``"scs-mi-mp2"``,
+        ``"kappa-mp2"``, ``"sigma-mp2"``, and ``"sigma2-mp2"`` plus
+        case-insensitive aliases.
+    regularization_strength
+        Non-negative regularization strength. ``None`` selects the established
+        default for kappa, sigma, or sigma-squared MP2 and is required for
+        spin-only methods.
 
     Notes
     -----
@@ -214,8 +227,14 @@ class MP2SSOptions:
     smallq_band_df: Optional[str] = None
     smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
+    correlation_method: str = 'mp2'
+    regularization_strength: Optional[float] = None
 
     def __post_init__(self):
+        variant = get_mp2_variant(
+            self.correlation_method,
+            self.regularization_strength,
+        )
         pair_density_eval_grid = str(self.pair_density_eval_grid).strip().lower()
         if pair_density_eval_grid not in ('uniform', 'becke'):
             raise ValueError("pair_density_eval_grid must be 'uniform' or 'becke'")
@@ -279,6 +298,12 @@ class MP2SSOptions:
             self, 'laplace_exchange_max_points', laplace_exchange_max_points)
         object.__setattr__(
             self, 'rsdf_occ_block_size', rsdf_occ_block_size)
+        object.__setattr__(self, 'correlation_method', variant.name)
+        object.__setattr__(
+            self,
+            'regularization_strength',
+            variant.regularization_strength,
+        )
 
 
 @dataclass(frozen=True)
@@ -977,6 +1002,66 @@ class MP2SS:
         auxfunc_exchange (model_function.ModelFunction): Auxiliary function for exchange correction
         fit_method (callable): Fitting method for the auxiliary functions.
     """
+
+    @staticmethod
+    def _validate_reference(kmf, kmp):
+        """Reject references outside restricted, closed-shell, gapped MP2SS."""
+        mo_coeff = getattr(kmf, "mo_coeff", None)
+        if isinstance(mo_coeff, tuple) and len(mo_coeff) == 2:
+            raise ValueError(
+                "MP2SS supports restricted closed-shell references only; "
+                "an unrestricted reference was supplied"
+            )
+
+        mo_occ = getattr(kmf, "mo_occ", None)
+        if mo_occ is not None:
+            occ_values = np.asarray(mo_occ).ravel()
+            if occ_values.size and not np.all(
+                    np.isclose(occ_values, 0.0)
+                    | np.isclose(occ_values, 2.0)):
+                raise ValueError(
+                    "MP2SS supports restricted closed-shell references only; "
+                    "the reference has singly occupied orbitals"
+                )
+
+        mo_energy = getattr(kmp, "mo_energy", None)
+        nocc = getattr(kmp, "nocc", None)
+        if mo_energy is None or nocc is None:
+            return
+        if isinstance(mo_energy, (list, tuple)):
+            energy_blocks = mo_energy
+        else:
+            mo_energy_array = np.asarray(mo_energy)
+            energy_blocks = (
+                [mo_energy_array]
+                if mo_energy_array.ndim == 1 and mo_energy_array.dtype != object
+                else [mo_energy_array[index] for index in range(mo_energy_array.shape[0])]
+            )
+        occupied_energies = []
+        virtual_energies = []
+        for energies in energy_blocks:
+            energies = np.asarray(energies)
+            if energies.ndim != 1 or int(nocc) <= 0 or energies.size <= int(nocc):
+                continue
+            occupied = energies[:int(nocc)]
+            virtual = energies[int(nocc):]
+            if occupied.size and virtual.size:
+                occupied_energies.append(occupied)
+                virtual_energies.append(virtual)
+        if occupied_energies:
+            # MP2 denominators couple occupied and virtual states at different
+            # k-points.  The relevant insulating gap is therefore the global
+            # (possibly indirect) gap, not the direct gap at each k-point.
+            valence_maximum = max(np.max(values) for values in occupied_energies)
+            conduction_minimum = min(np.min(values) for values in virtual_energies)
+            minimum_gap = float(conduction_minimum - valence_maximum)
+            if not np.isfinite(minimum_gap) or minimum_gap <= 0.0:
+                raise ValueError(
+                    "MP2SS requires a gapped restricted closed-shell "
+                    "reference; regularized denominators do not enable "
+                    "metallic support"
+                )
+
     def __init__(self, kmf, kmp, auxfunc_direct=None, auxfunc_exchange=None, t2=None,
                  options=None, **kwargs):
         """
@@ -1028,6 +1113,7 @@ class MP2SS:
 
         self.kmf = kmf
         self.kmp = kmp
+        self._validate_reference(kmf, kmp)
         self.cell = kmf.cell
         if self.cell.dimension < 3:
             warnings.warn(
@@ -1039,6 +1125,11 @@ class MP2SS:
         self.nks = get_monkhorst_pack_size(self.cell, kmf.kpts)
         self.t2 = t2
         self.options = options
+        self.variant = get_mp2_variant(
+            options.correlation_method,
+            options.regularization_strength,
+        )
+        self.correlation_method = self.variant.name
         self.auxfunc_direct = auxfunc_direct
         self.auxfunc_exchange = auxfunc_exchange
         
@@ -1191,11 +1282,21 @@ class MP2SS:
 
     def set_structure_factor(self, direct=True, exchange=True, dG0=False,
                              line_sampling=False):
+        # A supplied PySCF t2 is ordinary, unregularized data and belongs to
+        # the caller.  The legacy q-order conversion is in-place, so isolate
+        # that representation before handing it to the structure-factor code.
+        structure_factor_t2 = (
+            None if self.t2 is None else np.array(self.t2, copy=True)
+        )
+        compute_direct = bool(direct and self.variant.direct_scale != 0.0)
+        compute_exchange = bool(exchange and self.variant.exchange_scale != 0.0)
+        compute_q4 = bool(dG0 and self.variant.direct_scale != 0.0)
         mp2_structure_factor = MP2StructureFactor(
-            self.kmf, self.kmp, t2=self.t2, N_local=self.N_local,
+            self.kmf, self.kmp, t2=structure_factor_t2, N_local=self.N_local,
             sq_ke_cutoff=self.sq_ke_cutoff, qG_cutoff=self.qG_norm_cutoff,
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
+            variant=self.variant,
             t2_store_type=self.t2_store_type,
             rsdf_occ_block_size=self.rsdf_occ_block_size,
             laplace=self.laplace,
@@ -1212,7 +1313,8 @@ class MP2SS:
 
         qGrid = mp2_structure_factor.grids.qGrid
         kpts = self.kmp.kpts
-        if self.t2_store_type == 'kikjka':
+        if (self.t2_store_type in ('kikjka', 'kikj')
+                and structure_factor_t2 is not None):
             convert_t2_to_kikjq_format(mp2_structure_factor.t2, kpts, qGrid, self.cell)
 
         qG_full = None
@@ -1220,18 +1322,19 @@ class MP2SS:
             qG_full = mp2_structure_factor.grids.build_qG_line_sampling()
 
         mp2_structure_factor.build_structure_factor(
-            qG_full=qG_full, direct=direct, exchange=exchange, dG0=dG0,
+            qG_full=qG_full, direct=direct, exchange=exchange,
+            dG0=dG0,
             line_sampling_decay_min_fraction=self.line_sampling_decay_min_fraction if line_sampling else None,
             line_sampling_decay_consecutive_below=self.line_sampling_decay_consecutive_below,
             line_sampling_decay_components=self.line_sampling_decay_components if line_sampling else (),
             qG_line_sampling_segments=getattr(mp2_structure_factor.grids, "qG_line_sampling_segments", None),
         )
 
-        if self.t2_store_type == 'kikjka':
+        if self.t2_store_type == 'kikjka' and structure_factor_t2 is not None:
             convert_t2_to_kikjq_format(mp2_structure_factor.t2, kpts, qGrid, self.cell)
 
         self.smallq_result = None
-        if direct and self.smallq_band_df is not None:
+        if compute_direct and self.smallq_band_df is not None:
             smallq = MP2SmallQ(
                 self.kmf,
                 self.kmp,
@@ -1244,6 +1347,7 @@ class MP2SS:
                 pair_density_becke_grid_level=self.pair_density_becke_grid_level,
                 sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
                 outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+                variant=self.variant,
             )
             self.smallq_result = smallq.kernel()
         mp2_structure_factor.smallq_result = self.smallq_result
@@ -1399,6 +1503,13 @@ class MP2SS:
             return result.total_direct_correction
 
     def compute_exchange_correction(self, SqG_full_exchange=None, qG_full=None):
+        if self.variant.exchange_scale == 0.0:
+            self.exchange_integral_term = 0.0
+            self.exchange_quadrature_term = 0.0
+            self.exchange_correction.integral_term = 0.0
+            self.exchange_correction.quadrature_term = 0.0
+            self.exchange_correction.correction = 0.0
+            return 0.0
         if SqG_full_exchange is None:
             SqG_full_exchange = self.mp2_structure_factor.SqG_full_exchange
         if qG_full is None:
@@ -1421,8 +1532,6 @@ class MP2SS:
         self.exchange_quadrature_term = result.exchange_quadrature_term
         return result.total_exchange_correction
 
-
-
     def compute_correction(self,direct=True,exchange=True):
         """
         Compute the direct MP2 correction using singularity subtraction.
@@ -1442,20 +1551,58 @@ class MP2SS:
         SqG_full_exchange = self.mp2_structure_factor.SqG_full_exchange if exchange else None
         qG_full = self.mp2_structure_factor.qG_full
 
-        e_corr_ss = self.kmp.e_corr_ss
-        e_corr_os = self.kmp.e_corr_os
-        self.edi_uncorr = e_corr_os * 2.0
-        self.exi_uncorr = e_corr_ss - e_corr_os
-        self.emp2_uncorr = self.kmp.e_corr
+        if self.variant.is_regularized:
+            # Evaluate the full finite-basis energy with the same masked
+            # reciprocal used by the structure-factor routes.  The helper
+            # contracts one block at a time, so it does not retain a second
+            # full t2 tensor or run another HF calculation.
+            self.edi_uncorr = 0.0
+            self.exi_uncorr = 0.0
+            if direct or exchange:
+                energy_direct, energy_exchange, _ = (
+                    compute_mp2_variant_energies(
+                        self.kmp,
+                        variant=self.variant,
+                        # The existing ``ki`` route intentionally regenerates
+                        # amplitudes rather than consuming a full t2 table.
+                        t2=(self.t2 if self.t2_store_type != 'ki' else None),
+                    )
+                )
+                self.edi_uncorr = energy_direct if direct else 0.0
+                self.exi_uncorr = energy_exchange if exchange else 0.0
+            self.emp2_uncorr = self.edi_uncorr + self.exi_uncorr
+        else:
+            # Keep the established PySCF tags for ordinary MP2 and the
+            # spin-only scaled variants.  The repository's D/X decomposition
+            # is D=2*E_OS and X=E_SS-E_OS.
+            e_corr_ss = self.kmp.e_corr_ss
+            e_corr_os = self.kmp.e_corr_os
+            self.edi_uncorr = self.variant.direct_scale * (e_corr_os * 2.0)
+            self.exi_uncorr = self.variant.exchange_scale * (e_corr_ss - e_corr_os)
+            self.emp2_uncorr = self.edi_uncorr + self.exi_uncorr
+        self.e_corr_uncorrected = self.emp2_uncorr
 
-        mp2ss_direct_correction = self.compute_direct_correction(
-            SqG_full_direct=SqG_full_direct,
-            qG_full=qG_full,
-        )
-        mp2ss_exchange_correction = self.compute_exchange_correction(
-            SqG_full_exchange=SqG_full_exchange,
-            qG_full=qG_full,
-        )
+        if direct:
+            mp2ss_direct_correction = self.compute_direct_correction(
+                SqG_full_direct=SqG_full_direct,
+                qG_full=qG_full,
+            )
+        else:
+            mp2ss_direct_correction = 0.0
+            self.direct_integral_term = 0.0
+            self.direct_quadrature_term = 0.0
+        if exchange and self.variant.exchange_scale != 0.0:
+            mp2ss_exchange_correction = self.compute_exchange_correction(
+                SqG_full_exchange=SqG_full_exchange,
+                qG_full=qG_full,
+            )
+        else:
+            mp2ss_exchange_correction = 0.0
+            self.exchange_integral_term = 0.0
+            self.exchange_quadrature_term = 0.0
+            self.exchange_correction.integral_term = 0.0
+            self.exchange_correction.quadrature_term = 0.0
+            self.exchange_correction.correction = 0.0
 
         total_correction = mp2ss_direct_correction + mp2ss_exchange_correction
         self.mp2ss_total_correction = total_correction
@@ -1464,6 +1611,7 @@ class MP2SS:
         self.emp2ss_direct = self.edi_uncorr + mp2ss_direct_correction
         self.emp2ss_exchange = self.exi_uncorr + mp2ss_exchange_correction
         self.emp2ss = self.emp2ss_direct + self.emp2ss_exchange
+        self.e_corr_corrected = self.emp2ss
 
         self.print_results()
 
@@ -1476,15 +1624,30 @@ class MP2SS:
         return total_correction
     
     def print_results(self):
+        method = getattr(self, "correlation_method", "mp2")
+        variant = getattr(self, "variant", None)
         print(f"=== Results for {self.__class__.__name__} ===")
+        print(
+            f"Correlation method: {method}"
+            + (
+                f" (strength={variant.regularization_strength})"
+                if variant is not None and variant.is_regularized else ""
+            )
+        )
         print(f"Using with_df_ints: {self.with_df_ints}")
         print(f"Using auxiliary function: {self.auxfunc_direct} for direct correction")
         print(f"Using auxiliary function: {self.auxfunc_exchange} for exchange correction")
 
-        print("Uncorrected MP2 Energies:")
-        print(f" MP2 uncorrected direct energy (hartree)   = {self.edi_uncorr}")
-        print(f" MP2 uncorrected exchange energy (hartree) = {self.exi_uncorr}")
-        print(f" MP2 uncorrected total energy (hartree)    = {self.emp2_uncorr}")
+        if method == "mp2":
+            print("Uncorrected MP2 Energies:")
+            print(f" MP2 uncorrected direct energy (hartree)   = {self.edi_uncorr}")
+            print(f" MP2 uncorrected exchange energy (hartree) = {self.exi_uncorr}")
+            print(f" MP2 uncorrected total energy (hartree)    = {self.emp2_uncorr}")
+        else:
+            print("Uncorrected correlation energies:")
+            print(f" {method} direct energy (hartree)   = {self.edi_uncorr}")
+            print(f" {method} exchange energy (hartree) = {self.exi_uncorr}")
+            print(f" {method} total energy (hartree)    = {self.emp2_uncorr}")
         print()
 
         if self.correct_q2_q4_separately:
@@ -1496,6 +1659,11 @@ class MP2SS:
         self.exchange_correction.print_results()
 
         print("Final Energies:")
-        print(f" MP2SS direct final energy (hartree)        = {self.emp2ss_direct}")
-        print(f" MP2SS exchange final energy (hartree)      = {self.emp2ss_exchange}")
-        print(f" MP2SS total final energy (hartree)         = {self.emp2ss}")
+        if method == "mp2":
+            print(f" MP2SS direct final energy (hartree)        = {self.emp2ss_direct}")
+            print(f" MP2SS exchange final energy (hartree)      = {self.emp2ss_exchange}")
+            print(f" MP2SS total final energy (hartree)         = {self.emp2ss}")
+        else:
+            print(f" {method}SS direct final energy (hartree)   = {self.emp2ss_direct}")
+            print(f" {method}SS exchange final energy (hartree) = {self.emp2ss_exchange}")
+            print(f" {method}SS total final energy (hartree)    = {self.emp2ss}")

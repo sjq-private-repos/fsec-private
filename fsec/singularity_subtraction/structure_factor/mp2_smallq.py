@@ -24,6 +24,7 @@ from fsec.singularity_subtraction.structure_factor.helpers import TimingProfile
 from fsec.singularity_subtraction.structure_factor.mp2_sf import (
     MP2StructureFactor,
 )
+from fsec.singularity_subtraction.mp2_variants import MP2Variant, get_mp2_variant
 
 
 def normalize_band_df(value):
@@ -235,6 +236,7 @@ class MP2SmallQ:
         pair_density_becke_grid_level=0,
         sq_ke_cutoff_switch_radius=None,
         outer_sq_ke_cutoff_scale=0.5,
+        variant=None,
         verbose=None,
     ):
         self.kmf = kmf
@@ -257,6 +259,11 @@ class MP2SmallQ:
         self.pair_density_becke_grid_level = pair_density_becke_grid_level
         self.sq_ke_cutoff_switch_radius = sq_ke_cutoff_switch_radius
         self.outer_sq_ke_cutoff_scale = outer_sq_ke_cutoff_scale
+        if variant is None:
+            variant = get_mp2_variant()
+        elif not isinstance(variant, MP2Variant):
+            raise TypeError("variant must be an MP2Variant or None")
+        self.variant = variant
         self.verbose = verbose
         self.result = None
         self.smallq_structure_factor = None
@@ -589,6 +596,7 @@ class MP2SmallQ:
             pair_density_becke_grid_level=self.pair_density_becke_grid_level,
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
             outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+            variant=self.variant,
         )
         profile.stop("structure-factor setup", phase_t0)
 

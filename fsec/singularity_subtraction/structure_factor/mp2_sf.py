@@ -39,12 +39,13 @@ from fsec.singularity_subtraction.structure_factor.mp2_rsdf_direct_helpers impor
     is_direct_rsdf,
     validate_direct_rsdf_structure_factor,
 )
+from fsec.singularity_subtraction.mp2_variants import MP2Variant, get_mp2_variant
 
 
 
 def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=None,
                           skip_if_no_qpt=False, mode='direct', Lov=None, verbose=logger.DEBUG,
-                          return_eijab_recip=False, with_t2=True):
+                          return_eijab_recip=False, with_t2=True, variant=None):
     """Computes k-point RMP2 energy.
 
     Args:
@@ -68,6 +69,10 @@ def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=Non
     """
     if mode not in ['direct', 'exchange']:
         raise ValueError(f"Mode {mode} not recognized. Must be 'direct' or 'exchange'.")
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
     if not with_t2:
         return_eijab_recip = True
     profile = TimingProfile()
@@ -223,7 +228,18 @@ def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=Non
                 ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kvirt2])[n0_ovp_jb]
 
                 eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
-                eijab_recip_ijab = 1 / eijab
+                active_ia = np.zeros((nocc, nvir), dtype=bool)
+                active_jb = np.zeros((nocc, nvir), dtype=bool)
+                active_ia[n0_ovp_ia] = True
+                active_jb[n0_ovp_jb] = True
+                active_eijab = (
+                    active_ia[:, None, :, None]
+                    & active_jb[None, :, None, :]
+                )
+                eijab_recip_ijab = variant.reciprocal(
+                    eijab,
+                    active_mask=active_eijab,
+                )
                 profile.stop("compute_t2 denominator reciprocal", region_t0)
                 if return_eijab_recip:
                     region_t0 = profile.start()
@@ -262,14 +278,146 @@ def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=Non
     return t2
 
 
+def compute_mp2_variant_energies(kmp, variant=None, t2=None):
+    """Compute exact finite-basis energies for a resolved MP2 variant.
+
+    The contraction follows PySCF's restricted k-point MP2 energy kernel, but
+    evaluates the method reciprocal through :class:`MP2Variant`.  Only one
+    ``oovv`` block and one temporary amplitude block are kept at a time, so
+    this is useful for ``ki`` and Lov-backed structure-factor routes as well
+    as for the full route.  If ``t2`` is supplied it is interpreted as the
+    ordinary, unregularized PySCF tensor and is damped in a temporary block.
+
+    Returns
+    -------
+    tuple
+        ``(direct_energy, exchange_energy, total_energy)`` after the
+        variant's direct and exchange scales have been applied.
+    """
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
+    if variant.is_regularized and variant.regularization_strength == 0.0:
+        return 0.0, 0.0, 0.0
+
+    mo_coeff, mo_energy = kmp2._add_padding(
+        kmp, kmp.mo_coeff, kmp.mo_energy)
+    nmo = kmp.nmo
+    nocc = kmp.nocc
+    nvir = nmo - nocc
+    nkpts = kmp.nkpts
+    with_df_ints = (
+        kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF))
+    Lov = kmp2._init_mp_df_eris(kmp) if with_df_ints else None
+    fao2mo = kmp._scf.with_df.ao2mo
+    kconserv = kmp.khelper.kconserv
+    nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(
+        kmp, kind="split")
+    mo_e_o = [np.asarray(mo_energy[k][:nocc]) for k in range(nkpts)]
+    mo_e_v = [np.asarray(mo_energy[k][nocc:]) for k in range(nkpts)]
+
+    def oovv_block(ki, kj, ka, kb):
+        if with_df_ints:
+            return (1.0 / nkpts) * einsum(
+                "Lia,Ljb->iajb",
+                Lov[ki, ka],
+                Lov[kj, kb],
+            ).transpose(0, 2, 1, 3)
+        orbo_i = mo_coeff[ki][:, :nocc]
+        orbo_j = mo_coeff[kj][:, :nocc]
+        orbv_a = mo_coeff[ka][:, nocc:]
+        orbv_b = mo_coeff[kb][:, nocc:]
+        return fao2mo(
+            (orbo_i, orbv_a, orbo_j, orbv_b),
+            (kmp.kpts[ki], kmp.kpts[ka], kmp.kpts[kj], kmp.kpts[kb]),
+            compact=False,
+        ).reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3) / nkpts
+
+    def denominator_block(ki, kj, ka, kb):
+        eia = LARGE_DENOM * np.ones(
+            (nocc, nvir), dtype=mo_energy[0].dtype)
+        active_ia = np.zeros((nocc, nvir), dtype=bool)
+        ia_indices = np.ix_(
+            nonzero_opadding[ki], nonzero_vpadding[ka])
+        eia[ia_indices] = (
+            mo_e_o[ki][:, None] - mo_e_v[ka])[ia_indices]
+        active_ia[ia_indices] = True
+
+        ejb = LARGE_DENOM * np.ones(
+            (nocc, nvir), dtype=mo_energy[0].dtype)
+        active_jb = np.zeros((nocc, nvir), dtype=bool)
+        jb_indices = np.ix_(
+            nonzero_opadding[kj], nonzero_vpadding[kb])
+        ejb[jb_indices] = (
+            mo_e_o[kj][:, None] - mo_e_v[kb])[jb_indices]
+        active_jb[jb_indices] = True
+        denominator = lib.direct_sum("ia,jb->ijab", eia, ejb)
+        active = (
+            active_ia[:, None, :, None]
+            & active_jb[None, :, None, :]
+        )
+        return denominator, active
+
+    direct_energy = 0.0
+    exchange_energy = 0.0
+    for ki in range(nkpts):
+        for kj in range(nkpts):
+            for ka in range(nkpts):
+                kb = kconserv[ki, ka, kj]
+                oovv = oovv_block(ki, kj, ka, kb)
+                denominator, active = denominator_block(ki, kj, ka, kb)
+                if t2 is None:
+                    amplitudes = np.conj(oovv) * variant.reciprocal(
+                        denominator, active_mask=active)
+                else:
+                    ordinary_amplitudes = np.asarray(t2[ki, kj, ka])
+                    if ordinary_amplitudes.shape != denominator.shape:
+                        raise ValueError(
+                            "supplied t2 block has an incompatible shape")
+                    amplitudes = ordinary_amplitudes * variant.damping(
+                        denominator, active_mask=active)
+
+                if variant.direct_scale != 0.0:
+                    direct_energy += 2.0 * np.einsum(
+                        "ijab,ijab->",
+                        amplitudes,
+                        oovv,
+                        optimize=True,
+                    ).real
+                if variant.exchange_scale != 0.0:
+                    # Swapping the two virtual labels gives the exchange
+                    # integral block used by PySCF's E_SS - E_OS term.
+                    exchange_oovv = oovv_block(ki, kj, kb, ka)
+                    exchange_energy -= np.einsum(
+                        "ijab,ijba->",
+                        amplitudes,
+                        exchange_oovv,
+                        optimize=True,
+                    ).real
+
+    direct_energy *= variant.direct_scale / nkpts
+    exchange_energy *= variant.exchange_scale / nkpts
+    return direct_energy, exchange_energy, direct_energy + exchange_energy
+
+
 class MP2StructureFactor(StructureFactor):
-    def __init__(self, kmf, kmp, t2=None, N_local=None, sq_ke_cutoff=None, qG_cutoff=None, relative_shift=0.0, **kwargs):
+    def __init__(self, kmf, kmp, t2=None, N_local=None, sq_ke_cutoff=None,
+                 qG_cutoff=None, relative_shift=0.0, variant=None, **kwargs):
         """
         Initialize the structure factor with mean-field object (mf), density matrix (dm), cell, and optional parameters.
         """
         self.kmf = kmf
         self.kmp = kmp
         self.t2 = t2
+        if variant is None:
+            variant = get_mp2_variant(
+                kwargs.pop('correlation_method', 'mp2'),
+                kwargs.pop('regularization_strength', None),
+            )
+        elif not isinstance(variant, MP2Variant):
+            raise TypeError("variant must be an MP2Variant or None")
+        self.variant = variant
         self.kGrid1 = minimum_image(kmf.cell, kwargs.get('kGrid1', kmf.kpts))
         self.kGrid2 = kwargs.get('kGrid2', None)
         self.min_points = kwargs.get('min_points', 6)
@@ -319,7 +467,7 @@ class MP2StructureFactor(StructureFactor):
         if self.laplace_exchange_max_points < 1:
             raise ValueError("laplace_exchange_max_points must be positive")
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
-        
+
     @staticmethod
     def surviving_mo_energy(mmp):
         """Return mo_energy with frozen orbitals removed, per k-point.
@@ -433,6 +581,9 @@ class MP2StructureFactor(StructureFactor):
         
         if not direct and not exchange and not dG0:
             raise ValueError("Either direct or exchange or dG0 must be requested")
+        direct = bool(direct and self.variant.direct_scale != 0.0)
+        exchange = bool(exchange and self.variant.exchange_scale != 0.0)
+        dG0 = bool(dG0 and self.variant.direct_scale != 0.0)
         
         phase_t0 = profile.start()
         mo_coeff_padded, mo_energy_padded = kmp2._add_padding(
@@ -450,6 +601,44 @@ class MP2StructureFactor(StructureFactor):
         
         if qG_cutoff is None:
             qG_cutoff = self.qG_cutoff
+
+        if not direct and not exchange and not dG0:
+            # A zero-scale request is a valid no-op (for example, the SOS
+            # exchange component).  Return the same result shape without
+            # entering any contraction route or constructing exchange data.
+            qG_full = np.asarray(qG_full)
+            if qG_cutoff is not None:
+                keep = np.linalg.norm(qG_full, axis=1) < float(qG_cutoff) + 1e-8
+                qG_full = qG_full[keep]
+            zeros = np.zeros(qG_full.shape[0], dtype=float)
+            masks = np.ones(qG_full.shape[0], dtype=bool)
+            result = {
+                'SqG_full_direct': zeros.copy(),
+                'SqG_full_exchange': zeros.copy(),
+                'SqG_full_q4': zeros.copy(),
+                'SqG_full_direct_mask': masks.copy(),
+                'SqG_full_exchange_mask': masks.copy(),
+                'SqG_full_q4_mask': masks.copy(),
+                'line_sampling_decay_events': [],
+                'sq_ke_cutoff_by_qG': None,
+                'N_local_by_region': {},
+                'qG_full': qG_full,
+                'direct_rsdf_block_stats': None,
+            }
+            if update_class:
+                self.SqG_full_direct = result['SqG_full_direct']
+                self.SqG_full_exchange = result['SqG_full_exchange']
+                self.SqG_full_q4 = result['SqG_full_q4']
+                self.SqG_full_direct_mask = result['SqG_full_direct_mask']
+                self.SqG_full_exchange_mask = result['SqG_full_exchange_mask']
+                self.SqG_full_q4_mask = result['SqG_full_q4_mask']
+                self.line_sampling_decay_events = []
+                self.qG_full = qG_full
+                self.sq_ke_cutoff_by_qG = None
+                self.N_local_by_region = {}
+                self.direct_rsdf_block_stats = None
+            self.last_build_timings = profile.summary(total_t0)
+            return result
 
         if sq_ke_cutoff_switch_radius is None:
             sq_ke_cutoff_switch_radius = self.sq_ke_cutoff_switch_radius
@@ -499,6 +688,14 @@ class MP2StructureFactor(StructureFactor):
             t2_store_type = self.t2_store_type
         if rsdf_occ_block_size is None:
             rsdf_occ_block_size = self.rsdf_occ_block_size
+
+        # The class-level t2 is the normal public constructor path. Promote
+        # it to the local argument so supplied amplitudes are recognized as
+        # supplied (in particular, regularized variants can apply damping).
+        # The low-memory ``ki`` route deliberately regenerates amplitudes and
+        # therefore ignores a precomputed t2 table.
+        if t2 is None and self.t2 is not None and t2_store_type != 'ki':
+            t2 = self.t2
         
         kGrid1 = grids.kGrid1 # occupied
         kGrid2 = grids.kGrid2 # virtual
@@ -558,9 +755,15 @@ class MP2StructureFactor(StructureFactor):
                 Lov_b = Lov if Lov_b is None else Lov_b
                 profile.stop("DF Lov initialization", phase_t0)
                 print("Using Lov-backed kikj contractions without materializing t2.")
-            if (direct or exchange or dG0) and self.laplace:
+            use_laplace = self.laplace and self.variant.supports_laplace
+            if (direct or exchange or dG0) and use_laplace:
                 print(
                     "Using minimax Laplace denominators for all terms."
+                )
+            elif (direct or exchange or dG0) and self.laplace:
+                print(
+                    "Using exact denominators: the selected regularizer "
+                    "does not have a separable Laplace form."
                 )
             t2_required = False
         elif not direct and not exchange:
@@ -572,7 +775,12 @@ class MP2StructureFactor(StructureFactor):
                 # NOTE: t2 MUST be in the kikjq format
                 if self.t2 is None:
                     phase_t0 = profile.start()
-                    t2 = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff) # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
+                    t2 = compute_t2_amplitudes(
+                        self.kmp,
+                        self.kmp.mo_energy,
+                        self.kmp.mo_coeff,
+                        variant=self.variant,
+                    ) # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
                     profile.stop("full t2 construction", phase_t0)
                 else:
                     t2 = self.t2
@@ -792,6 +1000,7 @@ class MP2StructureFactor(StructureFactor):
         # Precomoute the qpis
         qpis_full = None
         eijab_full = None
+        t2_damping_full = None
         if t2_store_type == 'kikjka':
             # precompute qp and eijab for all q, ki, kj.
             # Results in qpis_full and eijab_full which are both O(Nk^3)
@@ -806,18 +1015,147 @@ class MP2StructureFactor(StructureFactor):
                 qpis_full = qpis_full.reshape(nkpts,nkpts,nkpts)
                 qpis_full = qpis_full.transpose(2,0,1) # q', ki, kj
             
-            # Compute Delta E matrix for q, ki, kj.
+            # Compute the method-specific reciprocal denominator for q, ki,
+            # kj.  Padding is selected explicitly before any regularizer is
+            # evaluated; LARGE_DENOM is never exponentiated.
             eijab_full = np.zeros((nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=mo_energy[0][0].dtype)
+            if t2_given and self.variant.is_regularized:
+                t2_damping_full = np.zeros_like(eijab_full, dtype=float)
             
             for qi in range(nkpts):
                 ka_at_qi = kas[qi]
                 kb_at_qi = kbs[qi]
                 eijab = mo_e_o[:,None,:,None,None,None] + mo_e_o[None,:,None,:,None,None] \
                     -mo_e_v[ka_at_qi,None,None,None,:,None] - mo_e_v_b[None,kb_at_qi,None,None,None,:]
-                eijab_full[qi,:,:,:,:,:,:] = 1/(eijab)
+                active_ia = np.zeros((nkpts, nocc, nvir), dtype=bool)
+                active_jb = np.zeros((nkpts, nocc, nvir), dtype=bool)
+                for ki in range(nkpts):
+                    active_ia[ki][np.ix_(
+                        nonzero_opadding[ki],
+                        nonzero_vpadding[ka_at_qi[ki]],
+                    )] = True
+                for kj in range(nkpts):
+                    active_jb[kj][np.ix_(
+                        nonzero_opadding[kj],
+                        nonzero_vpadding[kb_at_qi[kj]],
+                    )] = True
+                active_eijab = (
+                    active_ia[:, None, :, None, :, None]
+                    & active_jb[None, :, None, :, None, :]
+                )
+                eijab_full[qi] = self.variant.reciprocal(
+                    eijab,
+                    active_mask=active_eijab,
+                )
+                if t2_damping_full is not None:
+                    t2_damping_full[qi] = self.variant.damping(
+                        eijab,
+                        active_mask=active_eijab,
+                    )
             if exchange:
                 kii, kjj = np.indices((nkpts, nkpts))
-                
+
+        # A supplied kikj tensor uses the same q,ki,kj indexing as the full
+        # tensor, so exchange still needs the q' map even though it does not
+        # need the full q-block denominator cache above.
+        if exchange and t2_store_type == 'kikj' and t2_given:
+            qp_pts = np.zeros((nkpts, nkpts, nkpts, 3), dtype=np.float64)
+            qp_pts[:, :, :, :] = (
+                -kGrid1[:, None, None, :]
+                + kGrid1[None, :, None, :]
+                - qGrid[None, None, :, :]
+            )
+            qp_pts = minimum_image(kmf.cell, qp_pts.reshape(-1, 3))
+            _, qpis_full = qtree.query(
+                qp_pts, distance_upper_bound=1e-8)
+            if np.any(qpis_full == len(qGrid)):
+                raise TypeError("Cannot locate qpi in the qmesh.")
+            qpis_full = qpis_full.reshape(nkpts, nkpts, nkpts)
+            qpis_full = qpis_full.transpose(2, 0, 1)
+            kii, kjj = np.indices((nkpts, nkpts))
+
+        def build_method_denominator_blocks(qi):
+            """Build one q block for supplied ordinary t2 damping."""
+            eia = (
+                mo_e_o[:, :, None]
+                - mo_e_v[kas[qi], None, :]
+            )
+            ejb = (
+                mo_e_o[:, :, None]
+                - mo_e_v_b[kbs[qi], None, :]
+            )
+            denominator = (
+                eia[:, None, :, None, :, None]
+                + ejb[None, :, None, :, None, :]
+            )
+            active_ia = np.zeros((nkpts, nocc, nvir), dtype=bool)
+            active_jb = np.zeros((nkpts, nocc, nvir), dtype=bool)
+            for ko in range(nkpts):
+                active_ia[ko][np.ix_(
+                    nonzero_opadding[ko],
+                    nonzero_vpadding[kas[qi, ko]],
+                )] = True
+                active_jb[ko][np.ix_(
+                    nonzero_opadding[ko],
+                    nonzero_vpadding[kbs[qi, ko]],
+                )] = True
+            active = (
+                active_ia[:, None, :, None, :, None]
+                & active_jb[None, :, None, :, None, :]
+            )
+            return (
+                self.variant.reciprocal(denominator, active_mask=active),
+                self.variant.damping(denominator, active_mask=active),
+            )
+
+        supplied_damping_cache = {}
+        supplied_exchange_damping_cache = {}
+
+        def supplied_t2_damping(qi):
+            if not (t2_given and self.variant.is_regularized):
+                return None
+            qi = int(qi)
+            if t2_store_type == 'kikjka':
+                return t2_damping_full[qi]
+            if qi not in supplied_damping_cache:
+                supplied_damping_cache[qi] = build_method_denominator_blocks(qi)[1]
+            return supplied_damping_cache[qi]
+
+        def supplied_exchange_t2_damping(qi):
+            """Return damping for a supplied kikj exchange block."""
+            if not (t2_given and self.variant.is_regularized
+                    and t2_store_type == 'kikj'):
+                return None
+            qi = int(qi)
+            if qi not in supplied_exchange_damping_cache:
+                denominator = (
+                    mo_e_o[:, None, :, None, None, None]
+                    - mo_e_v_b[kbs[qi]][None, :, None, None, :, None]
+                    + mo_e_o[None, :, None, :, None, None]
+                    - mo_e_v[kas[qi]][:, None, None, None, None, :]
+                )
+                active_ib = np.zeros(
+                    (nkpts, nkpts, nocc, nvir), dtype=bool)
+                active_ja = np.zeros(
+                    (nkpts, nkpts, nocc, nvir), dtype=bool)
+                for ki in range(nkpts):
+                    for kj in range(nkpts):
+                        active_ib[ki, kj][np.ix_(
+                            nonzero_opadding[ki],
+                            nonzero_vpadding[kbs[qi, kj]],
+                        )] = True
+                        active_ja[ki, kj][np.ix_(
+                            nonzero_opadding[kj],
+                            nonzero_vpadding[kas[qi, ki]],
+                        )] = True
+                active = (
+                    active_ib[:, :, :, None, :, None]
+                    & active_ja[:, :, None, :, None, :]
+                )
+                supplied_exchange_damping_cache[qi] = self.variant.damping(
+                    denominator, active_mask=active)
+            return supplied_exchange_damping_cache[qi]
+
         contract_expression_rijab = 'mia,nbj->mnijab'
         use_trs_unique_pair_rijab = (
             kgrid_occ_trs and trs_map is not None and check_trs
@@ -873,7 +1211,7 @@ class MP2StructureFactor(StructureFactor):
                 sq_inversion_symm=self.sq_inversion_symm,
                 inversion_partner=inversion_partner,
                 requested_block_size=rsdf_occ_block_size,
-                laplace=self.laplace,
+                laplace=use_laplace,
                 laplace_direct_tol=self.laplace_direct_tol,
                 laplace_direct_max_points=self.laplace_direct_max_points,
                 laplace_exchange_tol=self.laplace_exchange_tol,
@@ -888,6 +1226,7 @@ class MP2StructureFactor(StructureFactor):
                 exchange_decay_state=exchange_decay_state,
                 profile=profile,
                 log=log,
+                variant=self.variant,
             )
             num_equiv_qG = direct_rsdf_stats[0]
             qG_loop_indices = ()
@@ -940,12 +1279,17 @@ class MP2StructureFactor(StructureFactor):
             conj_uKpts_i = mesh_context['conj_uKpts_i']
             qi = qi_map[qG]
             qpt = qGrid[qi]
-            if compute_exchange and t2_store_type == 'kikjka':
+            if compute_exchange and (
+                    t2_store_type == 'kikjka'
+                    or (t2_store_type == 'kikj' and t2_given)):
                 qpis = qpis_full[qi] # nkpts x nkpts.
 
             t2_qi = None
             if t2_required and t2_store_type == 'kikjka':  
                 t2_qi = t2[qi]
+                damping_qi = supplied_t2_damping(qi)
+                if damping_qi is not None:
+                    t2_qi = t2_qi * damping_qi
 
             kptas = kGrid1 + qGpt
             kptbs = kGrid1 - qGpt
@@ -1091,11 +1435,37 @@ class MP2StructureFactor(StructureFactor):
                         region_t0 = profile.start()
                         eijab_ki = mo_e_o[ki,None,:,None,None,None] + mo_e_o[:,None,:,None,None] \
                             -mo_e_v[ka,None,None,None,:,None] - mo_e_v_b[kbs_at_qi,None,None,None,:]
+                        active_ia = np.zeros((nocc, nvir), dtype=bool)
+                        active_ia[np.ix_(
+                            nonzero_opadding[ki],
+                            nonzero_vpadding[ka],
+                        )] = True
+                        active_jb = np.zeros((nkpts, nocc, nvir), dtype=bool)
+                        for kj in range(nkpts):
+                            active_jb[kj][np.ix_(
+                                nonzero_opadding[kj],
+                                nonzero_vpadding[kbs_at_qi[kj]],
+                            )] = True
+                        active_eijab_ki = (
+                            active_ia[None, :, None, :, None]
+                            & active_jb[:, None, :, None, :]
+                        )
+                        if self.variant.is_regularized:
+                            eijab_recip_ki = self.variant.reciprocal(
+                                eijab_ki,
+                                active_mask=active_eijab_ki,
+                            )
+                        else:
+                            # Preserve the legacy ordinary-MP2 low-memory
+                            # arithmetic, including its harmless padded
+                            # 1/LARGE_DENOM entries.  Regularized methods
+                            # take the masked policy path above.
+                            eijab_recip_ki = 1.0 / eijab_ki
                         profile.stop("energy denominators (ki path)", region_t0)
 
                     if compute_direct:
                         region_t0 = profile.start()
-                        t2_ki = np.conj(oovv_ij / eijab_ki) # kj, i, j, a, b
+                        t2_ki = np.conj(oovv_ij) * eijab_recip_ki # kj, i, j, a, b
                         temp_SqG_k = 2 * pyscf_einsum('nijab,nijab->', rijab_ki, t2_ki) 
                         SqG_full_direct[qG] += temp_SqG_k.real / nkpts
                         profile.stop("direct contraction (ki path)", region_t0)
@@ -1103,13 +1473,45 @@ class MP2StructureFactor(StructureFactor):
                         region_t0 = profile.start()
                         eijba_ki = mo_e_o[ki,None,:,None,None,None] + mo_e_o[:,None,:,None,None] \
                             -mo_e_v_b[kbs_at_qi,None,None,:,None] - mo_e_v[ka,None,None,None,None,:]
-                        t2_ki_x = np.conj(oovv_ji / eijba_ki) # kj, i, j, a, b
+                        active_ib = np.zeros((nocc, nvir), dtype=bool)
+                        active_ib[np.ix_(
+                            nonzero_opadding[ki],
+                            nonzero_vpadding[kbs_at_qi[ki]],
+                        )] = True
+                        active_ja = np.zeros((nkpts, nocc, nvir), dtype=bool)
+                        for kj in range(nkpts):
+                            active_ja[kj][np.ix_(
+                                nonzero_opadding[kj],
+                                nonzero_vpadding[ka],
+                            )] = True
+                        active_eijba_ki = (
+                            active_ib[None, :, None, :, None]
+                            & active_ja[:, None, :, None, :]
+                        )
+                        if self.variant.is_regularized:
+                            eijba_recip_ki = self.variant.reciprocal(
+                                eijba_ki,
+                                active_mask=active_eijba_ki,
+                            )
+                        else:
+                            eijba_recip_ki = 1.0 / eijba_ki
+                        t2_ki_x = np.conj(oovv_ji) * eijba_recip_ki # kj, i, j, a, b
                         temp_SqG_k = - pyscf_einsum('nijab,nijba->', rijab_ki, t2_ki_x) 
                         SqG_full_exchange[qG] += temp_SqG_k.real / nkpts
                         profile.stop("exchange contraction (ki path)", region_t0)
                     if compute_q4:
                         region_t0 = profile.start()
-                        temp_SqG_k =  2 * np.sum(np.abs(rijab_ki)**2 / eijab_ki)
+                        if self.variant.is_regularized:
+                            temp_SqG_k = -2 * np.sum(
+                                np.abs(rijab_ki)**2
+                                * self.variant.absolute_reciprocal(
+                                    eijab_ki,
+                                    active_mask=active_eijab_ki,
+                                )
+                            )
+                        else:
+                            temp_SqG_k = 2 * np.sum(
+                                np.abs(rijab_ki)**2 / eijab_ki)
                         SqG_full_q4[qG] += temp_SqG_k.real / nkpts
                         profile.stop("dG0 contraction (ki path)", region_t0)
 
@@ -1157,7 +1559,8 @@ class MP2StructureFactor(StructureFactor):
                             return_eijab_recip = compute_q4
                             t2_result = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
                                                                     skip_if_no_qpt=True, mode='direct', Lov=Lov, verbose=logger.NOTE,
-                                                                    return_eijab_recip=return_eijab_recip)
+                                                                    return_eijab_recip=return_eijab_recip,
+                                                                    variant=self.variant)
                             if return_eijab_recip:
                                 t2_qi, eijab = t2_result
                                 eijab = eijab.transpose(2,0,1,3,4,5,6)
@@ -1174,6 +1577,11 @@ class MP2StructureFactor(StructureFactor):
                             profile.stop("direct t2 cache miss", region_t0)
                     elif kikj_lov:
                         pass
+                    else:
+                        t2_qi = t2[qi]
+                    damping_qi = supplied_t2_damping(qi)
+                    if damping_qi is not None:
+                        t2_qi = t2_qi * damping_qi
                 # Compute t2 exchange for kikj route, or set it based on provided t2
                 if compute_exchange:
                     if t2_store_type == 'kikj' and not t2_given:
@@ -1186,7 +1594,8 @@ class MP2StructureFactor(StructureFactor):
                         else:
                             region_t0 = profile.start()
                             t2_qpi = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                skip_if_no_qpt=True, mode='exchange', Lov=Lov, verbose=logger.NOTE)
+                                                                skip_if_no_qpt=True, mode='exchange', Lov=Lov, verbose=logger.NOTE,
+                                                                variant=self.variant)
                             t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
                             t2_qpi = t2_qpi[0]
                             if int(qi) in repeated_qis:
@@ -1198,6 +1607,13 @@ class MP2StructureFactor(StructureFactor):
                     else:
                         region_t0 = profile.start()
                         t2_qpi = t2[qpis, kii, kjj]
+                        if t2_damping_full is not None:
+                            t2_qpi = t2_qpi * t2_damping_full[
+                                qpis, kii, kjj]
+                        else:
+                            damping_qpi = supplied_exchange_t2_damping(qi)
+                            if damping_qpi is not None:
+                                t2_qpi = t2_qpi * damping_qpi
                         profile.stop("exchange t2 gather", region_t0)
 
 
@@ -1222,6 +1638,7 @@ class MP2StructureFactor(StructureFactor):
                                     verbose=logger.NOTE,
                                     with_t2=False,
                                     return_eijab_recip=True,
+                                    variant=self.variant,
                                 )
                                 eijab = eijab.transpose(2,0,1,3,4,5,6)
                                 eijab = eijab[0]
@@ -1239,7 +1656,7 @@ class MP2StructureFactor(StructureFactor):
                     if kikj_lov:
                         contraction = (
                             contract_trs_unique_pair_rijab_lov_laplace
-                            if self.laplace
+                            if use_laplace
                             else contract_trs_unique_pair_rijab_lov
                         )
                         laplace_kwargs = (
@@ -1252,7 +1669,7 @@ class MP2StructureFactor(StructureFactor):
                                 'exchange_max_points': (
                                     self.laplace_exchange_max_points),
                             }
-                            if self.laplace else {}
+                            if use_laplace else {}
                         )
                         direct_sum, exchange_sum, q4_weighted_norm = (
                             contraction(
@@ -1273,6 +1690,7 @@ class MP2StructureFactor(StructureFactor):
                                 compute_exchange=compute_exchange,
                                 compute_q4=compute_q4,
                                 profile=profile,
+                                variant=self.variant,
                                 **laplace_kwargs,
                             )
                         )
@@ -1404,6 +1822,12 @@ class MP2StructureFactor(StructureFactor):
                 t2_cache_counts['exchange_hits'], t2_cache_counts['exchange_misses'],
                 cache_mem,
             )
+        # The kernels accumulate the repository's unscaled direct/exchange
+        # decomposition.  Apply method scales once, after every storage route
+        # (including direct-RSDF) has accumulated.  q4 is direct as well.
+        SqG_full_direct *= self.variant.direct_scale
+        SqG_full_q4 *= self.variant.direct_scale
+        SqG_full_exchange *= self.variant.exchange_scale
         if update_class:
             phase_t0 = profile.start()
             self.SqG_full_direct = SqG_full_direct

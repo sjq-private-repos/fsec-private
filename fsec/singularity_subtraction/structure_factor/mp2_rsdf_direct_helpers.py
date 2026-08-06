@@ -15,6 +15,7 @@ from fsec.singularity_subtraction.structure_factor.mp2_contractions import (
     contract_trs_unique_pair_rijab_lov,
     contract_trs_unique_pair_rijab_lov_laplace,
 )
+from fsec.singularity_subtraction.mp2_variants import MP2Variant, get_mp2_variant
 
 
 DIRECT_RSDF_TARGET_COMMIT = "5843306770f1df0ba9fb3f5a95c9b267683f2f86"
@@ -198,8 +199,12 @@ def accumulate_direct_rsdf_occ_blocks(
         laplace_exchange_tol, laplace_exchange_max_points,
         SqG_full_direct, SqG_full_exchange, SqG_full_q4,
         SqG_full_direct_mask, SqG_full_exchange_mask, SqG_full_q4_mask,
-        q4_decay_state, exchange_decay_state, profile, log):
+        q4_decay_state, exchange_decay_state, profile, log, variant=None):
     """Accumulate all occupied-block pairs for the fully direct RSDF route."""
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
     nkpts = int(kmp.nkpts)
     nocc = int(kmp.nocc)
     nvir = int(kmp.nmo - kmp.nocc)
@@ -353,6 +358,7 @@ def accumulate_direct_rsdf_occ_blocks(
                     occ_slice_j=occ_slice_j,
                     Lov_exchange_i=Lov_i,
                     Lov_exchange_j=Lov_j,
+                    variant=variant,
                     **laplace_kwargs,
                 )
                 if block_i != block_j:
@@ -378,6 +384,7 @@ def accumulate_direct_rsdf_occ_blocks(
                         occ_slice_j=occ_slice_i,
                         Lov_exchange_i=Lov_j,
                         Lov_exchange_j=Lov_i,
+                        variant=variant,
                         **laplace_kwargs,
                     )
                     directed_values = tuple(

@@ -55,4 +55,10 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2DirectSS,
     MP2ExchangeSS,
 )
+from fsec.singularity_subtraction.mp2_variants import (
+    MP2Variant,
+    get_mp2_variant,
+    normalize_correlation_method,
+    resolve_mp2_method,
+)
 from fsec.singularity_subtraction.analysis import OriginDiagnostics

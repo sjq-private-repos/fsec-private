@@ -6,6 +6,7 @@ from pyscf.lib.parameters import LARGE_DENOM
 from fsec.singularity_subtraction.structure_factor.laplace import (
     make_minimax_laplace_grid,
 )
+from fsec.singularity_subtraction.mp2_variants import MP2Variant, get_mp2_variant
 
 
 def build_trs_unique_pairs(trs_map, nkpts=None):
@@ -163,7 +164,7 @@ def build_active_eov_mask(
 
 def contract_exchange_lov_laplace(
         rho_ia, rho_jb, Lov_mkb, Lov_nka, eia, ejb,
-        active_ia, active_jb, tolerance, max_points):
+        active_ia, active_jb, tolerance, max_points, variant=None):
     """Contract one exchange block using a separable minimax denominator.
 
     The signed MP2 denominator is ``-(gap_ia + gap_jb)``.  Its minimax
@@ -177,13 +178,21 @@ def contract_exchange_lov_laplace(
         ``(exchange_block, grid)`` or ``None`` if the minimax tables do
         not cover the requested denominator range and tolerance.
     """
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
+    laplace_terms = variant.laplace_terms()
+    if laplace_terms is None:
+        return None
+
     active_ia = np.asarray(active_ia, dtype=bool)
     active_jb = np.asarray(active_jb, dtype=bool)
     if not np.any(active_ia) or not np.any(active_jb):
         return 0.0j, None
 
-    gap_ia = np.full(eia.shape, np.inf, dtype=eia.dtype)
-    gap_jb = np.full(ejb.shape, np.inf, dtype=ejb.dtype)
+    gap_ia = np.zeros(eia.shape, dtype=eia.dtype)
+    gap_jb = np.zeros(ejb.shape, dtype=ejb.dtype)
     gap_ia[active_ia] = -eia[active_ia]
     gap_jb[active_jb] = -ejb[active_jb]
     active_gaps_ia = gap_ia[active_ia]
@@ -204,17 +213,26 @@ def contract_exchange_lov_laplace(
 
     exchange_block = 0.0j
     Lov_nka_t = Lov_nka.transpose(0, 2, 1)
-    for point, weight in zip(grid.points, grid.weights):
-        scaled_rho_ia = rho_ia * np.exp(-point * gap_ia)
-        scaled_rho_bj = rho_jb.conj() * np.exp(-point * gap_jb).T
+    rho_ia_flat = np.where(active_ia, rho_ia, 0.0)
+    rho_bj_flat = np.where(active_jb.T, rho_jb.conj(), 0.0)
+    for shift, coefficient in laplace_terms:
+        for point, weight in zip(grid.points, grid.weights):
+            exp_ia = np.ones(gap_ia.shape, dtype=float)
+            exp_jb = np.ones(gap_jb.shape, dtype=float)
+            exp_ia[active_ia] = np.exp(
+                -(point + shift) * gap_ia[active_ia])
+            exp_jb[active_jb] = np.exp(
+                -(point + shift) * gap_jb[active_jb])
+            scaled_rho_ia = rho_ia_flat * exp_ia
+            scaled_rho_bj = rho_bj_flat * exp_jb.T
 
-        # Both intermediates have shape (naux, nocc, nocc).  The work is
-        # O(naux * nocc**2 * nvir) per Laplace point and the peak scratch
-        # is O(naux * nocc**2), independent of nvir**2.
-        left_Lij = Lov_mkb @ scaled_rho_bj # O(A O^2 V)
-        right_Lij = scaled_rho_ia @ Lov_nka_t
-        exchange_block -= weight * np.einsum(
-            'Lij,Lij->', left_Lij, right_Lij, optimize=True)
+            # Both intermediates have shape (naux, nocc, nocc).  The work is
+            # O(naux * nocc**2 * nvir) per Laplace point and the peak scratch
+            # is O(naux * nocc**2), independent of nvir**2.
+            left_Lij = Lov_mkb @ scaled_rho_bj # O(A O^2 V)
+            right_Lij = scaled_rho_ia @ Lov_nka_t
+            exchange_block += coefficient * weight * np.einsum(
+                'Lij,Lij->', left_Lij, right_Lij, optimize=True)
 
     return exchange_block, grid
 
@@ -222,7 +240,7 @@ def contract_exchange_lov_laplace(
 def contract_direct_q4_lov_laplace(
         rho_ia, rho_jb, Lov_mka, Lov_nkb, eia, ejb,
         active_ia, active_jb, compute_direct, compute_q4,
-        tolerance, max_points):
+        tolerance, max_points, variant=None):
     """Contract direct and q4 blocks with a separable minimax denominator.
 
     The direct contraction is evaluated as two batched ``A x OV`` by
@@ -236,13 +254,22 @@ def contract_direct_q4_lov_laplace(
         ``(direct_block, q4_block, grid)`` or ``None`` when the active
         gaps or minimax tables require the exact fallback.
     """
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
+    signed_terms = variant.laplace_terms()
+    absolute_terms = variant.laplace_terms(absolute=True)
+    if signed_terms is None or absolute_terms is None:
+        return None
+
     active_ia = np.asarray(active_ia, dtype=bool)
     active_jb = np.asarray(active_jb, dtype=bool)
     if not np.any(active_ia) or not np.any(active_jb):
         return 0.0j, 0.0, None
 
-    gap_ia = np.full(eia.shape, np.inf, dtype=eia.dtype)
-    gap_jb = np.full(ejb.shape, np.inf, dtype=ejb.dtype)
+    gap_ia = np.zeros(eia.shape, dtype=eia.dtype)
+    gap_jb = np.zeros(ejb.shape, dtype=ejb.dtype)
     gap_ia[active_ia] = -eia[active_ia]
     gap_jb[active_jb] = -ejb[active_jb]
     active_gaps_ia = gap_ia[active_ia]
@@ -259,26 +286,40 @@ def contract_direct_q4_lov_laplace(
     if grid is None:
         return None
 
-    exp_ia = np.exp(-grid.points[:, None] * gap_ia.ravel()[None, :])
-    exp_jb = np.exp(-grid.points[:, None] * gap_jb.ravel()[None, :])
-
     direct_block = 0.0j
+    rho_ia_flat = np.where(active_ia.ravel(), rho_ia.ravel(), 0.0)
+    rho_jb_flat = np.where(active_jb.ravel(), rho_jb.conj().T.ravel(), 0.0)
     if compute_direct:
-        rho_ia_weighted = exp_ia * rho_ia.ravel()[None, :]
-        rho_jb_weighted = exp_jb * rho_jb.conj().T.ravel()[None, :]
-        left_Ln = Lov_mka.reshape(Lov_mka.shape[0], -1) @ rho_ia_weighted.T # CPU: O(A O V nlaplace)
-        right_Ln = Lov_nkb.reshape(Lov_nkb.shape[0], -1) @ rho_jb_weighted.T
-        direct_laplace = np.einsum(
-            'Ln,Ln->n', left_Ln, right_Ln, optimize=True) # L is naux, n is Laplace points
-        direct_block = -np.dot(grid.weights, direct_laplace)
+        for shift, coefficient in signed_terms:
+            exp_ia = np.ones((grid.npoints, gap_ia.size), dtype=float)
+            exp_jb = np.ones((grid.npoints, gap_jb.size), dtype=float)
+            exp_ia[:, active_ia.ravel()] = np.exp(
+                -(grid.points[:, None] + shift) * gap_ia[active_ia][None, :])
+            exp_jb[:, active_jb.ravel()] = np.exp(
+                -(grid.points[:, None] + shift) * gap_jb[active_jb][None, :])
+            rho_ia_weighted = exp_ia * rho_ia_flat[None, :]
+            rho_jb_weighted = exp_jb * rho_jb_flat[None, :]
+            left_Ln = Lov_mka.reshape(Lov_mka.shape[0], -1) @ rho_ia_weighted.T
+            right_Ln = Lov_nkb.reshape(Lov_nkb.shape[0], -1) @ rho_jb_weighted.T
+            direct_laplace = np.einsum(
+                'Ln,Ln->n', left_Ln, right_Ln, optimize=True)
+            direct_block += coefficient * np.dot(grid.weights, direct_laplace)
 
     q4_block = 0.0
     if compute_q4:
-        rho_ia_abs = np.abs(rho_ia.ravel())**2
-        rho_jb_abs = np.abs(rho_jb.conj().T.ravel())**2
-        q4_ia = exp_ia @ rho_ia_abs # O(nlaplace O V)
-        q4_jb = exp_jb @ rho_jb_abs
-        q4_block = np.dot(grid.weights, q4_ia * q4_jb)
+        rho_ia_abs = np.abs(rho_ia_flat)**2
+        rho_jb_abs = np.abs(rho_jb_flat)**2
+        for shift, coefficient in absolute_terms:
+            exp_ia = np.ones((grid.npoints, gap_ia.size), dtype=float)
+            exp_jb = np.ones((grid.npoints, gap_jb.size), dtype=float)
+            exp_ia[:, active_ia.ravel()] = np.exp(
+                -(grid.points[:, None] + shift) * gap_ia[active_ia][None, :])
+            exp_jb[:, active_jb.ravel()] = np.exp(
+                -(grid.points[:, None] + shift) * gap_jb[active_jb][None, :])
+            q4_ia = exp_ia @ rho_ia_abs
+            q4_jb = exp_jb @ rho_jb_abs
+            q4_block += coefficient * np.dot(
+                grid.weights, q4_ia * q4_jb)
 
     return direct_block, q4_block, grid
 
@@ -289,8 +330,12 @@ def contract_trs_unique_pair_rijab_lov(
         nonzero_opadding, nonzero_vpadding, nkpts,
         compute_direct=False, compute_exchange=False, compute_q4=False,
         profile=None, occ_slice_i=None, occ_slice_j=None,
-        Lov_exchange_i=None, Lov_exchange_j=None):
+        Lov_exchange_i=None, Lov_exchange_j=None, variant=None):
     """Contract TRS-unique pairs exactly from DF Lov blocks."""
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
     direct_value = 0.0
     exchange_value = 0.0
     q4_weighted_norm = 0.0
@@ -310,6 +355,13 @@ def contract_trs_unique_pair_rijab_lov(
             if profile is not None:
                 profile.stop("TRS Lov denominator eov build", region_t0)
 
+        active_ia = build_active_eov_mask(
+            m, ka, mo_e_o.shape[1], mo_e_v.shape[1],
+            nonzero_opadding, nonzero_vpadding, occ_slice=occ_slice_i)
+        active_jb = build_active_eov_mask(
+            n, kb, mo_e_o.shape[1], mo_e_v_b.shape[1],
+            nonzero_opadding, nonzero_vpadding, occ_slice=occ_slice_j)
+
         Lov_mka = None
         Lov_nkb = None
         if compute_direct:
@@ -322,8 +374,14 @@ def contract_trs_unique_pair_rijab_lov(
         edenom_matrix = None
         if compute_direct or compute_q4:
             region_t0 = profile.start() if profile is not None else None
-            edenom_matrix = np.add.outer(eia.ravel(), ejb.ravel())
-            np.reciprocal(edenom_matrix, out=edenom_matrix)
+            denominator = np.add.outer(eia.ravel(), ejb.ravel())
+            active_denominator = (
+                active_ia.ravel()[:, None] & active_jb.ravel()[None, :]
+            )
+            edenom_matrix = variant.reciprocal(
+                denominator,
+                active_mask=active_denominator,
+            )
             if profile is not None:
                 profile.stop("TRS Lov direct/q4 denominator build", region_t0)
 
@@ -372,14 +430,21 @@ def contract_trs_unique_pair_rijab_lov(
                 profile.stop("TRS Lov exchange ERI matmul", region_t0)
 
             region_t0 = profile.start() if profile is not None else None
-            exchange_edenom = np.empty(
+            exchange_denominator = np.empty(
                 (nocc_i, nvir, nocc_j, nvir), dtype=eia.dtype)
             np.add(
                 eia[:, None, None, :],
                 ejb.T[None, :, :, None],
-                out=exchange_edenom,
+                out=exchange_denominator,
             )
-            np.reciprocal(exchange_edenom, out=exchange_edenom)
+            exchange_active = (
+                active_ia[:, None, None, :]
+                & active_jb.T[None, :, :, None]
+            )
+            exchange_edenom = variant.reciprocal(
+                exchange_denominator,
+                active_mask=exchange_active,
+            )
             if profile is not None:
                 profile.stop("TRS Lov exchange denominator build", region_t0)
 
@@ -433,12 +498,16 @@ def contract_trs_unique_pair_rijab_lov_laplace(
         direct_tolerance=1e-8, direct_max_points=16,
         exchange_tolerance=1e-8, exchange_max_points=16,
         occ_slice_i=None, occ_slice_j=None,
-        Lov_exchange_i=None, Lov_exchange_j=None):
+        Lov_exchange_i=None, Lov_exchange_j=None, variant=None):
     """Contract TRS-unique pairs with Laplace denominators.
 
     Any unique pair that is not covered by the minimax grid is passed
     to the exact contraction for the affected components.
     """
+    if variant is None:
+        variant = get_mp2_variant()
+    elif not isinstance(variant, MP2Variant):
+        raise TypeError("variant must be an MP2Variant or None")
     direct_value = 0.0
     exchange_value = 0.0
     q4_weighted_norm = 0.0
@@ -493,6 +562,7 @@ def contract_trs_unique_pair_rijab_lov_laplace(
                     compute_q4,
                     direct_tolerance,
                     direct_max_points,
+                    variant=variant,
                 )
             )
             if profile is not None:
@@ -533,6 +603,7 @@ def contract_trs_unique_pair_rijab_lov_laplace(
                     active_jb,
                     exchange_tolerance,
                     exchange_max_points,
+                    variant=variant,
                 )
             )
             if profile is not None:
@@ -574,6 +645,7 @@ def contract_trs_unique_pair_rijab_lov_laplace(
                     occ_slice_j=occ_slice_j,
                     Lov_exchange_i=Lov_exchange_i,
                     Lov_exchange_j=Lov_exchange_j,
+                    variant=variant,
                 )
             )
             direct_value += fallback[0]
