@@ -524,7 +524,10 @@ class MP2StructureFactor(StructureFactor):
         
         t2_required = True # if full t2 in kikjka format is needed
         t2_given = t2 is not None
-        direct_rsdf_blocked = is_direct_rsdf(kmp)
+        explicit_lov = Lov is not None
+        # Selective Lov tensors are already the requested representation, so
+        # they take precedence over the direct-RSDF block provider.
+        direct_rsdf_blocked = is_direct_rsdf(kmp) and not explicit_lov
         if direct_rsdf_blocked:
             validate_direct_rsdf_structure_factor(kmp, grids)
             if t2_given:
@@ -538,7 +541,9 @@ class MP2StructureFactor(StructureFactor):
             t2_store_type = "kikj_lov"
         kikj_lov = t2_store_type == 'kikj_lov'
         
-        with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
+        with_df_ints = (
+            kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
+        ) or explicit_lov
         if kikj_lov:
             if t2_given:
                 raise NotImplementedError("t2_store_type='kikj_lov' does not accept precomputed t2 amplitudes")

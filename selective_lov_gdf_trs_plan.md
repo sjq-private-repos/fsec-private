@@ -2,7 +2,7 @@
 
 ## Summary
 
-PySCF 2.13.1 does not use its fastest symmetry path when a custom
+PySCF 2.14 does not use its fastest symmetry path when a custom
 `kptij_lst` is supplied: it forces `aosym="s1"` and disables conjugate-\(q\)
 reuse. A future optimization can retain both AO-pair symmetry and
 time-reversal symmetry while constructing only the GDF blocks needed by the
@@ -99,7 +99,7 @@ No public API or benchmark-option changes are required.
 
 - The small-\(q\) calculation is nonmagnetic with a real Hamiltonian, so
   physical TR applies.
-- PySCF 2.13.1 private GDF-builder interfaces are the implementation target.
+- PySCF 2.14 private GDF-builder interfaces are the implementation target.
 - If TR validation fails, retain the correct transpose-closed `s2` sparse
   build but disable TR reconstruction and emit a clear diagnostic.
 

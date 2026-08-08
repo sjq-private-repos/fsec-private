@@ -24,6 +24,9 @@ from fsec.singularity_subtraction.structure_factor.helpers import TimingProfile
 from fsec.singularity_subtraction.structure_factor.mp2_sf import (
     MP2StructureFactor,
 )
+from fsec.singularity_subtraction.structure_factor.mp2_rsdf_direct_helpers import (
+    is_direct_rsdf,
+)
 
 
 def normalize_band_df(value):
@@ -563,8 +566,11 @@ class MP2SmallQ:
 
         lov = lov_b = None
         if (
-            self.kmp.with_df_ints
-            and isinstance(self.kmf.with_df, df.GDF)
+            (
+                self.kmp.with_df_ints
+                and isinstance(self.kmf.with_df, df.GDF)
+            )
+            or is_direct_rsdf(self.kmp)
         ):
             lov, lov_b = self._build_lov(
                 grids,

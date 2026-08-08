@@ -113,6 +113,100 @@ class MP2SmallQKnownValues(unittest.TestCase):
                 self.assertEqual(result.band_df, backend)
                 self.assertEqual(result.band_exxdiv, "ewald")
 
+    def test_direct_rsdf_passes_both_selective_lov_tensors(self):
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        try:
+            self.kmf.with_df = direct_df
+            direct_kmp = mp.KMP2(self.kmf)
+            calculation = MP2SmallQ(
+                self.kmf,
+                direct_kmp,
+                band_df="FFTDF",
+                N_local=self.N_local,
+                pair_density_eval_grid="uniform",
+                check_trs=False,
+            )
+            shifted_energy = [np.asarray(direct_kmp.mo_energy[0]).copy()]
+            shifted_coeff = [np.asarray(direct_kmp.mo_coeff[0]).copy()]
+            lov = object()
+            lov_b = object()
+            fake_structure_factor = mock.MagicMock()
+            fake_structure_factor.build_structure_factor.return_value = {
+                "SqG_full_direct": np.array([0.0]),
+                "SqG_full_q4": np.array([0.0]),
+            }
+            with (
+                mock.patch.object(
+                    calculation,
+                    "_get_shifted_bands",
+                    return_value=(shifted_energy, shifted_coeff),
+                ),
+                mock.patch.object(
+                    calculation,
+                    "_build_lov",
+                    return_value=(lov, lov_b),
+                ) as build_lov,
+                mock.patch(
+                    "fsec.singularity_subtraction.structure_factor.mp2_smallq."
+                    "MP2StructureFactor",
+                    return_value=fake_structure_factor,
+                ),
+            ):
+                calculation.kernel()
+
+            build_lov.assert_called_once()
+            build_kwargs = (
+                fake_structure_factor.build_structure_factor.call_args.kwargs
+            )
+            self.assertIs(build_kwargs["Lov"], lov)
+            self.assertIs(build_kwargs["Lov_b"], lov_b)
+        finally:
+            self.kmf.with_df = original_df
+
+    def test_direct_rsdf_smallq_matches_stored_gdf_for_both_band_backends(self):
+        references = {
+            backend: self._smallq(backend).kernel()
+            for backend in ("FFTDF", "GDF")
+        }
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        try:
+            self.kmf.with_df = direct_df
+            direct_kmp = mp.KMP2(self.kmf)
+            for backend in ("FFTDF", "GDF"):
+                with self.subTest(backend=backend):
+                    result = MP2SmallQ(
+                        self.kmf,
+                        direct_kmp,
+                        band_df=backend,
+                        band_exxdiv="ewald",
+                        N_local=self.N_local,
+                        pair_density_eval_grid="uniform",
+                        check_trs=False,
+                    ).kernel()
+                    reference = references[backend]
+                    self.assertAlmostEqual(
+                        result.sq_direct,
+                        reference.sq_direct,
+                        delta=1e-12,
+                    )
+                    self.assertAlmostEqual(
+                        result.sq_q4,
+                        reference.sq_q4,
+                        delta=1e-13,
+                    )
+                    self.assertEqual(result.band_df, backend)
+                    self.assertEqual(result.band_exxdiv, "ewald")
+        finally:
+            self.kmf.with_df = original_df
+
     def test_fftdf_band_exxdiv_is_temporary(self):
         original_df = self.kmf.with_df
         original_exxdiv = self.kmf.exxdiv

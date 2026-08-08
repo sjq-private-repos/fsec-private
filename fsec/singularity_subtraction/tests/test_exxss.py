@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import numpy as np
 from pyscf.pbc import df
 from pyscf.pbc import dft as pbcdft
@@ -6,6 +7,63 @@ from pyscf.pbc import gto as pbcgto
 from pyscf.pbc import scf as pbcscf
 
 from fsec.singularity_subtraction import ExxSS, ExxSSQuarticExponential
+
+
+class ExxUncorrectedCallShapeTests(unittest.TestCase):
+    @staticmethod
+    def _call_shape(df_class, rsjk=None, direct=False):
+        cell = pbcgto.Cell()
+        cell.unit = "Bohr"
+        cell.atom = "H 0.0 0.0 0.0"
+        cell.spin = 1
+        cell.a = np.eye(3) * 6.0
+        cell.basis = "gth-szv"
+        cell.pseudo = "gth-hf"
+        cell.build()
+        kpts = cell.make_kpts(
+            (1, 1, 1), wrap_around=True, with_gamma_point=True)
+        dm_kpts = np.zeros((1, cell.nao_nr(), cell.nao_nr()))
+
+        mf = mock.Mock()
+        mf.cell = cell
+        mf.kpts = kpts
+        mf.with_df = df_class(cell, kpts)
+        if direct:
+            mf.with_df.direct = True
+        mf.rsjk = rsjk
+        mf.exxdiv = "ewald"
+        mf.make_rdm1.return_value = dm_kpts
+        call_shape = {}
+
+        def get_jk(**kwargs):
+            call_shape.update(kwargs)
+            return np.zeros_like(dm_kpts), np.zeros_like(dm_kpts)
+
+        mf.get_jk.side_effect = get_jk
+        exxss = ExxSS.__new__(ExxSS)
+        exxss.kmf = mf
+        exxss.Ek_uncorr = None
+        exxss.compute_uncorrected_exx()
+        return call_shape
+
+    def test_gdf_and_fftdf_request_exchange_only(self):
+        for df_class in (df.GDF, df.FFTDF):
+            with self.subTest(backend=df_class.__name__):
+                call_shape = self._call_shape(df_class)
+                self.assertFalse(call_shape["with_j"])
+                self.assertIn("kpts_band", call_shape)
+
+    def test_rsjk_requests_jk_cache_shape(self):
+        call_shape = self._call_shape(df.GDF, rsjk=object())
+        self.assertTrue(call_shape["with_j"])
+
+        inactive_call_shape = self._call_shape(df.GDF, rsjk=False)
+        self.assertFalse(inactive_call_shape["with_j"])
+
+    def test_direct_rsdf_omits_band_kpoints(self):
+        call_shape = self._call_shape(df.RSDF, direct=True)
+        self.assertFalse(call_shape["with_j"])
+        self.assertNotIn("kpts_band", call_shape)
 
 
 class KnownValues(unittest.TestCase):

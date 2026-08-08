@@ -1322,6 +1322,58 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(
             actual["direct_rsdf_block_stats"]["block_size"], 1)
 
+    def test_explicit_lov_bypasses_direct_rsdf_provider(self):
+        reciprocal = self.kmf.cell.reciprocal_vectors()
+        qG_full = np.array([
+            [0.0, 0.0, 0.0],
+            reciprocal[0],
+            -reciprocal[0],
+        ])
+        full_lov = kmp2._init_mp_df_eris(self.kmp)
+        zero_lov = np.empty_like(full_lov)
+        zero_lov_b = np.empty_like(full_lov)
+        for ko in range(self.kmp.nkpts):
+            for kv in range(self.kmp.nkpts):
+                zero_lov[ko, kv] = np.zeros_like(full_lov[ko, kv])
+                zero_lov_b[ko, kv] = np.zeros_like(full_lov[ko, kv])
+
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        try:
+            self.kmf.with_df = direct_df
+            direct_sf = MP2StructureFactor(
+                self.kmf,
+                self.kmp,
+                N_local=self.N_local,
+                qG_cutoff=self.qG_cutoff,
+                sq_inversion_symm=True,
+                t2_store_type="ki",
+                pair_density_eval_grid="uniform",
+            )
+            with patch(
+                "fsec.singularity_subtraction.structure_factor.mp2_sf."
+                "accumulate_direct_rsdf_occ_blocks",
+                side_effect=AssertionError(
+                    "explicit Lov must bypass the blocked direct-RSDF route"
+                ),
+            ):
+                actual = direct_sf.build_structure_factor(
+                    qG_full=qG_full,
+                    direct=True,
+                    exchange=False,
+                    dG0=True,
+                    Lov=zero_lov,
+                    Lov_b=zero_lov_b,
+                )
+        finally:
+            self.kmf.with_df = original_df
+
+        self.assertIsNone(actual["direct_rsdf_block_stats"])
+        np.testing.assert_allclose(actual["SqG_full_direct"], 0.0)
+
     @unittest.skipUnless(
         HAS_KMP2_DIRECT,
         "requires the PySCF fork with pyscf.pbc.mp.kmp2_direct",
@@ -1806,13 +1858,27 @@ class KnownValues(unittest.TestCase):
         mp2_sf = MP2StructureFactor(
             self.kmf_112,
             self.kmp_112,
-            t2=self.t2_112,
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
+            t2_store_type="kikjka",
             pair_density_eval_grid="uniform",
         )
-        result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
+        mp2_sf.set_grids(min_fit_points=10)
+        t2_kikjq = self.t2_112.copy()
+        convert_t2_to_kikjq_format(
+            t2_kikjq,
+            self.kmp_112.kpts,
+            mp2_sf.grids.qGrid,
+            self.kmf_112.cell,
+        )
+        mp2_sf.t2 = t2_kikjq
+        result = mp2_sf.build_structure_factor(
+            grids=mp2_sf.grids,
+            direct=True,
+            exchange=True,
+            dG0=True,
+        )
 
         qG = result["qG_full"]
         idx10 = self._closest_10_indices(qG)
@@ -1829,40 +1895,40 @@ class KnownValues(unittest.TestCase):
             [-1.0471975511965976, 0.0, -0.5235987755982988],
         ]
         reference_direct_10 = [
-            -6.031483988853451e-22,
-            -0.0001331479670959755,
-            -0.0001331479670959755,
-            -5.837718619008481e-22,
-            -5.83757449261307e-22,
-            -0.000152965545669427,
-            -0.000152965545669427,
-            -5.83757449261307e-22,
-            -5.837718619008481e-22,
-            -5.043690481546798e-05,
+            -5.5472046120633615e-22,
+            -0.0001399607560043585,
+            -0.0001399607560043585,
+            -5.3690298464512465e-22,
+            -5.368898301328439e-22,
+            -0.00014013849432096997,
+            -0.00014013849432096997,
+            -5.368898301328439e-22,
+            -5.3690298464512465e-22,
+            -5.34169807626042e-05,
         ]
         reference_q4_10 = [
-            -3.82095320889316e-41,
+            -3.8209490334935407e-41,
             -8.559020498960629e-07,
             -8.559020498960629e-07,
-            -3.579441904733104e-41,
-            -3.5792634797576904e-41,
-            -2.437964679354982e-06,
-            -2.437964679354982e-06,
-            -3.5792634797576904e-41,
-            -3.579441904733104e-41,
-            -1.2343680816144883e-07,
+            -3.579442222239576e-41,
+            -3.579266530713441e-41,
+            -2.437964679354979e-06,
+            -2.437964679354979e-06,
+            -3.579266530713441e-41,
+            -3.579442222239576e-41,
+            -1.2343680816144936e-07,
         ]
         reference_exchange_10 = [
-            3.948083901297239e-22,
-            5.2916344116689204e-05,
-            5.2916344116689204e-05,
-            3.821253042962879e-22,
-            3.8211585588923894e-22,
-            0.00010004243537396696,
-            0.00010004243537396696,
-            3.8211585588923894e-22,
-            3.821253042962879e-22,
-            1.99304805849594e-05,
+            3.7059436888971183e-22,
+            5.632273857088071e-05,
+            5.632273857088071e-05,
+            3.5869087000632887e-22,
+            3.586820862473833e-22,
+            9.362890969973841e-05,
+            9.362890969973841e-05,
+            3.586820862473833e-22,
+            3.5869087000632887e-22,
+            2.1420518558527496e-05,
         ]
 
         np.testing.assert_allclose(qG[idx10], reference_qG_10, atol=1e-12)
