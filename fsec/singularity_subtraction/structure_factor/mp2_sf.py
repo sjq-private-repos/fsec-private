@@ -283,6 +283,10 @@ class MP2StructureFactor(StructureFactor):
             0 if pair_density_becke_grid_level is None
             else int(pair_density_becke_grid_level)
         )
+        verbose = kwargs.get('verbose', None)
+        stdout = kwargs.get('stdout', None)
+        self.verbose = kmp.verbose if verbose is None else verbose
+        self.stdout = kmp.stdout if stdout is None else stdout
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         self.rsdf_occ_block_size = kwargs.get('rsdf_occ_block_size', None)
@@ -368,8 +372,8 @@ class MP2StructureFactor(StructureFactor):
                                SqG_full_exchange_mask,
                                SqG_full_q4_mask, direct, exchange, dG0):
         """Log final structure-factor values alongside their q+G vectors."""
-        log.note("MP2 structure factors by q+G point:")
-        log.note(
+        log.debug("MP2 structure factors by q+G point:")
+        log.debug(
             "%8s %23s %23s %23s %23s %23s %23s",
             "index", "qG_x", "qG_y", "qG_z", "SqG_direct",
             "SqG_exchange", "SqG_q4",
@@ -391,7 +395,7 @@ class MP2StructureFactor(StructureFactor):
                 SqG_full_q4[index],
                 dG0 and SqG_full_q4_mask[index],
             )
-            log.note(
+            log.debug(
                 "%8d %23.16e %23.16e %23.16e %23s %23s %23s",
                 index, qGpt[0], qGpt[1], qGpt[2], direct_value,
                 exchange_value, q4_value,
@@ -410,8 +414,7 @@ class MP2StructureFactor(StructureFactor):
                                outer_sq_ke_cutoff_scale=None,
                                pair_density_eval_grid=None,
                                pair_density_becke_grid_level=None,
-                               rsdf_occ_block_size=None,
-                               debug_structure_factors=False):
+                               rsdf_occ_block_size=None):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -435,7 +438,8 @@ class MP2StructureFactor(StructureFactor):
             If None, uses the grids constructed from the class grid setup.
         verbose : int or pyscf.lib.logger.Logger, optional
             PySCF verbosity level or logger used for the timing summary. If
-            omitted, the verbosity and output stream are inherited from kmp.
+            omitted, use the construction-time verbosity, which inherits from
+            kmp by default. The structure-factor table is logged at DEBUG.
         pair_density_eval_grid : {"uniform", "becke"}, optional
             Real-space quadrature grid used to evaluate pair-density overlaps.
             ``"uniform"`` uses the existing equally weighted mesh. ``"becke"``
@@ -443,11 +447,6 @@ class MP2StructureFactor(StructureFactor):
         pair_density_becke_grid_level : int, optional
             PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
             Defaults to the class setting, which defaults to 0.
-        debug_structure_factors : bool, optional
-            If True, log a table pairing every retained q+G point with the
-            final direct, exchange, and q4 structure-factor values. Components
-            that were not requested or whose masks mark them unavailable are
-            displayed as ``N/A``. Defaults to False.
         Returns
         -------
         SqG_full_direct : np.ndarray
@@ -469,7 +468,7 @@ class MP2StructureFactor(StructureFactor):
         if kmp is None:
             kmp = self.kmp
 
-        log = logger.new_logger(kmp, verbose)
+        log = logger.new_logger(self, verbose)
         profile = TimingProfile()
         total_t0 = profile.start()
         
@@ -1446,7 +1445,7 @@ class MP2StructureFactor(StructureFactor):
                 t2_cache_counts['exchange_hits'], t2_cache_counts['exchange_misses'],
                 cache_mem,
             )
-        if debug_structure_factors:
+        if log.verbose >= logger.DEBUG:
             self._log_structure_factors(
                 log,
                 qG_full,

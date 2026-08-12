@@ -166,6 +166,10 @@ class MP2SSOptions:
     pair_density_becke_grid_level
         PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
         Lower values use fewer atom-centered grid points. The default is 0.
+    verbose
+        PySCF logging verbosity. ``None`` inherits ``kmp.verbose``. At
+        ``pyscf.lib.logger.DEBUG`` the final structure-factor table and other
+        debug diagnostics are written to the inherited PySCF output stream.
     smallq_band_df
         Density-fitting backend used for the half-shifted non-SCF bands.
         Supported values are ``"FFTDF"`` and ``"GDF"``. ``None`` disables
@@ -211,6 +215,7 @@ class MP2SSOptions:
     laplace_exchange_max_points: int = 16
     pair_density_eval_grid: str = 'becke'
     pair_density_becke_grid_level: int = 0
+    verbose: Optional[int] = None
     smallq_band_df: Optional[str] = None
     smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
@@ -261,6 +266,7 @@ class MP2SSOptions:
             rsdf_occ_block_size = int(rsdf_occ_block_size)
             if rsdf_occ_block_size < 1:
                 raise ValueError("rsdf_occ_block_size must be positive or None")
+        verbose = None if self.verbose is None else int(self.verbose)
         object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
         object.__setattr__(
             self,
@@ -279,6 +285,7 @@ class MP2SSOptions:
             self, 'laplace_exchange_max_points', laplace_exchange_max_points)
         object.__setattr__(
             self, 'rsdf_occ_block_size', rsdf_occ_block_size)
+        object.__setattr__(self, 'verbose', verbose)
 
 
 @dataclass(frozen=True)
@@ -1105,6 +1112,9 @@ class MP2SS:
         self.laplace_exchange_max_points = options.laplace_exchange_max_points
         self.pair_density_eval_grid = options.pair_density_eval_grid
         self.pair_density_becke_grid_level = options.pair_density_becke_grid_level
+        self.verbose = (
+            kmp.verbose if options.verbose is None else options.verbose)
+        self.stdout = kmp.stdout
         self.smallq_band_df = options.smallq_band_df
         self.smallq_band_exxdiv = options.smallq_band_exxdiv
         
@@ -1207,6 +1217,8 @@ class MP2SS:
             pair_density_becke_grid_level=self.pair_density_becke_grid_level,
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
             outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+            verbose=self.verbose,
+            stdout=self.stdout,
         )
         mp2_structure_factor.set_grids(min_fit_points=self.min_points)
 
@@ -1244,6 +1256,7 @@ class MP2SS:
                 pair_density_becke_grid_level=self.pair_density_becke_grid_level,
                 sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
                 outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+                verbose=self.verbose,
             )
             self.smallq_result = smallq.kernel()
         mp2_structure_factor.smallq_result = self.smallq_result
