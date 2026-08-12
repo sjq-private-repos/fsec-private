@@ -100,7 +100,7 @@ class ExxSSGrids(SSGrids):
         self.qG_norm_cutoff = qG_norm_cutoff
         self.min_points = min_points
         if kGrid2 is None:
-            if np.all(np.isclose(relative_shift, 0.0)):
+            if np.all(np.asarray(relative_shift) == 0.0):
                 self.kGrid2 = kGrid1
             else:
                 kshift_abs = cell.get_abs_kpts([shift / n for shift,n in zip(relative_shift,self.nks)])
@@ -270,13 +270,17 @@ class MP2SSGrids(ExxSSGrids):
                  qG_norm_cutoff=None, min_points=6, relative_shift=[0.0, 0.0, 0.0], shift_occ=True, **kwargs):
         super().__init__(cell, kGrid1, N_local=N_local, relative_shift=relative_shift, shift_occ=shift_occ, **kwargs)
 
-        kGrid3_neq_kGrid2 = False
-        for shift_i in relative_shift:
-            if ~np.isclose(shift_i, 0.0, atol=1e-8) and ~np.isclose(shift_i, 0.5, atol=1e-8):
-                kGrid3_neq_kGrid2 = True
-                break
+        relative_shift = np.asarray(relative_shift, dtype=float)
+        # A half-grid displacement is its own inverse, including the signed
+        # boundary value -0.5.  Only a genuinely non-self-inverse shift needs
+        # a separate virtual grid for k_j - q'.
+        self_inverse_components = (
+            (relative_shift == 0.0)
+            | (np.abs(relative_shift) == 0.5)
+        )
+        kGrid3_neq_kGrid2 = not np.all(self_inverse_components)
 
-        if np.all(np.isclose(relative_shift, 0.0)):
+        if np.all(relative_shift == 0.0):
             self.kGrid3 = self.kGrid1.copy()
         elif not kGrid3_neq_kGrid2:
             self.kGrid3 = self.kGrid2.copy()

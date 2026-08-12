@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+import warnings
 
 import numpy as np
 
@@ -22,6 +23,45 @@ from fsec.singularity_subtraction.structure_factor.mp2_sf import (
 
 
 class MP2SmallQOptionsTests(unittest.TestCase):
+    def test_relative_shift_validation(self):
+        invalid = (
+            (0.0, 0.0),
+            (0.0, 0.0, 0.0, 0.0),
+            (np.nan, 0.0, 0.0),
+            (np.inf, 0.0, 0.0),
+            (-0.500001, 0.0, 0.0),
+            (0.0, 0.500001, 0.0),
+        )
+        for shift in invalid:
+            with self.subTest(shift=shift):
+                with self.assertRaises(ValueError):
+                    MP2SSOptions(
+                        smallq_band_df="FFTDF",
+                        smallq_relative_shift=shift,
+                    )
+
+        with self.assertRaisesRegex(ValueError, "all-zero"):
+            MP2SSOptions(
+                smallq_band_df="FFTDF",
+                smallq_relative_shift=(0.0, 0.0, 0.0),
+            )
+        with self.assertRaisesRegex(ValueError, "all-zero"):
+            MP2SmallQ(
+                mock.Mock(cell=mock.Mock()),
+                mock.Mock(),
+                band_df="FFTDF",
+                relative_shift=(0.0, 0.0, 0.0),
+            )
+        # Validation still applies when small-q is disabled, but the zero
+        # vector remains representable because it is never consumed.
+        self.assertEqual(
+            MP2SSOptions(
+                smallq_band_df=None,
+                smallq_relative_shift=(0.0, 0.0, 0.0),
+            ).smallq_relative_shift,
+            (0.0, 0.0, 0.0),
+        )
+
     def test_band_df_normalization_and_exxdiv_validation(self):
         fft_options = MP2SSOptions(
             smallq_band_df=" fftdf ",
@@ -98,6 +138,175 @@ class MP2SmallQKnownValues(unittest.TestCase):
             check_trs=False,
         )
 
+    def test_mixed_shift_builds_distinct_periodic_grids(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            relative_shift=(0.25, 0.0, -0.5),
+            N_local=self.N_local,
+        )
+        qprime, grids = calculation._build_grids()
+
+        np.testing.assert_allclose(
+            self.cell.get_scaled_kpts(qprime),
+            (0.25, 0.0, -0.5),
+            atol=1e-12,
+        )
+        self.assertTrue(grids.kGrid3_neq_kGrid2)
+        ka_map = map_kpts(
+            self.cell,
+            grids.kGrid1 + qprime,
+            grids.kGrid2,
+            "ka",
+        )
+        kb_map = map_kpts(
+            self.cell,
+            grids.kGrid1 - qprime,
+            grids.kGrid3,
+            "kb",
+        )
+        np.testing.assert_allclose(
+            minimum_image(self.cell, grids.kGrid1 + qprime),
+            grids.kGrid2[ka_map],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            minimum_image(self.cell, grids.kGrid1 - qprime),
+            grids.kGrid3[kb_map],
+            atol=1e-12,
+        )
+        self.assertFalse(np.allclose(grids.kGrid2, grids.kGrid3))
+
+        tiny_shift = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            relative_shift=(1e-10, 0.0, 0.0),
+            N_local=self.N_local,
+        )
+        _, tiny_grids = tiny_shift._build_grids()
+        self.assertTrue(tiny_grids.kGrid3_neq_kGrid2)
+        self.assertFalse(np.array_equal(tiny_grids.kGrid1, tiny_grids.kGrid2))
+
+    def test_negative_half_shift_keeps_one_shifted_grid(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            relative_shift=(-0.5, -0.5, -0.5),
+            N_local=self.N_local,
+        )
+        qprime, grids = calculation._build_grids()
+        np.testing.assert_allclose(
+            self.cell.get_scaled_kpts(qprime),
+            (-0.5, -0.5, -0.5),
+            atol=1e-12,
+        )
+        self.assertFalse(grids.kGrid3_neq_kGrid2)
+        np.testing.assert_allclose(grids.kGrid2, grids.kGrid3, atol=1e-12)
+
+    def test_distinct_shift_splits_band_inputs_and_warns_once(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            band_exxdiv="ewald",
+            relative_shift=(0.01, 0.0, 0.0),
+            N_local=(3, 3, 3),
+            pair_density_eval_grid="uniform",
+        )
+        band_calls = []
+        band_energy = [np.asarray(e) for e in self.kmp.mo_energy]
+        band_coeff = [np.asarray(c) for c in self.kmp.mo_coeff]
+
+        fake_structure_factor = mock.MagicMock()
+        fake_structure_factor.build_structure_factor.return_value = {
+            "SqG_full_direct": np.asarray([-1.0]),
+            "SqG_full_q4": np.asarray([-2.0]),
+        }
+
+        def fake_bands(kpts, profile=None):
+            band_calls.append(np.asarray(kpts).copy())
+            return band_energy * 2, band_coeff * 2
+
+        with (
+            mock.patch.object(
+                calculation, "_get_shifted_bands", side_effect=fake_bands
+            ),
+            mock.patch(
+                "fsec.singularity_subtraction.structure_factor.mp2_smallq."
+                "MP2StructureFactor",
+                return_value=fake_structure_factor,
+            ),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            result = calculation.kernel()
+
+        runtime_warnings = [
+            warning for warning in caught
+            if warning.category is RuntimeWarning
+        ]
+        self.assertEqual(len(runtime_warnings), 1)
+        self.assertEqual(len(band_calls), 1)
+        nkpts = len(self.kmf.kpts)
+        self.assertEqual(len(band_calls[0]), 2 * nkpts)
+        self.assertFalse(
+            np.allclose(band_calls[0][:nkpts], band_calls[0][nkpts:])
+        )
+        build_kwargs = fake_structure_factor.build_structure_factor.call_args.kwargs
+        self.assertIsNot(
+            build_kwargs["mo_coeff_kpts2"], build_kwargs["mo_coeff_kpts3"]
+        )
+        self.assertIsNot(build_kwargs["mo_e_v"], build_kwargs["mo_e_v_b"])
+        self.assertEqual(result.qprime.shape, (3,))
+
+        reciprocal_norm = np.linalg.norm(self.cell.reciprocal_vectors()[0])
+        above_threshold = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            band_exxdiv="ewald",
+            relative_shift=(0.1001 / reciprocal_norm, 0.0, 0.0),
+            N_local=(3, 3, 3),
+            pair_density_eval_grid="uniform",
+        )
+        with (
+            mock.patch.object(
+                above_threshold, "_get_shifted_bands", side_effect=fake_bands
+            ),
+            mock.patch(
+                "fsec.singularity_subtraction.structure_factor.mp2_smallq."
+                "MP2StructureFactor",
+                return_value=fake_structure_factor,
+            ),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            above_threshold.kernel()
+        self.assertFalse(
+            any(warning.category is RuntimeWarning for warning in caught)
+        )
+
+    def test_rejects_unsupported_correlation_df(self):
+        original_df = self.kmf.with_df
+        try:
+            self.kmf.with_df = mock.Mock()
+            calculation = MP2SmallQ(
+                self.kmf,
+                self.kmp,
+                band_df="FFTDF",
+                band_exxdiv="vcut_sph",
+                relative_shift=(0.25, 0.0, -0.5),
+                N_local=(3, 3, 3),
+                pair_density_eval_grid="uniform",
+            )
+            with self.assertRaisesRegex(NotImplementedError, "FFTDF or GDF"):
+                calculation.kernel()
+        finally:
+            self.kmf.with_df = original_df
+
     def test_fftdf_and_gdf_reference_values(self):
         references = {
             "FFTDF": (-1.5455616988656258e-4, -8.910009779750352e-7),
@@ -112,6 +321,87 @@ class MP2SmallQKnownValues(unittest.TestCase):
                 self.assertAlmostEqual(result.sq_q4, sq_q4, delta=1e-11)
                 self.assertEqual(result.band_df, backend)
                 self.assertEqual(result.band_exxdiv, "ewald")
+
+    def test_mixed_shift_fftdf_and_gdf_direct_q4_are_tr_consistent(self):
+        for backend in ("FFTDF", "GDF"):
+            with self.subTest(backend=backend):
+                common = dict(
+                    band_df=backend,
+                    band_exxdiv="ewald",
+                    relative_shift=(0.25, 0.0, -0.5),
+                    N_local=(5, 5, 5),
+                    pair_density_eval_grid="uniform",
+                )
+                without_tr = MP2SmallQ(
+                    self.kmf,
+                    self.kmp,
+                    check_trs=False,
+                    **common,
+                ).kernel()
+                with_tr = MP2SmallQ(
+                    self.kmf,
+                    self.kmp,
+                    check_trs=True,
+                    **common,
+                ).kernel()
+                for field in ("sq_direct", "sq_q4"):
+                    self.assertTrue(np.isfinite(getattr(without_tr, field)))
+                    self.assertTrue(np.isfinite(getattr(with_tr, field)))
+                    self.assertAlmostEqual(
+                        getattr(without_tr, field),
+                        getattr(with_tr, field),
+                        places=12,
+                    )
+
+    def test_gdf_smallq_uses_supplied_lov_when_flag_is_disabled(self):
+        original_with_df_ints = self.kmp.with_df_ints
+        self.kmp.with_df_ints = False
+        try:
+            result = MP2SmallQ(
+                self.kmf,
+                self.kmp,
+                band_df="FFTDF",
+                band_exxdiv="vcut_sph",
+                relative_shift=(0.25, 0.0, -0.5),
+                N_local=(5, 5, 5),
+                pair_density_eval_grid="uniform",
+            ).kernel()
+        finally:
+            self.kmp.with_df_ints = original_with_df_ints
+
+        self.assertAlmostEqual(
+            result.sq_direct, -4.2075874894386875e-4, delta=1e-10
+        )
+        self.assertAlmostEqual(
+            result.sq_q4, -3.6641325303662666e-6, delta=1e-11
+        )
+        self.assertEqual(self.kmp.with_df_ints, original_with_df_ints)
+
+    def test_fftdf_correlation_uses_direct_ao2mo(self):
+        original_df = self.kmf.with_df
+        original_with_df_ints = self.kmp.with_df_ints
+        self.kmf.with_df = df.FFTDF(self.cell, self.kmf.kpts)
+        self.kmp.with_df_ints = False
+        try:
+            result = MP2SmallQ(
+                self.kmf,
+                self.kmp,
+                band_df="FFTDF",
+                band_exxdiv="vcut_sph",
+                relative_shift=(0.25, 0.0, -0.5),
+                N_local=(5, 5, 5),
+                pair_density_eval_grid="uniform",
+            ).kernel()
+        finally:
+            self.kmf.with_df = original_df
+            self.kmp.with_df_ints = original_with_df_ints
+
+        self.assertAlmostEqual(
+            result.sq_direct, -4.3787538195184196e-4, delta=1e-10
+        )
+        self.assertAlmostEqual(
+            result.sq_q4, -3.6641325303662683e-6, delta=1e-11
+        )
 
     def test_fftdf_band_exxdiv_is_temporary(self):
         original_df = self.kmf.with_df
@@ -272,6 +562,41 @@ class MP2SmallQKnownValues(unittest.TestCase):
         self.assertIsNone(mp2ss.smallq_result)
         self.assertIsNone(result.smallq_result)
 
+    def test_mp2ss_passes_smallq_relative_shift(self):
+        options = MP2SSOptions(
+            smallq_band_df="FFTDF",
+            smallq_relative_shift=(0.25, 0.0, -0.5),
+            t2_store_type="ki",
+            pair_density_eval_grid="uniform",
+        )
+        fake_structure_factor = mock.MagicMock()
+        fake_structure_factor.grids.qGrid = np.asarray(self.kmf.kpts)
+        fake_smallq = mock.MagicMock()
+        fake_smallq.kernel.return_value = "smallq-result"
+
+        with (
+            mock.patch(
+                "fsec.singularity_subtraction.mp2ss.MP2StructureFactor",
+                return_value=fake_structure_factor,
+            ),
+            mock.patch(
+                "fsec.singularity_subtraction.mp2ss.MP2SmallQ",
+                return_value=fake_smallq,
+            ) as smallq_class,
+        ):
+            mp2ss = MP2SS(self.kmf, self.kmp, options=options)
+            mp2ss.set_structure_factor(
+                direct=True,
+                exchange=False,
+                dG0=False,
+            )
+
+        self.assertEqual(mp2ss.smallq_result, "smallq-result")
+        self.assertEqual(
+            smallq_class.call_args.kwargs["relative_shift"],
+            (0.25, 0.0, -0.5),
+        )
+
 
 class MP2SmallQ112KnownValues(unittest.TestCase):
     @classmethod
@@ -424,6 +749,99 @@ class MP2SmallQ112KnownValues(unittest.TestCase):
                 any(pair not in set(evaluated) for pair in requested)
             )
             for pair in requested:
+                with self.subTest(pair=pair):
+                    np.testing.assert_allclose(
+                        selective[pair],
+                        full[pair],
+                        rtol=1e-10,
+                        atol=1e-10,
+                    )
+        finally:
+            selective.close()
+            full.close()
+            for gdf_object in (selective_df, full_df):
+                cderi_temp = gdf_object._cderi_to_save
+                if not isinstance(cderi_temp, str):
+                    cderi_temp.close()
+
+    def test_selective_three_grid_cderi_matches_full_gdf(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="GDF",
+            band_exxdiv="ewald",
+            relative_shift=(0.25, 0.0, -0.5),
+            N_local=self.N_local,
+            pair_density_eval_grid="uniform",
+        )
+        qprime, grids = calculation._build_grids()
+        nkpts = len(grids.kGrid1)
+        ka_map = map_kpts(
+            self.cell,
+            grids.kGrid1 + qprime,
+            grids.kGrid2,
+            "ka",
+        )
+        kb_map = map_kpts(
+            self.cell,
+            grids.kGrid1 - qprime,
+            grids.kGrid3,
+            "kb",
+        )
+        combined_kpts = np.concatenate(
+            (grids.kGrid1, grids.kGrid2, grids.kGrid3), axis=0
+        )
+        requested = required_lov_pairs(
+            ka_map,
+            kb_map,
+            nkpts,
+            ka_offset=nkpts,
+            kb_offset=2 * nkpts,
+        )
+        closure = s2_pair_closure(requested)
+        combined_trs = kpts_helper.conj_mapping(self.cell, combined_kpts)
+        evaluated = trs_pair_representatives(closure, combined_trs)
+
+        selective_df = calculation._make_correlation_gdf(
+            combined_kpts,
+            evaluated,
+        )
+        selective = _TRSCDERIArray(
+            selective_df._cderi,
+            evaluated,
+            combined_trs,
+        )
+
+        source_df = self.kmf.with_df
+        full_df = df.GDF(self.cell, combined_kpts)
+        full_df.auxbasis = source_df.auxbasis
+        if source_df.mesh is not None:
+            full_df.mesh = np.asarray(source_df.mesh).copy()
+        full_df.linear_dep_threshold = source_df.linear_dep_threshold
+        full_df.exp_to_discard = source_df.exp_to_discard
+        full_df._prefer_ccdf = source_df._prefer_ccdf
+        full_df.build(j_only=False)
+        full = _TRSCDERIArray(
+            full_df._cderi,
+            [
+                (ki, kj)
+                for ki in range(len(combined_kpts))
+                for kj in range(len(combined_kpts))
+            ],
+            np.arange(len(combined_kpts)),
+        )
+
+        try:
+            self.assertEqual(selective.aosym, "s2")
+            stored_keys = {int(key) for key in selective._array.j3c.keys()}
+            self.assertEqual(
+                stored_keys,
+                {
+                    ki * len(combined_kpts) + kj
+                    for ki, kj in evaluated
+                },
+            )
+            for pair in closure:
                 with self.subTest(pair=pair):
                     np.testing.assert_allclose(
                         selective[pair],

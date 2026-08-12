@@ -7,7 +7,10 @@ import time
 from fsec.singularity_subtraction import model_function
 from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
-from fsec.singularity_subtraction.structure_factor.mp2_smallq import MP2SmallQ
+from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
+    MP2SmallQ,
+    normalize_relative_shift,
+)
 from fsec.singularity_subtraction.grids import MP2SSGrids
 from fsec.singularity_subtraction import SingularitySubtraction
 from pyscf.pbc import df
@@ -171,11 +174,14 @@ class MP2SSOptions:
         ``pyscf.lib.logger.DEBUG`` the final structure-factor table and other
         debug diagnostics are written to the inherited PySCF output stream.
     smallq_band_df
-        Density-fitting backend used for the half-shifted non-SCF bands.
+        Density-fitting backend used for the shifted non-SCF bands.
         Supported values are ``"FFTDF"`` and ``"GDF"``. ``None`` disables
         the small-q fitting point.
+    smallq_relative_shift
+        Three-component fractional grid shift used for the small-q fitting
+        point. Components must lie in ``[-0.5, 0.5]``.
     smallq_band_exxdiv
-        Exchange-divergence treatment used only for the half-shifted bands
+        Exchange-divergence treatment used only for the shifted bands
         calculation. GDF supports only ``None`` and ``"ewald"``.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
@@ -219,6 +225,7 @@ class MP2SSOptions:
     smallq_band_df: Optional[str] = None
     smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
+    smallq_relative_shift: object = (0.5, 0.5, 0.5)
 
     def __post_init__(self):
         pair_density_eval_grid = str(self.pair_density_eval_grid).strip().lower()
@@ -249,6 +256,11 @@ class MP2SSOptions:
                 "GDF bands only support smallq_band_exxdiv=None or 'ewald'; "
                 f"got {smallq_band_exxdiv!r}"
             )
+        smallq_relative_shift = normalize_relative_shift(
+            self.smallq_relative_shift,
+            name="smallq_relative_shift",
+            reject_zero=smallq_band_df is not None,
+        )
         laplace_direct_tol = float(self.laplace_direct_tol)
         laplace_direct_max_points = int(self.laplace_direct_max_points)
         if not np.isfinite(laplace_direct_tol) or laplace_direct_tol <= 0:
@@ -276,6 +288,11 @@ class MP2SSOptions:
         object.__setattr__(self, 'smallq_band_df', smallq_band_df)
         object.__setattr__(
             self, 'smallq_band_exxdiv', smallq_band_exxdiv
+        )
+        object.__setattr__(
+            self,
+            'smallq_relative_shift',
+            tuple(float(component) for component in smallq_relative_shift),
         )
         object.__setattr__(self, 'laplace_direct_tol', laplace_direct_tol)
         object.__setattr__(
@@ -1117,6 +1134,7 @@ class MP2SS:
         self.stdout = kmp.stdout
         self.smallq_band_df = options.smallq_band_df
         self.smallq_band_exxdiv = options.smallq_band_exxdiv
+        self.smallq_relative_shift = options.smallq_relative_shift
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
@@ -1249,6 +1267,7 @@ class MP2SS:
                 self.kmp,
                 band_df=self.smallq_band_df,
                 band_exxdiv=self.smallq_band_exxdiv,
+                relative_shift=self.smallq_relative_shift,
                 N_local=self.N_local,
                 sq_ke_cutoff=self.sq_ke_cutoff,
                 check_trs=self.check_trs,

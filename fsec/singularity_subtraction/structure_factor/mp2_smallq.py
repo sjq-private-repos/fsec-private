@@ -1,7 +1,8 @@
-"""Half-shifted small-q direct MP2 structure factors."""
+"""Shifted small-q direct MP2 structure factors."""
 
 from dataclasses import dataclass
 from typing import Optional
+import warnings
 
 import numpy as np
 from scipy.spatial import KDTree
@@ -26,6 +27,25 @@ from fsec.singularity_subtraction.structure_factor.mp2_sf import (
 )
 
 
+def normalize_relative_shift(value, *, name="relative_shift", reject_zero=False):
+    """Validate and return a three-component fractional grid shift."""
+    try:
+        shift = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as err:
+        raise ValueError(
+            f"{name} must contain exactly three finite components"
+        ) from err
+    if shift.shape != (3,):
+        raise ValueError(f"{name} must contain exactly three components")
+    if not np.all(np.isfinite(shift)):
+        raise ValueError(f"{name} components must be finite")
+    if np.any((shift < -0.5) | (shift > 0.5)):
+        raise ValueError(f"{name} components must lie in [-0.5, 0.5]")
+    if reject_zero and np.all(shift == 0.0):
+        raise ValueError(f"{name} must not be the all-zero shift for small-q")
+    return shift
+
+
 def normalize_band_df(value):
     if value is None:
         raise ValueError("band_df must be 'FFTDF' or 'GDF'")
@@ -43,14 +63,16 @@ def map_kpts(cell, targets, grid, label):
     return np.asarray(indices, dtype=int)
 
 
-def required_lov_pairs(ka_map, kb_map, nkpts):
+def required_lov_pairs(ka_map, kb_map, nkpts, ka_offset=None, kb_offset=None):
     """Return unique combined-grid indices required by Lov and Lov_b."""
+    ka_offset = nkpts if ka_offset is None else int(ka_offset)
+    kb_offset = nkpts if kb_offset is None else int(kb_offset)
     pairs = [
-        (ki, nkpts + int(ka))
+        (ki, ka_offset + int(ka))
         for ki, ka in enumerate(ka_map)
     ]
     pairs.extend(
-        (kj, nkpts + int(kb))
+        (kj, kb_offset + int(kb))
         for kj, kb in enumerate(kb_map)
     )
     # dict preserves the first occurrence and therefore keeps the output
@@ -204,7 +226,7 @@ class _TRSCDERIArray:
 
 @dataclass(frozen=True)
 class MP2SmallQResult:
-    """Direct structure-factor values at the positive half-shifted q point."""
+    """Direct structure-factor values at the requested shifted q point."""
 
     qprime: np.ndarray
     sq_direct: float
@@ -218,7 +240,7 @@ class MP2SmallQ:
 
     The occupied orbitals are taken from the converged mean-field k-mesh.  The
     virtual orbitals and energies are evaluated non-self-consistently on the
-    half-shifted mesh.
+    requested shifted mesh.
     """
 
     def __init__(
@@ -227,6 +249,7 @@ class MP2SmallQ:
         kmp,
         *,
         band_df,
+        relative_shift=(0.5, 0.5, 0.5),
         band_exxdiv="ewald",
         N_local=None,
         sq_ke_cutoff=None,
@@ -240,6 +263,10 @@ class MP2SmallQ:
         self.kmf = kmf
         self.kmp = kmp
         self.cell = kmf.cell
+        self.relative_shift = normalize_relative_shift(
+            relative_shift,
+            reject_zero=True,
+        )
         self.band_df = normalize_band_df(band_df)
         self.band_exxdiv = (
             band_exxdiv.strip().lower()
@@ -275,18 +302,26 @@ class MP2SmallQ:
                 f"got {self.band_exxdiv!r}"
             )
 
+    def _validate_correlation_df(self):
+        if not isinstance(self.kmf.with_df, (df.FFTDF, df.GDF)):
+            raise NotImplementedError(
+                "MP2 small-q correlation supports only FFTDF or GDF; "
+                f"got {type(self.kmf.with_df).__name__}"
+            )
+
     def _build_grids(self):
         nks = np.asarray(
             get_monkhorst_pack_size(self.cell, self.kmf.kpts), dtype=int
         )
-        scaled_half_shift = 0.5 / nks
-        qprime = np.asarray(self.cell.get_abs_kpts(scaled_half_shift))
+        qprime = np.asarray(
+            self.cell.get_abs_kpts(self.relative_shift / nks)
+        )
         grids = MP2SSGrids(
             self.cell,
             self.kmf.kpts,
             N_local=self.N_local,
             qG_norm_cutoff=np.inf,
-            relative_shift=np.full(3, 0.5),
+            relative_shift=self.relative_shift,
             shift_occ=False,
         )
         # The single-point evaluator only needs the coarse real-space
@@ -327,7 +362,10 @@ class MP2SmallQ:
         finally:
             if isinstance(band_df, df.GDF):
                 cderi_temp = band_df._cderi_to_save
-                if not isinstance(cderi_temp, str):
+                if (
+                    cderi_temp is not None
+                    and not isinstance(cderi_temp, str)
+                ):
                     cderi_temp.close()
         if profile is not None:
             profile.stop("shifted-band Fock diagonalization", phase_t0)
@@ -344,41 +382,48 @@ class MP2SmallQ:
         correlation_df._prefer_ccdf = source_df._prefer_ccdf
         # Initializing without j3c constructs the auxiliary basis while
         # avoiding the full Cartesian product of the combined k-point grid.
-        correlation_df.build(j_only=False, with_j3c=False)
-        cderi_file = correlation_df._cderi_to_save
-        if not isinstance(cderi_file, str):
-            cderi_file = cderi_file.name
-        nkpts = len(combined_kpts)
-        kk_idx = np.asarray(
-            [ki * nkpts + kj for ki, kj in evaluated_pairs],
-            dtype=np.int32,
-        )
-        if correlation_df._prefer_ccdf or self.cell.omega > 0:
-            builder = _SelectiveCCGDFBuilder(
-                self.cell,
-                correlation_df.auxcell,
-                combined_kpts,
+        try:
+            correlation_df.build(j_only=False, with_j3c=False)
+            cderi_temp = correlation_df._cderi_to_save
+            cderi_file = cderi_temp
+            if not isinstance(cderi_file, str):
+                cderi_file = cderi_file.name
+            nkpts = len(combined_kpts)
+            kk_idx = np.asarray(
+                [ki * nkpts + kj for ki, kj in evaluated_pairs],
+                dtype=np.int32,
             )
-            builder.eta = correlation_df.eta
-        else:
-            builder = _SelectiveRSGDFBuilder(
-                self.cell,
-                correlation_df.auxcell,
-                combined_kpts,
+            if correlation_df._prefer_ccdf or self.cell.omega > 0:
+                builder = _SelectiveCCGDFBuilder(
+                    self.cell,
+                    correlation_df.auxcell,
+                    combined_kpts,
+                )
+                builder.eta = correlation_df.eta
+            else:
+                builder = _SelectiveRSGDFBuilder(
+                    self.cell,
+                    correlation_df.auxcell,
+                    combined_kpts,
+                )
+            builder.mesh = correlation_df.mesh
+            builder.linear_dep_threshold = (
+                correlation_df.linear_dep_threshold
             )
-        builder.mesh = correlation_df.mesh
-        builder.linear_dep_threshold = (
-            correlation_df.linear_dep_threshold
-        )
-        builder.selective_kk_idx = kk_idx
-        builder.make_j3c(
-            cderi_file,
-            j_only=False,
-            dataname=correlation_df._dataname,
-            aosym="s2",
-        )
-        correlation_df._cderi = cderi_file
-        return correlation_df
+            builder.selective_kk_idx = kk_idx
+            builder.make_j3c(
+                cderi_file,
+                j_only=False,
+                dataname=correlation_df._dataname,
+                aosym="s2",
+            )
+            correlation_df._cderi = cderi_file
+            return correlation_df
+        except Exception:
+            cderi_temp = getattr(correlation_df, "_cderi_to_save", None)
+            if cderi_temp is not None and not isinstance(cderi_temp, str):
+                cderi_temp.close()
+            raise
 
     def _build_lov(
         self,
@@ -387,10 +432,21 @@ class MP2SmallQ:
         mo_coeff_occ,
         mo_coeff_shifted,
         profile=None,
+        mo_coeff_shifted_b=None,
     ):
         """Build only the occupied-to-shifted GDF tensors needed at qprime."""
         nkpts = len(grids.kGrid1)
-        combined_kpts = np.concatenate((grids.kGrid1, grids.kGrid2), axis=0)
+        distinct_grids = grids.kGrid3_neq_kGrid2
+        if mo_coeff_shifted_b is None:
+            mo_coeff_shifted_b = mo_coeff_shifted
+        if distinct_grids:
+            grid_offsets = (0, nkpts, 2 * nkpts)
+            combined_kpts = np.concatenate(
+                (grids.kGrid1, grids.kGrid2, grids.kGrid3), axis=0
+            )
+        else:
+            grid_offsets = (0, nkpts, nkpts)
+            combined_kpts = np.concatenate((grids.kGrid1, grids.kGrid2), axis=0)
         phase_t0 = profile.start() if profile is not None else None
         ka_map = map_kpts(
             self.cell,
@@ -404,7 +460,13 @@ class MP2SmallQ:
             grids.kGrid3,
             "k_j - qprime",
         )
-        kpt_pairs = required_lov_pairs(ka_map, kb_map, nkpts)
+        kpt_pairs = required_lov_pairs(
+            ka_map,
+            kb_map,
+            nkpts,
+            ka_offset=grid_offsets[1],
+            kb_offset=grid_offsets[2],
+        )
         s2_pairs = s2_pair_closure(kpt_pairs)
         log = logger.new_logger(self.kmp, self.verbose)
 
@@ -414,20 +476,39 @@ class MP2SmallQ:
                 self.cell,
                 grids.kGrid1,
             )
-            trs_shifted = kpts_helper.conj_mapping(
-                self.cell,
-                grids.kGrid2,
-            )
-            if not np.array_equal(
-                trs_shifted[ka_map],
-                kb_map[trs_occ],
-            ):
-                raise ValueError(
-                    "ia and jb mappings are not time-reversal equivariant"
+            if distinct_grids:
+                # The TR partner of a ka point lives on the separate kb
+                # grid.  Build one map over the complete union so the
+                # selective s2 file can reconstruct all omitted blocks.
+                combined_trs = kpts_helper.conj_mapping(
+                    self.cell,
+                    combined_kpts,
                 )
-            combined_trs = np.concatenate(
-                (trs_occ, nkpts + trs_shifted)
-            )
+                if not np.array_equal(
+                    combined_trs[grid_offsets[1] + ka_map],
+                    grid_offsets[2] + kb_map[trs_occ],
+                ) or not np.array_equal(
+                    combined_trs[grid_offsets[2] + kb_map],
+                    grid_offsets[1] + ka_map[trs_occ],
+                ):
+                    raise ValueError(
+                        "ia and jb mappings are not time-reversal equivariant"
+                    )
+            else:
+                trs_shifted = kpts_helper.conj_mapping(
+                    self.cell,
+                    grids.kGrid2,
+                )
+                if not np.array_equal(
+                    trs_shifted[ka_map],
+                    kb_map[trs_occ],
+                ):
+                    raise ValueError(
+                        "ia and jb mappings are not time-reversal equivariant"
+                    )
+                combined_trs = np.concatenate(
+                    (trs_occ, nkpts + trs_shifted)
+                )
             evaluated_pairs = trs_pair_representatives(
                 s2_pairs,
                 combined_trs,
@@ -468,6 +549,10 @@ class MP2SmallQ:
             combined_trs,
         )
         if cderi_array.aosym != "s2":
+            cderi_array.close()
+            cderi_temp = correlation_df._cderi_to_save
+            if cderi_temp is not None and not isinstance(cderi_temp, str):
+                cderi_temp.close()
             raise RuntimeError(
                 "selective Lov GDF must retain aosym='s2'"
             )
@@ -477,21 +562,25 @@ class MP2SmallQ:
         nvir = nmo - nocc
         nao = self.cell.nao_nr()
         dtype = np.result_type(
-            np.complex128, *mo_coeff_occ, *mo_coeff_shifted
+            np.complex128,
+            *mo_coeff_occ,
+            *mo_coeff_shifted,
+            *mo_coeff_shifted_b,
         )
 
         lov_a = np.empty(nkpts, dtype=object)
         lov_b = np.empty(nkpts, dtype=object)
-        transform_cache = {}
+        transform_cache_a = {}
+        transform_cache_b = transform_cache_a if not distinct_grids else {}
 
-        def transform(ko, kv):
+        def transform(cache, ko, kv, grid_offset, mo_coeff_virtual):
             key = (int(ko), int(kv))
-            if key in transform_cache:
-                return transform_cache[key]
+            if key in cache:
+                return cache[key]
 
             phase_t0 = profile.start() if profile is not None else None
-            Lpq_ao = cderi_array[ko, nkpts + kv]
-            mo = np.hstack((mo_coeff_occ[ko], mo_coeff_shifted[kv]))
+            Lpq_ao = cderi_array[ko, grid_offset + kv]
+            mo = np.hstack((mo_coeff_occ[ko], mo_coeff_virtual[kv]))
             mo = np.asarray(mo, dtype=dtype, order="F")
             if Lpq_ao[0].size != nao**2:
                 Lpq_ao = lib.unpack_tril(Lpq_ao).astype(np.complex128)
@@ -509,18 +598,33 @@ class MP2SmallQ:
             if profile is not None:
                 profile.stop("Lov AO-to-MO transformation", phase_t0)
             out = out.reshape(-1, nocc, nvir)
-            transform_cache[key] = out
+            cache[key] = out
             return out
 
         try:
             for ki, ka in enumerate(ka_map):
-                lov_a[ki] = transform(ki, ka)
+                lov_a[ki] = transform(
+                    transform_cache_a,
+                    ki,
+                    ka,
+                    grid_offsets[1],
+                    mo_coeff_shifted,
+                )
             for kj, kb in enumerate(kb_map):
-                lov_b[kj] = transform(kj, kb)
+                lov_b[kj] = transform(
+                    transform_cache_b,
+                    kj,
+                    kb,
+                    grid_offsets[2],
+                    mo_coeff_shifted_b,
+                )
         finally:
             cderi_array.close()
             cderi_temp = correlation_df._cderi_to_save
-            if not isinstance(cderi_temp, str):
+            if (
+                cderi_temp is not None
+                and not isinstance(cderi_temp, str)
+            ):
                 cderi_temp.close()
         return lov_a, lov_b
 
@@ -529,14 +633,39 @@ class MP2SmallQ:
         profile = TimingProfile()
         total_t0 = profile.start()
 
+        self._validate_correlation_df()
+
         phase_t0 = profile.start()
         qprime, grids = self._build_grids()
         profile.stop("small-q grid construction", phase_t0)
+        if (
+            self.band_exxdiv == "ewald"
+            and np.linalg.norm(qprime) < 0.1
+        ):
+            warnings.warn(
+                "MP2 small-q band calculation uses Ewald at a very small "
+                "Cartesian qprime; the result may be sensitive to the "
+                "exchange-divergence treatment.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
-        shifted_energy, shifted_coeff = self._get_shifted_bands(
-            grids.kGrid2,
-            profile=profile,
-        )
+        if grids.kGrid3_neq_kGrid2:
+            nkpts = len(grids.kGrid1)
+            shifted_energy_all, shifted_coeff_all = self._get_shifted_bands(
+                np.concatenate((grids.kGrid2, grids.kGrid3), axis=0),
+                profile=profile,
+            )
+            shifted_energy = shifted_energy_all[:nkpts]
+            shifted_energy_b = shifted_energy_all[nkpts:]
+            shifted_coeff = shifted_coeff_all[:nkpts]
+            shifted_coeff_b = shifted_coeff_all[nkpts:]
+        else:
+            shifted_energy, shifted_coeff = self._get_shifted_bands(
+                grids.kGrid2,
+                profile=profile,
+            )
+            shifted_energy_b, shifted_coeff_b = shifted_energy, shifted_coeff
 
         phase_t0 = profile.start()
         mo_coeff_occ, mo_energy_occ = kmp2._add_padding(
@@ -544,6 +673,9 @@ class MP2SmallQ:
         )
         mo_coeff_shifted, mo_energy_shifted = kmp2._add_padding(
             self.kmp, shifted_coeff, shifted_energy
+        )
+        mo_coeff_shifted_b, mo_energy_shifted_b = kmp2._add_padding(
+            self.kmp, shifted_coeff_b, shifted_energy_b
         )
         # Shifted-grid integrals are generally complex even when the
         # origin-centered SCF coefficients happen to be real (for example at
@@ -555,23 +687,26 @@ class MP2SmallQ:
             np.asarray(coeff, dtype=np.complex128)
             for coeff in mo_coeff_shifted
         ]
+        mo_coeff_shifted_b = [
+            np.asarray(coeff, dtype=np.complex128)
+            for coeff in mo_coeff_shifted_b
+        ]
 
         nocc = self.kmp.nocc
         mo_e_o = np.asarray(mo_energy_occ)[:, :nocc]
         mo_e_v = np.asarray(mo_energy_shifted)[:, nocc:]
+        mo_e_v_b = np.asarray(mo_energy_shifted_b)[:, nocc:]
         profile.stop("MO padding and dtype preparation", phase_t0)
 
         lov = lov_b = None
-        if (
-            self.kmp.with_df_ints
-            and isinstance(self.kmf.with_df, df.GDF)
-        ):
+        if isinstance(self.kmf.with_df, df.GDF):
             lov, lov_b = self._build_lov(
                 grids,
                 qprime,
                 mo_coeff_occ,
                 mo_coeff_shifted,
                 profile=profile,
+                mo_coeff_shifted_b=mo_coeff_shifted_b,
             )
 
         phase_t0 = profile.start()
@@ -603,11 +738,11 @@ class MP2SmallQ:
             grids=grids,
             mo_coeff_kpts1=mo_coeff_occ,
             mo_coeff_kpts2=mo_coeff_shifted,
-            mo_coeff_kpts3=mo_coeff_shifted,
+            mo_coeff_kpts3=mo_coeff_shifted_b,
             mo_energy=mo_energy_occ,
             mo_e_o=mo_e_o,
             mo_e_v=mo_e_v,
-            mo_e_v_b=mo_e_v,
+            mo_e_v_b=mo_e_v_b,
             t2_store_type="ki",
             Lov=lov,
             Lov_b=lov_b,

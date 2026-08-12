@@ -579,7 +579,14 @@ class MP2StructureFactor(StructureFactor):
             t2_store_type = "kikj_lov"
         kikj_lov = t2_store_type == 'kikj_lov'
         
-        with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
+        # A small-q caller may provide Lov tensors built on a temporary
+        # shifted-grid GDF even when the public KMP2 flag was disabled.  The
+        # supplied tensors select the DF contraction locally; the flag itself
+        # is left untouched.
+        with_df_ints = (
+            isinstance(kmf.with_df, df.GDF)
+            and (kmp.with_df_ints or Lov is not None or Lov_b is not None)
+        )
         if kikj_lov:
             if t2_given:
                 raise NotImplementedError("t2_store_type='kikj_lov' does not accept precomputed t2 amplitudes")
@@ -638,12 +645,21 @@ class MP2StructureFactor(StructureFactor):
         nocc = self.kmp.nocc
         # nbands = kmf.cell.nao_nr()
         nbands = self.kmp.nmo
-        fao2mo = self.kmp._scf.with_df.ao2mo
+        fao2mo = kmf.with_df.ao2mo
         nvir = nbands - nocc
         phase_t0 = profile.start()
         
-        kgrids_equal = kGrid1 is kGrid2 or np.allclose(kGrid1, kGrid2, atol=1e-8)
+        # Grid identity is a discrete property.  Tolerance-based comparisons
+        # would collapse a valid but very small nonzero shift onto zero.
+        kgrids_equal = kGrid1 is kGrid2 or np.array_equal(kGrid1, kGrid2)
         mo_coeffs_equal = mo_coeff_kpts1 is mo_coeff_kpts2 or np.allclose(mo_coeff_kpts1, mo_coeff_kpts2, atol=1e-8)
+        virtual_grids_equal = (
+            not grids.kGrid3_neq_kGrid2
+        )
+        virtual_mo_coeffs_equal = (
+            mo_coeff_kpts2 is mo_coeff_kpts3
+            or np.allclose(mo_coeff_kpts2, mo_coeff_kpts3, atol=1e-8)
+        )
 
         if mo_energy is None:
             mo_energy = mo_energy_padded
@@ -677,7 +693,7 @@ class MP2StructureFactor(StructureFactor):
                 uKpts_b_local = uKpts_i_local
             else:
                 uKpts_i_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
-                uKpts_j_local = build_uKpts(kmf, kGrid1, mo_coeff_kpts1, rptGrid3D=rptGrid3D, nbands=nbands)
+                uKpts_j_local = uKpts_i_local
                 uKpts_a_local = build_uKpts(kmf, kGrid2, mo_coeff_kpts2, rptGrid3D=rptGrid3D, nbands=nbands)
                 uKpts_b_local = build_uKpts(kmf, kGrid3, mo_coeff_kpts3, rptGrid3D=rptGrid3D, nbands=nbands) # SJQ checked
 
@@ -862,6 +878,7 @@ class MP2StructureFactor(StructureFactor):
         contract_expression_rijab = 'mia,nbj->mnijab'
         use_trs_unique_pair_rijab = (
             kgrid_occ_trs and trs_map is not None and check_trs
+            and virtual_grids_equal and virtual_mo_coeffs_equal
             and t2_store_type in ('kikjka', 'kikj', 'kikj_lov')
         )
         trs_unique_pairs = None
@@ -1008,7 +1025,13 @@ class MP2StructureFactor(StructureFactor):
             
             kas_at_qi = kas[qi]
             kbs_at_qi = kbs[qi]
-            if kgrid_occ_trs and trs_map is not None and check_trs:
+            if (
+                kgrid_occ_trs
+                and trs_map is not None
+                and check_trs
+                and virtual_grids_equal
+                and virtual_mo_coeffs_equal
+            ):
                 # Use time-reversal symmetry 
                 exp_term_as = np.exp(-1j * (rptGrid3D @ kGdiffas.T)).T
                 profile.stop("per-qG index/phase setup", region_t0)
