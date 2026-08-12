@@ -361,6 +361,42 @@ class MP2StructureFactor(StructureFactor):
         mesh_idx = np.hstack([xv.reshape(-1, 1), yv.reshape(-1, 1), zv.reshape(-1, 1)])
         return mesh_idx @ L_delta
 
+    @staticmethod
+    def _log_structure_factors(log, qG_full, SqG_full_direct,
+                               SqG_full_exchange, SqG_full_q4,
+                               SqG_full_direct_mask,
+                               SqG_full_exchange_mask,
+                               SqG_full_q4_mask, direct, exchange, dG0):
+        """Log final structure-factor values alongside their q+G vectors."""
+        log.note("MP2 structure factors by q+G point:")
+        log.note(
+            "%8s %23s %23s %23s %23s %23s %23s",
+            "index", "qG_x", "qG_y", "qG_z", "SqG_direct",
+            "SqG_exchange", "SqG_q4",
+        )
+
+        def format_value(value, available):
+            return f"{value:.16e}" if available else "N/A"
+
+        for index, qGpt in enumerate(qG_full):
+            direct_value = format_value(
+                SqG_full_direct[index],
+                direct and SqG_full_direct_mask[index],
+            )
+            exchange_value = format_value(
+                SqG_full_exchange[index],
+                exchange and SqG_full_exchange_mask[index],
+            )
+            q4_value = format_value(
+                SqG_full_q4[index],
+                dG0 and SqG_full_q4_mask[index],
+            )
+            log.note(
+                "%8d %23.16e %23.16e %23.16e %23s %23s %23s",
+                index, qGpt[0], qGpt[1], qGpt[2], direct_value,
+                exchange_value, q4_value,
+            )
+
     def build_structure_factor(self,direct=False,exchange=False,qG_full=None,
                                update_class=True, qG_cutoff=None, dG0=False,
                                grids=None, mo_coeff_kpts1=None, mo_coeff_kpts2=None, mo_coeff_kpts3=None, 
@@ -374,7 +410,8 @@ class MP2StructureFactor(StructureFactor):
                                outer_sq_ke_cutoff_scale=None,
                                pair_density_eval_grid=None,
                                pair_density_becke_grid_level=None,
-                               rsdf_occ_block_size=None):
+                               rsdf_occ_block_size=None,
+                               debug_structure_factors=False):
         """
         Build the MP2 structure factor, either direct term, exchange term, or both.
 
@@ -406,6 +443,11 @@ class MP2StructureFactor(StructureFactor):
         pair_density_becke_grid_level : int, optional
             PySCF Becke grid level used when ``pair_density_eval_grid="becke"``.
             Defaults to the class setting, which defaults to 0.
+        debug_structure_factors : bool, optional
+            If True, log a table pairing every retained q+G point with the
+            final direct, exchange, and q4 structure-factor values. Components
+            that were not requested or whose masks mark them unavailable are
+            displayed as ``N/A``. Defaults to False.
         Returns
         -------
         SqG_full_direct : np.ndarray
@@ -1403,6 +1445,20 @@ class MP2StructureFactor(StructureFactor):
                 t2_cache_counts['direct_hits'], t2_cache_counts['direct_misses'],
                 t2_cache_counts['exchange_hits'], t2_cache_counts['exchange_misses'],
                 cache_mem,
+            )
+        if debug_structure_factors:
+            self._log_structure_factors(
+                log,
+                qG_full,
+                SqG_full_direct,
+                SqG_full_exchange,
+                SqG_full_q4,
+                SqG_full_direct_mask,
+                SqG_full_exchange_mask,
+                SqG_full_q4_mask,
+                direct,
+                exchange,
+                dG0,
             )
         if update_class:
             phase_t0 = profile.start()
