@@ -206,7 +206,7 @@ class MP2SmallQKnownValues(unittest.TestCase):
         self.assertFalse(grids.kGrid3_neq_kGrid2)
         np.testing.assert_allclose(grids.kGrid2, grids.kGrid3, atol=1e-12)
 
-    def test_distinct_shift_splits_band_inputs_and_warns_once(self):
+    def test_distinct_shift_recomputes_and_propagates_all_band_blocks(self):
         calculation = MP2SmallQ(
             self.kmf,
             self.kmp,
@@ -217,8 +217,8 @@ class MP2SmallQKnownValues(unittest.TestCase):
             pair_density_eval_grid="uniform",
         )
         band_calls = []
-        band_energy = [np.asarray(e) for e in self.kmp.mo_energy]
-        band_coeff = [np.asarray(c) for c in self.kmp.mo_coeff]
+        base_energy = [np.asarray(e) for e in self.kmp.mo_energy]
+        base_coeff = [np.asarray(c) for c in self.kmp.mo_coeff]
 
         fake_structure_factor = mock.MagicMock()
         fake_structure_factor.build_structure_factor.return_value = {
@@ -228,12 +228,22 @@ class MP2SmallQKnownValues(unittest.TestCase):
 
         def fake_bands(kpts, profile=None):
             band_calls.append(np.asarray(kpts).copy())
-            return band_energy * 2, band_coeff * 2
+            energies = []
+            coeffs = []
+            for index in range(len(kpts)):
+                # Give every returned point a distinguishable value so the
+                # ordered ki/ka/kb split is observable below.
+                energies.append(base_energy[index % len(base_energy)] + index)
+                coeffs.append(base_coeff[index % len(base_coeff)] + index)
+            return energies, coeffs
 
         with (
             mock.patch.object(
                 calculation, "_get_shifted_bands", side_effect=fake_bands
             ),
+            mock.patch.object(
+                calculation, "_build_lov", return_value=(None, None)
+            ) as build_lov,
             mock.patch(
                 "fsec.singularity_subtraction.structure_factor.mp2_smallq."
                 "MP2StructureFactor",
@@ -251,15 +261,50 @@ class MP2SmallQKnownValues(unittest.TestCase):
         self.assertEqual(len(runtime_warnings), 1)
         self.assertEqual(len(band_calls), 1)
         nkpts = len(self.kmf.kpts)
-        self.assertEqual(len(band_calls[0]), 2 * nkpts)
-        self.assertFalse(
-            np.allclose(band_calls[0][:nkpts], band_calls[0][nkpts:])
+        self.assertEqual(len(band_calls[0]), 3 * nkpts)
+        _, grids = calculation._build_grids()
+        np.testing.assert_allclose(
+            band_calls[0],
+            np.concatenate(
+                (grids.kGrid1, grids.kGrid2, grids.kGrid3), axis=0
+            ),
         )
         build_kwargs = fake_structure_factor.build_structure_factor.call_args.kwargs
+        np.testing.assert_allclose(
+            build_kwargs["mo_energy"][0],
+            base_energy[0],
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts1"][0],
+            base_coeff[0],
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts2"][0],
+            base_coeff[0] + nkpts,
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts3"][0],
+            base_coeff[0] + 2 * nkpts,
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_e_v"][0],
+            (base_energy[0] + nkpts)[self.kmp.nocc:],
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_e_v_b"][0],
+            (base_energy[0] + 2 * nkpts)[self.kmp.nocc:],
+        )
         self.assertIsNot(
             build_kwargs["mo_coeff_kpts2"], build_kwargs["mo_coeff_kpts3"]
         )
         self.assertIsNot(build_kwargs["mo_e_v"], build_kwargs["mo_e_v_b"])
+        lov_args = build_lov.call_args.args
+        np.testing.assert_allclose(lov_args[2][0], base_coeff[0])
+        np.testing.assert_allclose(lov_args[3][0], base_coeff[0] + nkpts)
+        np.testing.assert_allclose(
+            build_lov.call_args.kwargs["mo_coeff_shifted_b"][0],
+            base_coeff[0] + 2 * nkpts,
+        )
         self.assertEqual(result.qprime.shape, (3,))
 
         reciprocal_norm = np.linalg.norm(self.cell.reciprocal_vectors()[0])
@@ -276,6 +321,9 @@ class MP2SmallQKnownValues(unittest.TestCase):
             mock.patch.object(
                 above_threshold, "_get_shifted_bands", side_effect=fake_bands
             ),
+            mock.patch.object(
+                above_threshold, "_build_lov", return_value=(None, None)
+            ),
             mock.patch(
                 "fsec.singularity_subtraction.structure_factor.mp2_smallq."
                 "MP2StructureFactor",
@@ -288,6 +336,153 @@ class MP2SmallQKnownValues(unittest.TestCase):
         self.assertFalse(
             any(warning.category is RuntimeWarning for warning in caught)
         )
+
+    def test_self_inverse_shift_reuses_shifted_band_block(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            relative_shift=(-0.5, -0.5, -0.5),
+            N_local=(3, 3, 3),
+            pair_density_eval_grid="uniform",
+            check_trs=False,
+        )
+        band_calls = []
+        base_energy = [np.asarray(e) for e in self.kmp.mo_energy]
+        base_coeff = [np.asarray(c) for c in self.kmp.mo_coeff]
+        fake_structure_factor = mock.MagicMock()
+        fake_structure_factor.build_structure_factor.return_value = {
+            "SqG_full_direct": np.asarray([-1.0]),
+            "SqG_full_q4": np.asarray([-2.0]),
+        }
+
+        def fake_bands(kpts, profile=None):
+            band_calls.append(np.asarray(kpts).copy())
+            energies = [
+                base_energy[index % len(base_energy)] + index
+                for index in range(len(kpts))
+            ]
+            coeffs = [
+                base_coeff[index % len(base_coeff)] + index
+                for index in range(len(kpts))
+            ]
+            return energies, coeffs
+
+        with (
+            mock.patch.object(
+                calculation, "_get_shifted_bands", side_effect=fake_bands
+            ),
+            mock.patch.object(
+                calculation, "_build_lov", return_value=(None, None)
+            ),
+            mock.patch(
+                "fsec.singularity_subtraction.structure_factor.mp2_smallq."
+                "MP2StructureFactor",
+                return_value=fake_structure_factor,
+            ),
+        ):
+            calculation.kernel()
+
+        nkpts = len(self.kmf.kpts)
+        self.assertEqual(len(band_calls), 1)
+        self.assertEqual(len(band_calls[0]), 2 * nkpts)
+        _, grids = calculation._build_grids()
+        np.testing.assert_allclose(
+            band_calls[0],
+            np.concatenate((grids.kGrid1, grids.kGrid2), axis=0),
+        )
+        build_kwargs = fake_structure_factor.build_structure_factor.call_args.kwargs
+        self.assertIs(
+            build_kwargs["mo_coeff_kpts2"],
+            build_kwargs["mo_coeff_kpts3"],
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts2"][0],
+            base_coeff[0] + nkpts,
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts3"][0],
+            base_coeff[0] + nkpts,
+        )
+
+    def test_recomputed_ki_bands_ignore_stale_kmp_inputs(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            N_local=(3, 3, 3),
+            pair_density_eval_grid="uniform",
+            check_trs=False,
+        )
+        original_energy = self.kmp.mo_energy
+        original_coeff = self.kmp.mo_coeff
+        stale_energy = [np.asarray(energy) + 100.0 for energy in original_energy]
+        stale_coeff = [np.asarray(coeff) + 100.0 for coeff in original_coeff]
+        pure_energy = [np.asarray(energy) - 10.0 for energy in original_energy]
+        pure_coeff = [np.asarray(coeff) - 10.0 for coeff in original_coeff]
+        fake_structure_factor = mock.MagicMock()
+        fake_structure_factor.build_structure_factor.return_value = {
+            "SqG_full_direct": np.asarray([-1.0]),
+            "SqG_full_q4": np.asarray([-2.0]),
+        }
+
+        def fake_bands(kpts, profile=None):
+            npoints = len(kpts)
+            return (
+                [pure_energy[index % len(pure_energy)] for index in range(npoints)],
+                [pure_coeff[index % len(pure_coeff)] for index in range(npoints)],
+            )
+
+        self.kmp.mo_energy = stale_energy
+        self.kmp.mo_coeff = stale_coeff
+        try:
+            with (
+                mock.patch.object(
+                    calculation, "_get_shifted_bands", side_effect=fake_bands
+                ),
+                mock.patch.object(
+                    calculation, "_build_lov", return_value=(None, None)
+                ),
+                mock.patch(
+                    "fsec.singularity_subtraction.structure_factor.mp2_smallq."
+                    "MP2StructureFactor",
+                    return_value=fake_structure_factor,
+                ),
+            ):
+                calculation.kernel()
+        finally:
+            self.kmp.mo_energy = original_energy
+            self.kmp.mo_coeff = original_coeff
+
+        build_kwargs = fake_structure_factor.build_structure_factor.call_args.kwargs
+        np.testing.assert_allclose(
+            build_kwargs["mo_energy"][0], pure_energy[0]
+        )
+        np.testing.assert_allclose(
+            build_kwargs["mo_coeff_kpts1"][0], pure_coeff[0]
+        )
+        self.assertFalse(
+            np.allclose(build_kwargs["mo_energy"][0], stale_energy[0])
+        )
+
+    def test_band_block_count_mismatch_is_rejected(self):
+        calculation = MP2SmallQ(
+            self.kmf,
+            self.kmp,
+            band_df="FFTDF",
+            relative_shift=(0.25, 0.0, -0.5),
+            N_local=(3, 3, 3),
+        )
+        _, grids = calculation._build_grids()
+        with (
+            mock.patch.object(
+                calculation,
+                "_get_shifted_bands",
+                return_value=([self.kmp.mo_energy[0]], []),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected 3"),
+        ):
+            calculation._get_band_blocks(grids)
 
     def test_rejects_unsupported_correlation_df(self):
         original_df = self.kmf.with_df
@@ -309,8 +504,8 @@ class MP2SmallQKnownValues(unittest.TestCase):
 
     def test_fftdf_and_gdf_reference_values(self):
         references = {
-            "FFTDF": (-1.5455616988656258e-4, -8.910009779750352e-7),
-            "GDF": (-1.439918272607873e-4, -8.302497872716938e-7),
+            "FFTDF": (-1.4880756934176656e-4, -8.580232969749587e-7),
+            "GDF": (-1.4399182726078822e-4, -8.302497872716984e-7),
         }
         for backend, (sq_direct, sq_q4) in references.items():
             with self.subTest(backend=backend):
@@ -370,10 +565,10 @@ class MP2SmallQKnownValues(unittest.TestCase):
             self.kmp.with_df_ints = original_with_df_ints
 
         self.assertAlmostEqual(
-            result.sq_direct, -4.2075874894386875e-4, delta=1e-10
+            result.sq_direct, -4.2940956150106673e-4, delta=1e-10
         )
         self.assertAlmostEqual(
-            result.sq_q4, -3.6641325303662666e-6, delta=1e-11
+            result.sq_q4, -3.8091174426527914e-6, delta=1e-11
         )
         self.assertEqual(self.kmp.with_df_ints, original_with_df_ints)
 
@@ -397,10 +592,10 @@ class MP2SmallQKnownValues(unittest.TestCase):
             self.kmp.with_df_ints = original_with_df_ints
 
         self.assertAlmostEqual(
-            result.sq_direct, -4.3787538195184196e-4, delta=1e-10
+            result.sq_direct, -4.474443278105192e-4, delta=1e-10
         )
         self.assertAlmostEqual(
-            result.sq_q4, -3.6641325303662683e-6, delta=1e-11
+            result.sq_q4, -3.8091174426527935e-6, delta=1e-11
         )
 
     def test_fftdf_band_exxdiv_is_temporary(self):
@@ -428,6 +623,75 @@ class MP2SmallQKnownValues(unittest.TestCase):
         self.assertEqual(observed, [("vcut_sph", df.FFTDF)])
         self.assertIs(self.kmf.with_df, original_df)
         self.assertEqual(self.kmf.exxdiv, original_exxdiv)
+
+        with (
+            mock.patch.object(
+                self.kmf,
+                "get_bands",
+                side_effect=RuntimeError("band diagonalization failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "diagonalization failed"),
+        ):
+            calculation._get_shifted_bands(grids.kGrid2)
+        self.assertIs(self.kmf.with_df, original_df)
+        self.assertEqual(self.kmf.exxdiv, original_exxdiv)
+
+    def test_temporary_gdf_closes_when_band_diagonalization_fails(self):
+        calculation = self._smallq("GDF", band_exxdiv="ewald")
+        _, grids = calculation._build_grids()
+        temporary_df = df.GDF(self.cell, self.kmf.kpts)
+        temporary_handle = mock.Mock()
+        temporary_df._cderi_to_save = temporary_handle
+        original_df = self.kmf.with_df
+        original_exxdiv = self.kmf.exxdiv
+
+        with (
+            mock.patch.object(
+                calculation, "_make_band_df", return_value=temporary_df
+            ),
+            mock.patch.object(
+                self.kmf,
+                "get_bands",
+                side_effect=RuntimeError("band diagonalization failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "diagonalization failed"),
+        ):
+            calculation._get_shifted_bands(grids.kGrid2)
+
+        temporary_handle.close.assert_called_once_with()
+        self.assertIs(self.kmf.with_df, original_df)
+        self.assertEqual(self.kmf.exxdiv, original_exxdiv)
+
+    def test_same_df_ki_occupied_virtual_blocks_are_orthogonal(self):
+        calculation = self._smallq("FFTDF", band_exxdiv="vcut_sph")
+        _, grids = calculation._build_grids()
+        _, band_coeff = calculation._get_shifted_bands(grids.kGrid1)
+        overlap = self.kmf.get_ovlp(self.cell, grids.kGrid1)
+        for kindex, coeff in enumerate(band_coeff):
+            occupied = coeff[:, :self.kmp.nocc]
+            virtual = coeff[:, self.kmp.nocc:]
+            cross_overlap = occupied.conj().T @ overlap[kindex] @ virtual
+            np.testing.assert_allclose(cross_overlap, 0.0, atol=1e-10)
+
+    def test_small_shift_raw_structure_factors_decrease(self):
+        results = []
+        for shift in (0.01, 0.005):
+            results.append(MP2SmallQ(
+                self.kmf,
+                self.kmp,
+                band_df="FFTDF",
+                band_exxdiv="vcut_sph",
+                relative_shift=(shift, shift, shift),
+                N_local=self.N_local,
+                pair_density_eval_grid="uniform",
+                check_trs=False,
+            ).kernel())
+
+        for result in results:
+            self.assertTrue(np.isfinite(result.sq_direct))
+            self.assertTrue(np.isfinite(result.sq_q4))
+        self.assertLess(abs(results[1].sq_direct), abs(results[0].sq_direct))
+        self.assertLess(abs(results[1].sq_q4), abs(results[0].sq_q4))
 
     def test_positive_half_shift_and_periodic_mappings(self):
         for mesh in ((1, 1, 1), (1, 1, 2), (2, 2, 2)):

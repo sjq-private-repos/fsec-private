@@ -238,9 +238,10 @@ class MP2SmallQResult:
 class MP2SmallQ:
     """Compute direct and fourth-order MP2 structure factors at one small q.
 
-    The occupied orbitals are taken from the converged mean-field k-mesh.  The
-    virtual orbitals and energies are evaluated non-self-consistently on the
-    requested shifted mesh.
+    All occupied and virtual bands are evaluated non-self-consistently with
+    one temporary band DF and exchange-divergence setting.  The occupied
+    ``ki`` block is therefore independent of KMP2-stored band values and
+    external energy overrides.
     """
 
     def __init__(
@@ -329,7 +330,14 @@ class MP2SmallQ:
         grids.build_RptGrid3D_coarse()
         return qprime, grids
 
-    def _make_band_df(self, shifted_kpts):
+    @staticmethod
+    def _close_temporary_gdf(gdf_object):
+        """Close a temporary GDF file handle, if PySCF created one."""
+        cderi_temp = getattr(gdf_object, "_cderi_to_save", None)
+        if cderi_temp is not None and not isinstance(cderi_temp, str):
+            cderi_temp.close()
+
+    def _make_band_df(self, band_kpts):
         if self.band_df == "FFTDF":
             return df.FFTDF(self.cell, self.kmf.kpts)
 
@@ -342,34 +350,81 @@ class MP2SmallQ:
             band_df.linear_dep_threshold = source_df.linear_dep_threshold
             band_df.exp_to_discard = source_df.exp_to_discard
             band_df._prefer_ccdf = source_df._prefer_ccdf
-        band_df.build(kpts_band=shifted_kpts)
+        try:
+            band_df.build(kpts_band=band_kpts)
+        except Exception:
+            self._close_temporary_gdf(band_df)
+            raise
         return band_df
 
     def _get_shifted_bands(self, shifted_kpts, profile=None):
-        phase_t0 = profile.start() if profile is not None else None
-        band_df = self._make_band_df(shifted_kpts)
-        if profile is not None:
-            profile.stop("shifted-band DF construction", phase_t0)
-
+        """Evaluate bands at all points in one temporary band environment."""
+        band_kpts = np.asarray(shifted_kpts).reshape(-1, 3)
+        band_df = None
         phase_t0 = profile.start() if profile is not None else None
         try:
+            band_df = self._make_band_df(band_kpts)
+            if profile is not None:
+                profile.stop("small-q band DF construction", phase_t0)
+
+            phase_t0 = profile.start() if profile is not None else None
             with lib.temporary_env(
                 self.kmf,
                 with_df=band_df,
                 exxdiv=self.band_exxdiv,
             ):
-                mo_energy, mo_coeff = self.kmf.get_bands(shifted_kpts)
+                mo_energy, mo_coeff = self.kmf.get_bands(band_kpts)
         finally:
             if isinstance(band_df, df.GDF):
-                cderi_temp = band_df._cderi_to_save
-                if (
-                    cderi_temp is not None
-                    and not isinstance(cderi_temp, str)
-                ):
-                    cderi_temp.close()
+                self._close_temporary_gdf(band_df)
         if profile is not None:
-            profile.stop("shifted-band Fock diagonalization", phase_t0)
+            profile.stop("small-q band Fock diagonalization", phase_t0)
         return list(np.asarray(mo_energy)), list(np.asarray(mo_coeff))
+
+    def _get_band_blocks(self, grids, profile=None):
+        """Recompute and split the ordered ``ki``, ``ka``, and ``kb`` bands."""
+        nkpts = len(grids.kGrid1)
+        if grids.kGrid3_neq_kGrid2:
+            band_kpts = np.concatenate(
+                (grids.kGrid1, grids.kGrid2, grids.kGrid3),
+                axis=0,
+            )
+            nblocks = 3
+        else:
+            band_kpts = np.concatenate(
+                (grids.kGrid1, grids.kGrid2),
+                axis=0,
+            )
+            nblocks = 2
+
+        mo_energy, mo_coeff = self._get_shifted_bands(
+            band_kpts,
+            profile=profile,
+        )
+        expected = nblocks * nkpts
+        if len(mo_energy) != expected or len(mo_coeff) != expected:
+            raise RuntimeError(
+                "small-q band evaluation returned an unexpected number of "
+                f"points: expected {expected}, got {len(mo_energy)} energies "
+                f"and {len(mo_coeff)} coefficient blocks"
+            )
+
+        energy_ki = mo_energy[:nkpts]
+        coeff_ki = mo_coeff[:nkpts]
+        energy_ka = mo_energy[nkpts:2 * nkpts]
+        coeff_ka = mo_coeff[nkpts:2 * nkpts]
+        if nblocks == 3:
+            energy_kb = mo_energy[2 * nkpts:]
+            coeff_kb = mo_coeff[2 * nkpts:]
+        else:
+            # kGrid2 and kGrid3 are the same discrete grid for a self-inverse
+            # shift.  Reuse the shifted block, including its orbital gauge.
+            energy_kb, coeff_kb = energy_ka, coeff_ka
+        return (
+            (energy_ki, coeff_ki),
+            (energy_ka, coeff_ka),
+            (energy_kb, coeff_kb),
+        )
 
     def _make_correlation_gdf(self, combined_kpts, evaluated_pairs):
         source_df = self.kmf.with_df
@@ -651,32 +706,40 @@ class MP2SmallQ:
             )
 
         if grids.kGrid3_neq_kGrid2:
-            nkpts = len(grids.kGrid1)
-            shifted_energy_all, shifted_coeff_all = self._get_shifted_bands(
-                np.concatenate((grids.kGrid2, grids.kGrid3), axis=0),
-                profile=profile,
-            )
-            shifted_energy = shifted_energy_all[:nkpts]
-            shifted_energy_b = shifted_energy_all[nkpts:]
-            shifted_coeff = shifted_coeff_all[:nkpts]
-            shifted_coeff_b = shifted_coeff_all[nkpts:]
+            band_order = "[kGrid1, kGrid2, kGrid3]"
+            band_count = 3 * len(grids.kGrid1)
         else:
-            shifted_energy, shifted_coeff = self._get_shifted_bands(
-                grids.kGrid2,
-                profile=profile,
-            )
-            shifted_energy_b, shifted_coeff_b = shifted_energy, shifted_coeff
+            band_order = "[kGrid1, kGrid2] with kGrid2 reused for kGrid3"
+            band_count = 2 * len(grids.kGrid1)
+        log.note(
+            "MP2 small-q: recomputing pure %s bands with exxdiv=%s at %d "
+            "ordered band points %s; KMP2 energy/occupied-shift overrides "
+            "are not used",
+            self.band_df,
+            self.band_exxdiv,
+            band_count,
+            band_order,
+        )
+        (
+            (energy_ki, coeff_ki),
+            (energy_ka, coeff_ka),
+            (energy_kb, coeff_kb),
+        ) = self._get_band_blocks(grids, profile=profile)
 
         phase_t0 = profile.start()
         mo_coeff_occ, mo_energy_occ = kmp2._add_padding(
-            self.kmp, self.kmp.mo_coeff, self.kmp.mo_energy
+            self.kmp, coeff_ki, energy_ki
         )
         mo_coeff_shifted, mo_energy_shifted = kmp2._add_padding(
-            self.kmp, shifted_coeff, shifted_energy
+            self.kmp, coeff_ka, energy_ka
         )
-        mo_coeff_shifted_b, mo_energy_shifted_b = kmp2._add_padding(
-            self.kmp, shifted_coeff_b, shifted_energy_b
-        )
+        if grids.kGrid3_neq_kGrid2:
+            mo_coeff_shifted_b, mo_energy_shifted_b = kmp2._add_padding(
+                self.kmp, coeff_kb, energy_kb
+            )
+        else:
+            mo_coeff_shifted_b = mo_coeff_shifted
+            mo_energy_shifted_b = mo_energy_shifted
         # Shifted-grid integrals are generally complex even when the
         # origin-centered SCF coefficients happen to be real (for example at
         # Gamma).  The low-memory contraction allocates from this dtype.
@@ -687,10 +750,13 @@ class MP2SmallQ:
             np.asarray(coeff, dtype=np.complex128)
             for coeff in mo_coeff_shifted
         ]
-        mo_coeff_shifted_b = [
-            np.asarray(coeff, dtype=np.complex128)
-            for coeff in mo_coeff_shifted_b
-        ]
+        if grids.kGrid3_neq_kGrid2:
+            mo_coeff_shifted_b = [
+                np.asarray(coeff, dtype=np.complex128)
+                for coeff in mo_coeff_shifted_b
+            ]
+        else:
+            mo_coeff_shifted_b = mo_coeff_shifted
 
         nocc = self.kmp.nocc
         mo_e_o = np.asarray(mo_energy_occ)[:, :nocc]

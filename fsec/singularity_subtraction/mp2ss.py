@@ -174,15 +174,17 @@ class MP2SSOptions:
         ``pyscf.lib.logger.DEBUG`` the final structure-factor table and other
         debug diagnostics are written to the inherited PySCF output stream.
     smallq_band_df
-        Density-fitting backend used for the shifted non-SCF bands.
-        Supported values are ``"FFTDF"`` and ``"GDF"``. ``None`` disables
-        the small-q fitting point.
+        Density-fitting backend used for the non-SCF bands on all small-q
+        ``ki``, ``ka``, and ``kb`` grids. Supported values are ``"FFTDF"``
+        and ``"GDF"``. ``None`` disables the small-q fitting point. These
+        pure band eigenvalues do not include energy overrides stored on the
+        supplied KMP2 object (for example, an ExxSS occupied shift).
     smallq_relative_shift
         Three-component fractional grid shift used for the small-q fitting
         point. Components must lie in ``[-0.5, 0.5]``.
     smallq_band_exxdiv
-        Exchange-divergence treatment used only for the shifted bands
-        calculation. GDF supports only ``None`` and ``"ewald"``.
+        Exchange-divergence treatment used for all three small-q band grids.
+        GDF supports only ``None`` and ``"ewald"``.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
