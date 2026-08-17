@@ -150,6 +150,14 @@ class KRCCD(kccsd_rhf.RCCSD):
         the occupied orbital energies so PySCF's residual intermediates see a
         consistent one-body operator.
         """
+        if self.keep_exxdiv and self.madelung_orbital:
+            logger.warn(
+                self,
+                "keep_exxdiv=True and madelung_orbital=True may double-count "
+                "the occupied-orbital Madelung correction; set "
+                "keep_exxdiv=False to use KRCCD's explicit correction",
+            )
+
         eris = super().ao2mo(mo_coeff)
         fock = np.array(eris.fock, copy=True)
         mo_energy = [

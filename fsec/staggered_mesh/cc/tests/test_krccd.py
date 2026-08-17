@@ -161,6 +161,23 @@ class InterfaceTests(TestCase):
         np.testing.assert_allclose(mf.mo_energy, original["mo_energy"])
         self.assertEqual(mf.exxdiv, original["exxdiv"])
 
+    def test_warns_when_retained_exxdiv_and_orbital_correction_are_combined(self):
+        solver = make_uninitialized_solver()
+        solver.keep_exxdiv = True
+        solver.madelung_orbital = True
+
+        eris = SimpleNamespace(
+            fock=np.asarray([[[1.0, 0.0], [0.0, 3.0]]]),
+            mo_energy=[np.zeros(2)],
+        )
+        with mock.patch.object(
+            kccsd_rhf.RCCSD, "ao2mo", return_value=eris
+        ), mock.patch.object(krccd_module.logger, "warn") as warn:
+            solver.ao2mo()
+
+        warn.assert_called_once()
+        self.assertIn("double-count", warn.call_args.args[1])
+
     def test_unsupported_inputs_have_clear_errors(self):
         cell = gto.Cell()
         cell.unit = "Bohr"
