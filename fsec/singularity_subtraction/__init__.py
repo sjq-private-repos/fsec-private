@@ -56,3 +56,4 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2ExchangeSS,
 )
 from fsec.singularity_subtraction.analysis import OriginDiagnostics
+from fsec.singularity_subtraction.ccdss import CCDSSOptions, KRCCD_SS
