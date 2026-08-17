@@ -11,8 +11,13 @@ license = { file = "LICENSE" }
 dependencies = [
     "numpy",
     "scipy",
-    "pyscf",
+    "pyscf>=2.14",
 ]
 
 [tool.setuptools.packages.find]
 include = ["fsec*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: periodic numerical reference tests that perform full SCF and CCD calculations",
+]

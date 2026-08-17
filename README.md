@@ -69,6 +69,13 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## Periodic restricted CCD
+
+The restricted k-point CCD implementation and its signed orbital/ERI Madelung
+corrections are documented in [`fsec/staggered_mesh/cc/README.md`](fsec/staggered_mesh/cc/README.md).
+It currently supports only closed-shell, three-dimensional uniform-mesh
+systems; staggered meshes are not included.
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,
