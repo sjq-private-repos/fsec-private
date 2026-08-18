@@ -23,6 +23,7 @@ cc = KRCCD_SS(
     fixed_sigma=None,
     amplitude_fit_tol=1e-12,
     occupied_orbital_shift=None,
+    use_constraint_1=True,
 )
 e_corr, t1, t2 = cc.kernel()
 ```
@@ -57,9 +58,9 @@ exxss.compute_correction()
 cc = KRCCD_SS(kmf, occupied_orbital_shift=-exxss.chi)
 ```
 
-`CCDSSOptions` contains the same six method-specific controls. An options
-object can be passed instead of individual overrides, but the two forms may
-not be mixed ambiguously.
+`CCDSSOptions` contains the method-specific controls, including both
+independent constraint switches. An options object can be passed instead of
+individual overrides, but the two forms may not be mixed ambiguously.
 
 ## Amplitude and momentum layout
 
@@ -83,9 +84,10 @@ The calculation has four main stages.
    occupied-orbital Madelung shift enabled unless a custom occupied-orbital
    shift was supplied. The exact ERI Madelung correction is disabled because
    it is replaced by the fitted singularity-subtraction residual.
-2. `_build_pair_factors` creates a periodic Becke grid, evaluates the active
-   padded molecular orbitals, and precomputes normalized transition pair
-   densities. The origin is normalized to exactly one.
+2. `_build_pair_factors` or `_build_pair_densities` creates a periodic Becke
+   grid, evaluates the active padded molecular orbitals, and precomputes
+   normalized transition pair densities. The origin is normalized to exactly
+   one.
 3. `_prepare_ss` constructs the six normalized structure-factor channels,
    fits a unit-coefficient isotropic Gaussian to each, and evaluates its
    analytic-integral-minus-finite-quadrature correction `xi_n`.
@@ -140,18 +142,24 @@ of `h` minus its finite `(q+G)` quadrature.
 ## Constraints and update timing
 
 Constraint (1), which retains only orbital indices contributing at the
-singular point, is always active.
+singular point, is controlled by `use_constraint_1` and is active by default.
+When it is disabled, each pair density is a normalized transition-density
+matrix and the internal orbital indices in all six channels are summed.
 
 With the default `use_constraint_2=True`, the amplitude is fixed at its
-`q=0` value when forming each normalized structure factor. The pair densities,
-Gaussian widths, and `xi_n` tensors are prepared once from the initial T2 and
-reused throughout CCD iteration.
+external `t2[ki,kj,ka]` when forming each normalized structure factor. With
+constraint (1) disabled, the external T2 is outside the density-only sum. The
+pair densities, Gaussian widths, and `xi_n` tensors are prepared once from
+the initial T2 shape and the resulting `xi_n` values are multiplied by the
+current external T2 on every CCD update.
 
 With `use_constraint_2=False`, amplitudes are sampled at their shifted
-momenta. The six Gaussian fits are consequently rebuilt from the current T2
-on every amplitude update. Entries whose external amplitude is smaller than
-`amplitude_fit_tol` fall back to a unit amplitude ratio to avoid unstable
-division.
+momenta. If constraint (1) is enabled, this is the existing shifted-amplitude
+path. If both constraints are disabled, the complete density-amplitude
+contractions are evaluated before normalization. The six Gaussian fits are
+consequently rebuilt from the current T2 on every amplitude update. Entries
+whose external amplitude is smaller than `amplitude_fit_tol` fall back to the
+density-only channel to avoid unstable division.
 
 The counters `ss_prepare_count` and `ss_fit_count` expose how often these
 operations occurred. The most recent fitted widths and corrections are

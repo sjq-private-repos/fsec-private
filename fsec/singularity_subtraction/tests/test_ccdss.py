@@ -76,6 +76,7 @@ def test_options_object_cannot_be_ambiguously_mixed_with_overrides():
     options = CCDSSOptions(line_points=5)
     assert _merge_options(
         options,
+        use_constraint_1=True,
         use_constraint_2=True,
         line_points=3,
         pair_density_becke_grid_level=0,
@@ -86,6 +87,7 @@ def test_options_object_cannot_be_ambiguously_mixed_with_overrides():
     with pytest.raises(ValueError, match="line_points"):
         _merge_options(
             options,
+            use_constraint_1=True,
             use_constraint_2=True,
             line_points=4,
             pair_density_becke_grid_level=0,
@@ -93,6 +95,25 @@ def test_options_object_cannot_be_ambiguously_mixed_with_overrides():
             fixed_sigma=None,
             amplitude_fit_tol=1e-12,
         )
+
+
+def test_constraint_1_option_defaults_property_and_logging():
+    assert CCDSSOptions().use_constraint_1 is True
+    assert CCDSSOptions(use_constraint_1=False).use_constraint_1 is False
+
+    solver = solver_shell()
+    solver.options = CCDSSOptions(use_constraint_1=False)
+    assert solver.use_constraint_1 is False
+
+    log = mock.MagicMock()
+    with mock.patch.object(KRCCD, "dump_flags", return_value=None), mock.patch(
+        "fsec.singularity_subtraction.ccdss.logger.new_logger", return_value=log
+    ):
+        solver.dump_flags()
+    assert any(
+        call.args[:2] == ("CCD SS constraint (1) = %s", False)
+        for call in log.info.call_args_list
+    )
 
 
 def test_occupied_orbital_shift_validation_broadcasts_and_copies():
@@ -237,6 +258,31 @@ def test_k_shift_maps_treat_scaled_k_points_as_periodic():
     plus, minus = solver._build_k_shift_maps(q_vectors)
     np.testing.assert_array_equal(plus, [[0]])
     np.testing.assert_array_equal(minus, [[0]])
+
+
+def test_pair_density_origin_is_exact_identity_and_complex_values_are_finite():
+    solver = solver_shell(nkpts=2, nocc=2, nvir=2)
+    solver._ss_q_vectors = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    solver._ss_plus = np.asarray([[0, 1], [1, 0]])
+    solver._ss_minus = np.asarray([[0, 1], [1, 0]])
+    solver._scf = SimpleNamespace(cell=SimpleNamespace())
+    solver.kpts = np.zeros((2, 3))
+
+    coords = np.asarray([[0.37, 0.0, 0.0]])
+    weights = np.asarray([1.0])
+    rng = np.random.default_rng(12)
+    u = rng.normal(size=(2, 4, 1)) + 1j * rng.normal(size=(2, 4, 1))
+    u[:, -1] = 0.0
+    norms = np.ones((2, 4))
+    norms[:, -1] = 0.0
+    wrapped_kpts = np.zeros((2, 3))
+    solver._ss_pair_orbitals = (coords, weights, u, norms, wrapped_kpts)
+
+    densities = solver._build_pair_densities()
+    np.testing.assert_array_equal(densities[0], np.broadcast_to(np.eye(4), (2, 4, 4)))
+    assert np.iscomplexobj(densities)
+    assert np.all(np.isfinite(densities))
+    np.testing.assert_array_equal(densities[1, :, -1, -1], 1.0)
 
 
 @pytest.mark.parametrize("weighted", [False, True])
@@ -387,6 +433,235 @@ def test_each_unconstrained_channel_uses_the_documented_momentum_mapping():
     np.testing.assert_array_equal(channels[5], t2[1, 1, 0])
 
 
+def _density_solver_for_contraction_tests():
+    solver = solver_shell(nkpts=2, nocc=2, nvir=2)
+    solver.options = CCDSSOptions(
+        use_constraint_1=False, use_constraint_2=True, fixed_sigma=0.0
+    )
+    solver._ss_q_vectors = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    solver._ss_plus = np.asarray([[0, 1], [1, 0]])
+    solver._ss_minus = np.asarray([[0, 1], [1, 0]])
+    solver.khelper.kconserv = np.fromfunction(
+        lambda ki, ka, kj: (ki - ka + kj) % 2, (2, 2, 2), dtype=int
+    ).astype(int)
+    rng = np.random.default_rng(29)
+    pair_densities = rng.normal(size=(2, 2, 4, 4)) + 1j * rng.normal(
+        size=(2, 2, 4, 4)
+    )
+    pair_densities[0] = np.eye(4)
+    solver._ss_pair_densities = pair_densities
+    return solver, pair_densities
+
+
+def test_density_only_sums_match_nested_loop_references_and_ignore_t2():
+    solver, rho = _density_solver_for_contraction_tests()
+    q_index, ki, kj, ka = 1, 0, 1, 0
+    kb = solver.khelper.kconserv[ki, ka, kj]
+    nocc = solver.nocc
+    minus = solver._ss_minus[q_index]
+
+    rho_ki = rho[q_index, minus[ki], :nocc, :nocc]
+    rho_j = rho[q_index, kj, :nocc, :nocc]
+    rho_a = rho[q_index, ka, nocc:, nocc:]
+    rho_b = rho[q_index, minus[kb], nocc:, nocc:]
+    rho_i = rho[q_index, ki, :nocc, :nocc]
+    rho_bk = rho[q_index, kb, nocc:, nocc:]
+
+    expected = [
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_ki[k, i] * rho_j[j, l].conjugate()
+                        for k in range(nocc)
+                        for l in range(nocc)
+                    )
+                    for j in range(nocc)
+                ]
+                for i in range(nocc)
+            ]
+        ),
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_a[a, c] * rho_b[d, b].conjugate()
+                        for c in range(nocc)
+                        for d in range(nocc)
+                    )
+                    for b in range(nocc)
+                ]
+                for a in range(nocc)
+            ]
+        ),
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_a[a, c] * rho_i[i, k].conjugate()
+                        for c in range(nocc)
+                        for k in range(nocc)
+                    )
+                    for a in range(nocc)
+                ]
+                for i in range(nocc)
+            ]
+        ),
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_bk[b, c] * rho_j[j, k].conjugate()
+                        for c in range(nocc)
+                        for k in range(nocc)
+                    )
+                    for b in range(nocc)
+                ]
+                for j in range(nocc)
+            ]
+        ),
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_a[a, c] * rho_j[j, k].conjugate()
+                        for c in range(nocc)
+                        for k in range(nocc)
+                    )
+                    for a in range(nocc)
+                ]
+                for j in range(nocc)
+            ]
+        ),
+        np.asarray(
+            [
+                [
+                    sum(
+                        rho_bk[b, c] * rho_i[i, k].conjugate()
+                        for c in range(nocc)
+                        for k in range(nocc)
+                    )
+                    for b in range(nocc)
+                ]
+                for i in range(nocc)
+            ]
+        ),
+    ]
+
+    first = solver._density_only_sums(q_index, ki, kj, ka)
+    second = solver._density_only_sums(
+        q_index, ki, kj, ka, pair_densities=rho
+    )
+    for observed, observed_again, reference in zip(first, second, expected):
+        np.testing.assert_allclose(observed, reference)
+        np.testing.assert_array_equal(observed, observed_again)
+
+    t2_a = np.ones((2, 2, 2, 2, 2, 2, 2))
+    t2_b = np.arange(t2_a.size, dtype=float).reshape(t2_a.shape)
+    samples_a = solver._density_only_channel_samples(t2_a)
+    samples_b = solver._density_only_channel_samples(t2_b)
+    np.testing.assert_array_equal(samples_a, samples_b)
+    for channel, value in enumerate(first):
+        np.testing.assert_allclose(
+            samples_a[channel, q_index, ki, kj, ka],
+            np.broadcast_to(
+                solver._broadcast_density_sum(value, channel),
+                samples_a[channel, q_index, ki, kj, ka].shape,
+            ),
+        )
+    for channel in range(6):
+        np.testing.assert_array_equal(
+            samples_a[channel, 0, ki, kj, ka], 1.0
+        )
+
+
+def test_full_density_amplitude_contractions_match_nested_loop_references():
+    solver, rho = _density_solver_for_contraction_tests()
+    q_index, ki, kj, ka = 1, 0, 1, 0
+    plus = solver._ss_plus[q_index]
+    minus = solver._ss_minus[q_index]
+    kb = solver.khelper.kconserv[ki, ka, kj]
+    n = solver.nocc
+    rng = np.random.default_rng(31)
+    t2 = rng.normal(size=(2, 2, 2, 2, 2, 2, 2)) + 1j * rng.normal(
+        size=(2, 2, 2, 2, 2, 2, 2)
+    )
+
+    rki = rho[q_index, minus[ki], :n, :n]
+    rj = rho[q_index, kj, :n, :n]
+    ra = rho[q_index, ka, n:, n:]
+    rb = rho[q_index, minus[kb], n:, n:]
+    ri = rho[q_index, ki, :n, :n]
+    rbk = rho[q_index, kb, n:, n:]
+    a1 = t2[minus[ki], plus[kj], ka]
+    a2 = t2[ki, kj, plus[ka]]
+    a3 = t2[plus[ki], kj, plus[ka]]
+    a4 = t2[plus[kj], ki, plus[kb]]
+    a5 = t2[plus[kj], ki, kb]
+    a6 = t2[plus[ki], kj, ka]
+    expected = [
+        np.asarray(
+            [
+                [
+                    [
+                        [
+                            sum(
+                                rki[k, i]
+                                * rj[j, l].conjugate()
+                                * a1[k, l, a, b]
+                                for k in range(n)
+                                for l in range(n)
+                            )
+                            for b in range(n)
+                        ]
+                        for a in range(n)
+                    ]
+                    for j in range(n)
+                ]
+                for i in range(n)
+            ]
+        ),
+        np.einsum("ac,db,ijcd->ijab", ra, rb.conjugate(), a2),
+        np.einsum("ac,ik,kjcb->ijab", ra, ri.conjugate(), a3),
+        np.einsum("bc,jk,kica->ijab", rbk, rj.conjugate(), a4),
+        np.einsum("ac,jk,kibc->ijab", ra, rj.conjugate(), a5),
+        np.einsum("bc,ik,kjac->ijab", rbk, ri.conjugate(), a6),
+    ]
+    observed = solver._full_density_amplitude_contractions(
+        t2, q_index, ki, kj, ka
+    )
+    for result, reference in zip(observed, expected):
+        np.testing.assert_allclose(result, reference)
+
+
+def test_relaxed_full_samples_are_normalized_and_guard_small_external_t2():
+    solver, rho = _density_solver_for_contraction_tests()
+    solver.options = CCDSSOptions(
+        use_constraint_1=False,
+        use_constraint_2=False,
+        fixed_sigma=0.0,
+        amplitude_fit_tol=1e-8,
+    )
+    t2 = np.ones((2, 2, 2, 2, 2, 2, 2), dtype=complex)
+    t2[0, 1, 0, 0, 0, 0, 0] = 1e-12
+    samples = solver._full_density_amplitude_channel_samples(t2)
+    q_index, ki, kj, ka = 1, 0, 1, 0
+    contractions = solver._full_density_amplitude_contractions(
+        t2, q_index, ki, kj, ka, rho
+    )
+    sums = solver._density_only_sums(q_index, ki, kj, ka, rho)
+    external = t2[ki, kj, ka]
+    for channel, contraction in enumerate(contractions):
+        observed = samples[channel, q_index, ki, kj, ka]
+        expected = np.broadcast_to(
+            solver._broadcast_density_sum(sums[channel], channel),
+            contraction.shape,
+        ).copy()
+        np.divide(contraction, external, out=expected, where=np.abs(external) > 1e-8)
+        np.testing.assert_allclose(observed, expected)
+    assert np.all(np.isfinite(samples))
+
+
 def test_update_amps_keeps_t1_zero_and_validates_t2_shape():
     solver = solver_shell()
     t1 = np.ones((1, 1, 1))
@@ -439,6 +714,10 @@ def test_h2_1x1x2_limits_and_default_fit():
         "infinite": KRCCD_SS(mf, fixed_sigma=np.inf),
         "fitted": KRCCD_SS(mf),
         "unconstrained": KRCCD_SS(mf, use_constraint_2=False),
+        "constraint_1_off": KRCCD_SS(mf, use_constraint_1=False),
+        "both_constraints_off": KRCCD_SS(
+            mf, use_constraint_1=False, use_constraint_2=False
+        ),
     }
     energies = {}
     for name, cc in calculations.items():
@@ -478,3 +757,9 @@ def test_h2_1x1x2_limits_and_default_fit():
     unconstrained = calculations["unconstrained"]
     assert unconstrained.ss_prepare_count > 1
     assert np.all(np.isfinite(unconstrained.ss_sigmas))
+    constraint_1_off = calculations["constraint_1_off"]
+    assert constraint_1_off.ss_prepare_count == 1
+    assert constraint_1_off.ss_fit_count > 0
+    both_constraints_off = calculations["both_constraints_off"]
+    assert both_constraints_off.ss_prepare_count > 1
+    assert np.all(np.isfinite(both_constraints_off.ss_sigmas))
