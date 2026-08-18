@@ -15,6 +15,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial import KDTree
 
+from pyscf.lib import logger
 from pyscf.pbc import tools
 from pyscf.pbc.cc import kccsd_rhf
 from pyscf.pbc.dft import gen_grid as pbc_gen_grid
@@ -245,8 +246,6 @@ class KRCCD_SS(KRCCD):
 
     def dump_flags(self, verbose=None):
         result = super().dump_flags(verbose)
-        from pyscf.lib import logger
-
         log = logger.new_logger(self, verbose)
         log.info("CCD SS constraint (2) = %s", self.options.use_constraint_2)
         log.info("CCD SS positive line samples = %d", self.options.line_points)
@@ -519,6 +518,10 @@ class KRCCD_SS(KRCCD):
 
     def _prepare_ss(self, t2):
         self._validate_t2(t2)
+        report_timing = self.verbose >= logger.INFO
+        if report_timing:
+            cpu0 = logger.process_clock()
+            wall0 = logger.perf_counter()
         self.ss_prepare_count += 1
         if self.options.fixed_sigma is not None:
             sigmas = np.full((6,) + t2.shape, self.options.fixed_sigma)
@@ -544,6 +547,13 @@ class KRCCD_SS(KRCCD):
                     self.ss_fit_count += 1
         self.ss_sigmas = sigmas
         self.ss_xi = xi
+        if report_timing:
+            logger.info(
+                self,
+                "KRCCDSS xi precomputation CPU %.2f sec, wall %.2f sec",
+                logger.process_clock() - cpu0,
+                logger.perf_counter() - wall0,
+            )
         return xi
 
     def _ss_residual_coefficient(self, t2):

@@ -2,12 +2,14 @@
 
 from types import SimpleNamespace
 from unittest import mock
+import io
 
 import numpy as np
 import pytest
 
 from pyscf.pbc.cc import kccsd_rhf
 from pyscf.pbc import gto, scf, tools
+from pyscf.lib import logger
 
 from fsec.staggered_mesh.cc import KRCCD
 from fsec.singularity_subtraction.ccdss import (
@@ -50,6 +52,8 @@ def solver_shell(nkpts=1, nocc=1, nvir=1):
     solver.ss_fit_count = 0
     solver.ss_prepare_count = 0
     solver.last_ss_residual_norm = 0.0
+    solver.verbose = logger.NOTE
+    solver.stdout = io.StringIO()
     return solver
 
 
@@ -327,6 +331,25 @@ def test_constrained_corrections_are_reused_and_unconstrained_are_refit():
     unconstrained._ss_residual_coefficient(t2)
     unconstrained._ss_residual_coefficient(2 * t2)
     assert unconstrained.ss_prepare_count == 2
+
+
+def test_xi_preparation_reports_cpu_and_wall_time_at_info():
+    solver = solver_shell()
+    solver.verbose = logger.INFO
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss.logger.process_clock",
+        side_effect=[10.0, 12.0],
+    ), mock.patch(
+        "fsec.singularity_subtraction.ccdss.logger.perf_counter",
+        side_effect=[20.0, 23.5],
+    ):
+        solver._prepare_ss(t2)
+
+    assert (
+        "KRCCDSS xi precomputation CPU 2.00 sec, wall 3.50 sec"
+        in solver.stdout.getvalue()
+    )
 
 
 def test_unconstrained_gaussians_are_actually_refitted_after_t2_changes():

@@ -156,6 +156,8 @@ division.
 The counters `ss_prepare_count` and `ss_fit_count` expose how often these
 operations occurred. The most recent fitted widths and corrections are
 available as `ss_sigmas` and `ss_xi`.
+At `verbose >= logger.INFO`, each preparation also reports its CPU and wall
+time.
 
 ## Fixed-sigma limits
 
