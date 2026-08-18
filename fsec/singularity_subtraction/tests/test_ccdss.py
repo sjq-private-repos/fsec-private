@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from pyscf.pbc.cc import kccsd_rhf
-from pyscf.pbc import gto, scf
+from pyscf.pbc import gto, scf, tools
 
 from fsec.staggered_mesh.cc import KRCCD
 from fsec.singularity_subtraction.ccdss import (
@@ -15,6 +15,7 @@ from fsec.singularity_subtraction.ccdss import (
     KRCCD_SS,
     _fit_unit_gaussian,
     _line_samples,
+    _normalize_occupied_orbital_shift,
 )
 
 
@@ -37,6 +38,10 @@ def solver_shell(nkpts=1, nocc=1, nvir=1):
     solver.frozen = None
     solver.level_shift = 0.0
     solver.madelung_constant = -0.75
+    solver.madelung_orbital = True
+    solver.madelung_eri = False
+    solver.keep_exxdiv = False
+    solver.occupied_orbital_shift = None
     solver.khelper = SimpleNamespace(
         kconserv=np.zeros((nkpts, nkpts, nkpts), dtype=int)
     )
@@ -84,6 +89,110 @@ def test_options_object_cannot_be_ambiguously_mixed_with_overrides():
             fixed_sigma=None,
             amplitude_fit_tol=1e-12,
         )
+
+
+def test_occupied_orbital_shift_validation_broadcasts_and_copies():
+    scalar = _normalize_occupied_orbital_shift(-0.25, nkpts=2, nocc=3)
+    np.testing.assert_array_equal(scalar, np.full((2, 3), -0.25))
+
+    supplied = np.arange(6.0).reshape(2, 3)
+    normalized = _normalize_occupied_orbital_shift(supplied, nkpts=2, nocc=3)
+    supplied[0, 0] = 99.0
+    assert normalized[0, 0] == 0.0
+
+    for invalid in (
+        np.zeros(3),
+        np.zeros((3, 2)),
+        np.asarray([[1.0, np.inf], [2.0, 3.0]]),
+        1.0 + 0.0j,
+        True,
+        "0.1",
+    ):
+        with pytest.raises(ValueError, match="occupied_orbital_shift"):
+            _normalize_occupied_orbital_shift(invalid, nkpts=2, nocc=2)
+
+
+def test_custom_occupied_shift_replaces_exxdiv_and_respects_padding():
+    def run(keep_exxdiv):
+        solver = solver_shell(nkpts=2, nocc=2, nvir=1)
+        # A custom shift wins even if either inherited correction switch is
+        # subsequently enabled by user code.
+        solver.madelung_orbital = True
+        solver.keep_exxdiv = keep_exxdiv
+        solver.occupied_orbital_shift = np.asarray(
+            [[0.1, -0.2], [0.3, 8.0]]
+        )
+        observed_correction_flags = []
+
+        def make_eris(_mo_coeff=None):
+            observed_correction_flags.append(
+                (solver.keep_exxdiv, solver.madelung_orbital)
+            )
+            return SimpleNamespace(
+                fock=np.asarray(
+                    [
+                        [[1.0, 0.4, 0.0], [0.4, 2.0, 0.5], [0.0, 0.5, 6.0]],
+                        [[3.0, 0.6, 0.0], [0.6, 4.0, 0.7], [0.0, 0.7, 7.0]],
+                    ]
+                ),
+                mo_energy=[np.zeros(3), np.zeros(3)],
+            )
+
+        with mock.patch.object(
+            kccsd_rhf.RCCSD, "ao2mo", side_effect=make_eris
+        ), mock.patch(
+            "fsec.singularity_subtraction.ccdss.padding_k_idx",
+            return_value=(
+                [np.asarray([0, 1]), np.asarray([0])],
+                [np.asarray([0]), np.asarray([0, 1])],
+            ),
+        ), mock.patch("fsec.staggered_mesh.cc.krccd.logger.warn") as warn:
+            eris = solver.ao2mo()
+
+        assert observed_correction_flags == [(False, False)]
+        assert solver.keep_exxdiv is keep_exxdiv
+        assert solver.madelung_orbital is True
+        warn.assert_not_called()
+        np.testing.assert_allclose(
+            eris.fock,
+            [
+                [[1.1, 0.4, 0.0], [0.4, 1.8, 0.5], [0.0, 0.5, 6.0]],
+                [[3.3, 0.6, 0.0], [0.6, 4.0, 0.7], [0.0, 0.7, 7.0]],
+            ],
+        )
+        np.testing.assert_allclose(
+            eris.mo_energy,
+            [[1.1, 1.8, 6.0], [3.3, 4.0, 7.0]],
+        )
+        return eris
+
+    without_exxdiv = run(False)
+    with_exxdiv = run(True)
+    np.testing.assert_allclose(without_exxdiv.fock, with_exxdiv.fock)
+    np.testing.assert_allclose(without_exxdiv.mo_energy, with_exxdiv.mo_energy)
+
+
+def test_missing_occupied_shift_preserves_default_ao2mo_path():
+    solver = solver_shell()
+    solver.keep_exxdiv = True
+    expected = SimpleNamespace()
+    with mock.patch.object(KRCCD, "ao2mo", return_value=expected) as ao2mo:
+        assert solver.ao2mo() is expected
+    ao2mo.assert_called_once_with(None)
+    assert solver.keep_exxdiv is True
+
+
+def test_custom_occupied_shift_restores_flags_when_ao2mo_fails():
+    solver = solver_shell()
+    solver.occupied_orbital_shift = np.zeros((1, 1))
+    solver.keep_exxdiv = True
+    solver.madelung_orbital = True
+    with mock.patch.object(
+        kccsd_rhf.RCCSD, "ao2mo", side_effect=RuntimeError("failed ERI build")
+    ), pytest.raises(RuntimeError, match="failed ERI build"):
+        solver.ao2mo()
+    assert solver.keep_exxdiv is True
+    assert solver.madelung_orbital is True
 
 
 def test_line_sampling_uses_positive_mesh_steps():
@@ -292,6 +401,11 @@ def test_h2_1x1x2_limits_and_default_fit():
     calculations = {
         "orbital": KRCCD(mf, madelung_orbital=True),
         "zero": KRCCD_SS(mf, fixed_sigma=0.0),
+        "custom_madelung": KRCCD_SS(
+            mf,
+            fixed_sigma=0.0,
+            occupied_orbital_shift=-tools.madelung(cell, kpts),
+        ),
         "near_zero": KRCCD_SS(mf, fixed_sigma=1e-10),
         "madelung": KRCCD(mf, madelung_orbital=True, madelung_eri=True),
         "sigma_0.5": KRCCD_SS(mf, fixed_sigma=0.5),
@@ -314,6 +428,9 @@ def test_h2_1x1x2_limits_and_default_fit():
         assert np.isfinite(energy)
 
     assert energies["zero"] == pytest.approx(energies["orbital"], abs=1e-11)
+    assert energies["custom_madelung"] == pytest.approx(
+        energies["zero"], abs=1e-11
+    )
     assert energies["near_zero"] == pytest.approx(energies["orbital"], abs=1e-9)
     assert energies["large"] == pytest.approx(energies["madelung"], abs=1e-11)
     assert energies["infinite"] == pytest.approx(energies["madelung"], abs=1e-11)

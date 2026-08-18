@@ -22,6 +22,7 @@ cc = KRCCD_SS(
     fit_with_coul=True,
     fixed_sigma=None,
     amplitude_fit_tol=1e-12,
+    occupied_orbital_shift=None,
 )
 e_corr, t1, t2 = cc.kernel()
 ```
@@ -30,6 +31,31 @@ The mean-field object must satisfy the same requirements as `KRCCD`: a
 closed-shell, three-dimensional `KRHF` calculation on a uniform k-point mesh.
 Set `kmf.exxdiv = None` and `cc.keep_exxdiv = False` when using the routine's
 explicit occupied-orbital correction.
+
+`occupied_orbital_shift` optionally replaces that correction. It accepts a
+finite real scalar or an array with shape `(nkpts, nocc)`, in Hartree, and is
+added directly to the active occupied Fock diagonals and orbital energies. A
+scalar is broadcast to every occupied state. Array columns use PySCF's
+correlated, padded occupied-orbital layout; values corresponding to padded
+states are ignored. Virtual energies and off-diagonal Fock elements are not
+changed.
+
+When a custom shift is present, `KRCCD_SS` builds the uncorrected one-body
+baseline regardless of `keep_exxdiv`: it bypasses the explicit Madelung shift
+when `keep_exxdiv=False` and replaces the retained SCF exchange-divergence
+correction when `keep_exxdiv=True`. The public value of `keep_exxdiv` is not
+modified.
+
+The current `ExxSS` implementation produces one uniform correction per
+occupied orbital. Its sign convention can be passed to CCDSS as follows:
+
+```python
+from fsec.singularity_subtraction import ExxSS, KRCCD_SS
+
+exxss = ExxSS(kmf)
+exxss.compute_correction()
+cc = KRCCD_SS(kmf, occupied_orbital_shift=-exxss.chi)
+```
 
 `CCDSSOptions` contains the same six method-specific controls. An options
 object can be passed instead of individual overrides, but the two forms may
@@ -54,9 +80,9 @@ CCD rather than CCSD.
 The calculation has four main stages.
 
 1. `KRCCD_SS.__init__` validates the options and initializes `KRCCD` with the
-   occupied-orbital Madelung shift enabled. The exact ERI Madelung correction
-   is disabled because it is replaced by the fitted singularity-subtraction
-   residual.
+   occupied-orbital Madelung shift enabled unless a custom occupied-orbital
+   shift was supplied. The exact ERI Madelung correction is disabled because
+   it is replaced by the fitted singularity-subtraction residual.
 2. `_build_pair_factors` creates a periodic Becke grid, evaluates the active
    padded molecular orbitals, and precomputes normalized transition pair
    densities. The origin is normalized to exactly one.
@@ -143,4 +169,3 @@ available as `ss_sigmas` and `ss_xi`.
 
 The H2 example in `examples/h2_ccdss.py` demonstrates the fitted calculation
 and both exact limiting cases.
-

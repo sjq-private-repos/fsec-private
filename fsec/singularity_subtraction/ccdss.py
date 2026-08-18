@@ -92,6 +92,34 @@ def _merge_options(options, **values):
     return options
 
 
+def _normalize_occupied_orbital_shift(value, nkpts, nocc):
+    """Return a real ``(nkpts, nocc)`` shift array or ``None``."""
+    if value is None:
+        return None
+
+    shift = np.asarray(value)
+    if not np.issubdtype(shift.dtype, np.number) or np.issubdtype(
+        shift.dtype, np.bool_
+    ):
+        raise ValueError("occupied_orbital_shift must contain real numbers")
+    if np.iscomplexobj(shift):
+        raise ValueError("occupied_orbital_shift must contain real numbers")
+
+    expected = (nkpts, nocc)
+    if shift.ndim == 0:
+        shift = np.full(expected, float(shift), dtype=float)
+    elif shift.shape == expected:
+        shift = np.array(shift, dtype=float, copy=True)
+    else:
+        raise ValueError(
+            "occupied_orbital_shift must be a scalar or have shape "
+            f"{expected}; received {shift.shape}"
+        )
+    if not np.all(np.isfinite(shift)):
+        raise ValueError("occupied_orbital_shift values must be finite")
+    return shift
+
+
 def _line_samples(cell, kpts, line_points):
     """Return origin and positive ``b_i/n_i`` line samples."""
     nks = np.asarray(tools.get_monkhorst_pack_size(cell, kpts), dtype=int)
@@ -157,6 +185,7 @@ class KRCCD_SS(KRCCD):
     _keys = KRCCD._keys.union(
         {
             "options",
+            "occupied_orbital_shift",
             "ss_fit_count",
             "ss_prepare_count",
             "last_ss_residual_norm",
@@ -178,6 +207,7 @@ class KRCCD_SS(KRCCD):
         fit_with_coul=True,
         fixed_sigma=None,
         amplitude_fit_tol=1e-12,
+        occupied_orbital_shift=None,
     ):
         self.options = _merge_options(
             options,
@@ -193,8 +223,11 @@ class KRCCD_SS(KRCCD):
             frozen=frozen,
             mo_coeff=mo_coeff,
             mo_occ=mo_occ,
-            madelung_orbital=True,
+            madelung_orbital=occupied_orbital_shift is None,
             madelung_eri=False,
+        )
+        self.occupied_orbital_shift = _normalize_occupied_orbital_shift(
+            occupied_orbital_shift, self.nkpts, self.nocc
         )
         self.ss_fit_count = 0
         self.ss_prepare_count = 0
@@ -222,7 +255,53 @@ class KRCCD_SS(KRCCD):
             self.options.pair_density_becke_grid_level,
         )
         log.info("CCD SS fixed sigma = %s", self.options.fixed_sigma)
+        if self.occupied_orbital_shift is None:
+            log.info("CCD SS occupied-orbital shift = Madelung default")
+        else:
+            log.info(
+                "CCD SS occupied-orbital shift shape = %s, range = [%g, %g]",
+                self.occupied_orbital_shift.shape,
+                np.min(self.occupied_orbital_shift),
+                np.max(self.occupied_orbital_shift),
+            )
+            log.info(
+                "CCD SS occupied-orbital shift replaces Madelung and "
+                "keep_exxdiv corrections"
+            )
         return result
+
+    def ao2mo(self, mo_coeff=None):
+        """Build ERIs and apply any custom occupied-orbital shifts.
+
+        A custom shift is defined relative to the uncorrected one-body
+        baseline.  It therefore replaces both KRCCD's explicit Madelung shift
+        and an exchange-divergence correction requested through
+        ``keep_exxdiv``.
+        """
+        if self.occupied_orbital_shift is None:
+            return super().ao2mo(mo_coeff)
+
+        keep_exxdiv = self.keep_exxdiv
+        madelung_orbital = self.madelung_orbital
+        try:
+            self.keep_exxdiv = False
+            self.madelung_orbital = False
+            eris = super().ao2mo(mo_coeff)
+        finally:
+            self.keep_exxdiv = keep_exxdiv
+            self.madelung_orbital = madelung_orbital
+
+        fock = np.array(eris.fock, copy=True)
+        mo_energy = [np.asarray(energy).copy() for energy in eris.mo_energy]
+        nonzero_opadding, _ = padding_k_idx(self, kind="split")
+        for k, occupied in enumerate(nonzero_opadding):
+            shift = self.occupied_orbital_shift[k, occupied]
+            fock[k][occupied, occupied] += shift
+            mo_energy[k][occupied] += shift
+
+        eris.fock = fock
+        eris.mo_energy = mo_energy
+        return eris
 
     def init_amps(self, eris):
         emp2, t1, t2 = super().init_amps(eris)
