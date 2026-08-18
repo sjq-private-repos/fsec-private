@@ -110,6 +110,22 @@ def test_line_sampling_uses_positive_mesh_steps():
     assert len(metadata) == 3
 
 
+def test_k_shift_maps_treat_scaled_k_points_as_periodic():
+    class IdentityScaledCell:
+        @staticmethod
+        def get_scaled_kpts(kpts):
+            return np.asarray(kpts)
+
+    solver = solver_shell()
+    solver._scf = SimpleNamespace(cell=IdentityScaledCell())
+    # The tiny negative component is numerically equivalent to zero modulo a
+    # reciprocal lattice vector.  A non-periodic KD-tree sees it at 1 instead.
+    q_vectors = np.asarray([[0.0, 0.0, -1e-18]])
+    plus, minus = solver._build_k_shift_maps(q_vectors)
+    np.testing.assert_array_equal(plus, [[0]])
+    np.testing.assert_array_equal(minus, [[0]])
+
+
 @pytest.mark.parametrize("weighted", [False, True])
 def test_unit_gaussian_fit_recovers_sigma(weighted):
     q = np.asarray(

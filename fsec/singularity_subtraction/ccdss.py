@@ -246,14 +246,19 @@ class KRCCD_SS(KRCCD):
 
     def _build_k_shift_maps(self, q_vectors):
         cell = self._scf.cell
-        scaled = cell.get_scaled_kpts(self.kpts)
-        tree = KDTree(scaled - np.floor(scaled))
+        scaled = np.remainder(cell.get_scaled_kpts(self.kpts), 1.0)
+        # Floating-point remainders can round a value just below zero to
+        # exactly 1.0.  Canonicalize that boundary before constructing the
+        # periodic tree, whose input must lie in [0, 1).
+        scaled[scaled >= 1.0] = 0.0
+        tree = KDTree(scaled, boxsize=1.0)
         plus = np.empty((len(q_vectors), self.nkpts), dtype=int)
         minus = np.empty_like(plus)
         for iq, q in enumerate(q_vectors):
             qscaled = cell.get_scaled_kpts(q)
             for sign, output in ((1.0, plus), (-1.0, minus)):
-                targets = (scaled + sign * qscaled) % 1.0
+                targets = np.remainder(scaled + sign * qscaled, 1.0)
+                targets[targets >= 1.0] = 0.0
                 distance, indices = tree.query(targets)
                 if np.any(distance > 1e-7):
                     raise ValueError("line sample does not map onto the k-point mesh")
