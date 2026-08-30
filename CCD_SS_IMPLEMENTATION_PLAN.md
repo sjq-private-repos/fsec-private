@@ -8,7 +8,8 @@ First save this complete plan as `CCD_SS_IMPLEMENTATION_PLAN.md`. Then launch Lu
 
 - Add `fsec/singularity_subtraction/ccdss.py` with `KRCCD_SS`, subclassing PySCF's periodic restricted `kccsd_rhf.RCCSD`.
 - Keep T1 identically zero through amplitude initialization, updates, and energy evaluation.
-- Override `update_amps` to apply the six corrections from `ccd-ss.pdf` with the residual coefficient
+- Override `update_amps` to apply the six contracted structure-factor
+  corrections with the residual coefficient
   \[
   \xi_1+\xi_2-\xi_3-\xi_4-\xi_5-\xi_6.
   \]

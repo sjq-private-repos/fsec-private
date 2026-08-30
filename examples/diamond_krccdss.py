@@ -63,17 +63,20 @@ def run_ccdss(label, fixed_sigma=None):
     )
     if cc.ss_sigmas is not None:
         print(
-            f"{'':24s} sigma range = "
-            f"[{np.min(cc.ss_sigmas):.8f}, {np.max(cc.ss_sigmas):.8f}]"
+            f"{'':24s} six sigmas = "
+            f"{np.array2string(cc.ss_sigmas, precision=8)}"
         )
     return e_corr, t1, t2
 
 
-# Default: fit the six normalized Gaussian structure-factor channels once and
-# reuse their corrections throughout the constrained CCD iteration.
+# Default: refit six aggregate Gaussian structure-factor channels after every
+# amplitude update.  The stored sigma and xi states each have six elements.
+# The current implementation requires use_constraint_1=True and
+# use_constraint_2=True; either disabled option raises NotImplementedError.
 run_ccdss("fitted CCDSS")
 
-# Reference limits: zero gives the orbital-only correction; infinity gives
-# the exact orbital-plus-ERI Madelung correction.
+# Fixed widths are amplitude-independent and are prepared lazily once.  Zero
+# gives the orbital-only correction; infinity gives the exact
+# orbital-plus-ERI Madelung correction.
 run_ccdss("sigma = 0", fixed_sigma=0.0)
 run_ccdss("sigma = infinity", fixed_sigma=np.inf)

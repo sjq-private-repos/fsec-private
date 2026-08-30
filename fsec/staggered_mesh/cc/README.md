@@ -35,6 +35,11 @@ adds the equivalent `(2*xi*T2)/eijab` term block by block using PySCF's padding
 masks and `level_shift` convention.  The final CCD energy contraction is
 unchanged.
 
+Do not combine inherited `keep_exxdiv=True` with
+`madelung_orbital=True`: the retained SCF exchange-divergence treatment may
+already contain the occupied-orbital correction.  `KRCCD` warns about this
+combination.  Set `keep_exxdiv=False` to use the explicit KRCCD correction.
+
 `kernel_n(n)` starts both amplitudes at zero and performs exactly `n` raw,
 undamped fixed-point updates.  Thus `kernel_n(1)` is the CCD(1)/MP2 starting
 point and the ERI correction is inert on that first update.  The inherited
