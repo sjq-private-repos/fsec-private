@@ -1,4 +1,4 @@
-"""Tests for iterative CCD singularity subtraction."""
+"""Tests for unconstrained iterative CCD singularity subtraction."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -7,9 +7,9 @@ import io
 import numpy as np
 import pytest
 
-from pyscf.pbc.cc import kccsd_rhf
-from pyscf.pbc import gto, scf, tools
 from pyscf.lib import logger
+from pyscf.pbc import gto, scf
+from pyscf.pbc.cc import kccsd_rhf
 
 from fsec.staggered_mesh.cc import KRCCD
 from fsec.singularity_subtraction.ccdss import (
@@ -22,19 +22,19 @@ from fsec.singularity_subtraction.ccdss import (
 
 
 class FakeCell:
-    """Minimal orthorhombic cell used to test reciprocal-line sampling."""
+    """Minimal orthorhombic cell for reciprocal-line tests."""
 
     vol = 8.0
 
     def reciprocal_vectors(self):
-        """Return distinct reciprocal lengths for the three directions."""
+        """Return distinct reciprocal lengths."""
         return np.diag([2.0, 3.0, 4.0])
 
 
-def solver_shell(nkpts=1, nocc=1, nvir=1):
-    """Build a lightweight solver without running the PySCF constructor."""
+def solver_shell(nkpts=1, nocc=1, nvir=1, fixed_sigma=0.0):
+    """Build a lightweight solver without invoking the PySCF constructor."""
     solver = object.__new__(KRCCD_SS)
-    solver.options = CCDSSOptions(fixed_sigma=0.0)
+    solver.options = CCDSSOptions(fixed_sigma=fixed_sigma)
     solver.kpts = np.zeros((nkpts, 3))
     solver.mo_occ = np.asarray(
         [np.r_[np.full(nocc, 2.0), np.zeros(nvir)] for _ in range(nkpts)]
@@ -57,7 +57,11 @@ def solver_shell(nkpts=1, nocc=1, nvir=1):
     solver.keep_exxdiv = False
     solver.occupied_orbital_shift = None
     solver.khelper = SimpleNamespace(
-        kconserv=np.zeros((nkpts, nkpts, nkpts), dtype=int)
+        kconserv=np.fromfunction(
+            lambda ki, ka, kj: (ki - ka + kj) % nkpts,
+            (nkpts, nkpts, nkpts),
+            dtype=int,
+        ).astype(int)
     )
     solver.ss_xi = None
     solver.ss_sigmas = None
@@ -65,833 +69,513 @@ def solver_shell(nkpts=1, nocc=1, nvir=1):
     solver.ss_prepare_count = 0
     solver.last_ss_residual_norm = 0.0
     solver._ss_active_masks = None
-    solver._ss_active_count = None
+    solver._ss_pair_densities = None
     solver.verbose = logger.NOTE
     solver.stdout = io.StringIO()
     return solver
 
 
-def _aggregate_solver_for_tests(nkpts=2, nocc=2, nvir=2):
-    """Add a two-point q grid and deterministic pair factors to a solver."""
-    solver = solver_shell(nkpts=nkpts, nocc=nocc, nvir=nvir)
-    solver.options = CCDSSOptions(fixed_sigma=None)
+def aggregate_solver(imag_tol=1e6):
+    """Return a three-k-point shell with complex densities and padding."""
+    solver = solver_shell(nkpts=3, nocc=2, nvir=2, fixed_sigma=None)
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_imag_tol=imag_tol
+    )
     solver._ss_q_vectors = np.asarray(
-        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        [[0.0, 0.0, 0.0], [0.7, -0.2, 0.1]]
     )
-    solver._ss_plus = np.asarray([[0, 1], [1, 0]])
-    solver._ss_minus = np.asarray([[0, 1], [1, 0]])
-    solver.khelper.kconserv = np.fromfunction(
-        lambda ki, ka, kj: (ki - ka + kj) % 2,
-        (nkpts, nkpts, nkpts),
-        dtype=int,
-    ).astype(int)
-    rng = np.random.default_rng(29)
-    factors = rng.normal(size=(2, nkpts, nocc + nvir)) + 1j * rng.normal(
-        size=(2, nkpts, nocc + nvir)
+    solver._ss_plus = np.asarray([[0, 1, 2], [1, 2, 0]])
+    solver._ss_minus = np.asarray([[0, 1, 2], [2, 0, 1]])
+    occupied = np.asarray([[True, True], [True, False], [True, True]])
+    virtual = np.asarray([[True, False], [True, True], [False, True]])
+    solver._ss_active_masks = occupied, virtual
+    rng = np.random.default_rng(18)
+    rho_oo = rng.normal(size=(2, 3, 2, 2)) + 1j * rng.normal(
+        size=(2, 3, 2, 2)
     )
-    factors[0] = 1.0
-    solver._ss_pair_factors = factors
+    rho_vv = rng.normal(size=(2, 3, 2, 2)) + 1j * rng.normal(
+        size=(2, 3, 2, 2)
+    )
+    rho_oo[0] = np.eye(2)
+    rho_vv[0] = np.eye(2)
+    solver._ss_pair_densities = rho_oo, rho_vv
     return solver
 
 
-def _relaxed_aggregate_solver_for_tests(nkpts=2, nocc=2, nvir=2):
-    """Add full complex transition densities to an aggregate test solver."""
-    solver = _aggregate_solver_for_tests(nkpts=nkpts, nocc=nocc, nvir=nvir)
-    solver.options = CCDSSOptions(
-        use_constraint_1=False,
-        use_constraint_2=True,
-        fixed_sigma=None,
-    )
-    rng = np.random.default_rng(37)
-    pair_densities = rng.normal(
-        size=(2, nkpts, nocc + nvir, nocc + nvir)
-    ) + 1j * rng.normal(size=(2, nkpts, nocc + nvir, nocc + nvir))
-    pair_densities[0] = np.eye(nocc + nvir, dtype=complex)
-    solver._ss_pair_densities = pair_densities
-    solver._ss_pair_factors = None
-    return solver, pair_densities
-
-
-def _explicit_diagonal_density_raw(solver, q_index):
-    """Evaluate diagonal density-only aggregates with explicit loops."""
-    factors = solver._ss_pair_factors[q_index]
+def explicit_structure_factors(solver, t2):
+    """Evaluate all six equations with literal orbital-index loops."""
     occupied, virtual = solver._build_active_masks()
-    plus = solver._ss_plus[q_index]
-    minus = solver._ss_minus[q_index]
-    nocc = solver.nocc
-    raw = np.zeros(6, dtype=complex)
-    for ki in range(solver.nkpts):
-        for kj in range(solver.nkpts):
-            for ka in range(solver.nkpts):
-                kb = solver.khelper.kconserv[ki, ka, kj]
-                for i in range(nocc):
-                    for j in range(nocc):
-                        for a in range(solver.nmo - nocc):
-                            for b in range(solver.nmo - nocc):
-                                external = (
-                                    occupied[ki, i]
-                                    and occupied[kj, j]
-                                    and virtual[ka, a]
-                                    and virtual[kb, b]
-                                )
-                                if not external:
-                                    continue
-                                if occupied[minus[ki], i] and occupied[ki, i]:
-                                    if occupied[kj, j] and occupied[plus[kj], j]:
-                                        raw[0] += (
-                                            factors[minus[ki], i]
-                                            * factors[kj, j].conjugate()
-                                        )
-                                if virtual[ka, a] and virtual[plus[ka], a]:
-                                    if virtual[minus[kb], b] and virtual[kb, b]:
-                                        raw[1] += (
-                                            factors[ka, nocc + a]
-                                            * factors[minus[kb], nocc + b].conjugate()
-                                        )
-                                if virtual[ka, a] and virtual[plus[ka], a]:
-                                    if occupied[ki, i] and occupied[plus[ki], i]:
-                                        raw[2] += (
-                                            factors[ka, nocc + a]
-                                            * factors[ki, i].conjugate()
-                                        )
-                                if virtual[kb, b] and virtual[plus[kb], b]:
-                                    if occupied[kj, j] and occupied[plus[kj], j]:
-                                        raw[3] += (
-                                            factors[kb, nocc + b]
-                                            * factors[kj, j].conjugate()
-                                        )
-                                        raw[4] += (
-                                            factors[ka, nocc + a]
-                                            * factors[kj, j].conjugate()
-                                        )
-                                if virtual[kb, b] and virtual[plus[kb], b]:
-                                    if occupied[ki, i] and occupied[plus[ki], i]:
-                                        raw[5] += (
-                                            factors[kb, nocc + b]
-                                            * factors[ki, i].conjugate()
-                                        )
-    return raw
-
-
-def _explicit_full_density_raw(solver, pair_densities, q_index):
-    """Evaluate full-density aggregates with explicit nested-loop sums."""
-    occupied, virtual = solver._build_active_masks()
-    plus = solver._ss_plus[q_index]
-    minus = solver._ss_minus[q_index]
+    rho_oo_all, rho_vv_all = solver._ss_pair_densities
+    kconserv = solver.khelper.kconserv
     nocc = solver.nocc
     nvir = solver.nmo - nocc
-    density = pair_densities[q_index]
-    raw = np.zeros(6, dtype=complex)
+    raw = np.zeros((6, len(solver._ss_q_vectors)), dtype=complex)
+
+    def amp_active(k1, k2, ka, i, j, a, b):
+        kb = kconserv[k1, ka, k2]
+        return (
+            occupied[k1, i]
+            and occupied[k2, j]
+            and virtual[ka, a]
+            and virtual[kb, b]
+        )
+
+    for iq in range(len(solver._ss_q_vectors)):
+        plus = solver._ss_plus[iq]
+        minus = solver._ss_minus[iq]
+        rho_oo = rho_oo_all[iq]
+        rho_vv = rho_vv_all[iq]
+        for ki in range(solver.nkpts):
+            for kj in range(solver.nkpts):
+                for ka in range(solver.nkpts):
+                    kb = kconserv[ki, ka, kj]
+                    for i in range(nocc):
+                        for j in range(nocc):
+                            for a in range(nvir):
+                                for b in range(nvir):
+                                    for k in range(nocc):
+                                        for l in range(nocc):
+                                            if (
+                                                occupied[minus[ki], k]
+                                                and occupied[ki, i]
+                                                and occupied[kj, j]
+                                                and occupied[plus[kj], l]
+                                                and amp_active(
+                                                    minus[ki], plus[kj], ka,
+                                                    k, l, a, b,
+                                                )
+                                            ):
+                                                raw[0, iq] += (
+                                                    rho_oo[minus[ki], k, i]
+                                                    * rho_oo[kj, j, l].conjugate()
+                                                    * t2[
+                                                        minus[ki], plus[kj], ka,
+                                                        k, l, a, b,
+                                                    ]
+                                                )
+                                    for c in range(nvir):
+                                        for d in range(nvir):
+                                            if (
+                                                virtual[ka, a]
+                                                and virtual[plus[ka], c]
+                                                and virtual[minus[kb], d]
+                                                and virtual[kb, b]
+                                                and amp_active(
+                                                    ki, kj, plus[ka], i, j, c, d
+                                                )
+                                            ):
+                                                raw[1, iq] += (
+                                                    rho_vv[ka, a, c]
+                                                    * rho_vv[
+                                                        minus[kb], d, b
+                                                    ].conjugate()
+                                                    * t2[
+                                                        ki, kj, plus[ka], i, j, c, d
+                                                    ]
+                                                )
+                                    for c in range(nvir):
+                                        for k in range(nocc):
+                                            if (
+                                                virtual[ka, a]
+                                                and virtual[plus[ka], c]
+                                                and occupied[ki, i]
+                                                and occupied[plus[ki], k]
+                                                and amp_active(
+                                                    plus[ki], kj, plus[ka],
+                                                    k, j, c, b,
+                                                )
+                                            ):
+                                                raw[2, iq] += (
+                                                    rho_vv[ka, a, c]
+                                                    * rho_oo[ki, i, k].conjugate()
+                                                    * t2[
+                                                        plus[ki], kj, plus[ka],
+                                                        k, j, c, b,
+                                                    ]
+                                                )
+                                            if (
+                                                virtual[kb, b]
+                                                and virtual[plus[kb], c]
+                                                and occupied[kj, j]
+                                                and occupied[plus[kj], k]
+                                                and amp_active(
+                                                    plus[kj], ki, plus[kb],
+                                                    k, i, c, a,
+                                                )
+                                            ):
+                                                raw[3, iq] += (
+                                                    rho_vv[kb, b, c]
+                                                    * rho_oo[kj, j, k].conjugate()
+                                                    * t2[
+                                                        plus[kj], ki, plus[kb],
+                                                        k, i, c, a,
+                                                    ]
+                                                )
+                                            if (
+                                                virtual[ka, a]
+                                                and virtual[plus[ka], c]
+                                                and occupied[kj, j]
+                                                and occupied[plus[kj], k]
+                                                and amp_active(
+                                                    plus[kj], ki, kb,
+                                                    k, i, b, c,
+                                                )
+                                            ):
+                                                raw[4, iq] += (
+                                                    rho_vv[ka, a, c]
+                                                    * rho_oo[kj, j, k].conjugate()
+                                                    * t2[
+                                                        plus[kj], ki, kb,
+                                                        k, i, b, c,
+                                                    ]
+                                                )
+                                            if (
+                                                virtual[kb, b]
+                                                and virtual[plus[kb], c]
+                                                and occupied[ki, i]
+                                                and occupied[plus[ki], k]
+                                                and amp_active(
+                                                    plus[ki], kj, ka,
+                                                    k, j, a, c,
+                                                )
+                                            ):
+                                                raw[5, iq] += (
+                                                    rho_vv[kb, b, c]
+                                                    * rho_oo[ki, i, k].conjugate()
+                                                    * t2[
+                                                        plus[ki], kj, ka,
+                                                        k, j, a, c,
+                                                    ]
+                                                )
+    return raw
+
+
+def symmetric_t2(solver, seed=31):
+    """Return padded amplitudes satisfying restricted-CCD pair symmetry."""
+    rng = np.random.default_rng(seed)
+    shape = (
+        solver.nkpts,
+        solver.nkpts,
+        solver.nkpts,
+        solver.nocc,
+        solver.nocc,
+        solver.nmo - solver.nocc,
+        solver.nmo - solver.nocc,
+    )
+    source = rng.normal(size=shape)
+    result = np.zeros(shape)
     for ki in range(solver.nkpts):
         for kj in range(solver.nkpts):
             for ka in range(solver.nkpts):
                 kb = solver.khelper.kconserv[ki, ka, kj]
-                for i in range(nocc):
-                    for j in range(nocc):
-                        for a in range(nvir):
-                            for b in range(nvir):
-                                if not (
-                                    occupied[ki, i]
-                                    and occupied[kj, j]
-                                    and virtual[ka, a]
-                                    and virtual[kb, b]
-                                ):
-                                    continue
-                                for k in range(nocc):
-                                    for l in range(nocc):
-                                        if (
-                                            occupied[minus[ki], k]
-                                            and occupied[plus[kj], l]
-                                        ):
-                                            raw[0] += (
-                                                density[minus[ki], k, i]
-                                                * density[kj, j, l].conjugate()
-                                            )
-                                for c in range(nvir):
-                                    for d in range(nvir):
-                                        if (
-                                            virtual[plus[ka], c]
-                                            and virtual[minus[kb], d]
-                                        ):
-                                            raw[1] += (
-                                                density[ka, nocc + a, nocc + c]
-                                                * density[
-                                                    minus[kb], nocc + d, nocc + b
-                                                ].conjugate()
-                                            )
-                                for c in range(nvir):
-                                    for k in range(nocc):
-                                        if (
-                                            virtual[plus[ka], c]
-                                            and occupied[plus[ki], k]
-                                        ):
-                                            raw[2] += (
-                                                density[ka, nocc + a, nocc + c]
-                                                * density[ki, i, k].conjugate()
-                                            )
-                                        if (
-                                            virtual[plus[kb], c]
-                                            and occupied[plus[kj], k]
-                                        ):
-                                            raw[3] += (
-                                                density[kb, nocc + b, nocc + c]
-                                                * density[kj, j, k].conjugate()
-                                            )
-                                        if (
-                                            virtual[plus[ka], c]
-                                            and occupied[plus[kj], k]
-                                        ):
-                                            raw[4] += (
-                                                density[ka, nocc + a, nocc + c]
-                                                * density[kj, j, k].conjugate()
-                                            )
-                                        if (
-                                            virtual[plus[kb], c]
-                                            and occupied[plus[ki], k]
-                                        ):
-                                            raw[5] += (
-                                                density[kb, nocc + b, nocc + c]
-                                                * density[ki, i, k].conjugate()
-                                            )
-    return raw
+                block = source[ki, kj, ka]
+                partner = source[kj, ki, kb].transpose(1, 0, 3, 2)
+                result[ki, kj, ka] = 0.5 * (block + partner)
+    return result
 
 
-def test_options_reject_invalid_inputs():
-    """Reject controls that would make sampling or fitting ill-defined."""
-    for value in (0, -1, 1.5, True):
-        with pytest.raises(ValueError, match="line_points"):
-            CCDSSOptions(line_points=value)
-    with pytest.raises(ValueError, match="grid_level"):
-        CCDSSOptions(pair_density_becke_grid_level=-1)
-    for value in (-1.0, np.nan):
-        with pytest.raises(ValueError, match="fixed_sigma"):
-            CCDSSOptions(fixed_sigma=value)
-    with pytest.raises(ValueError, match="amplitude_fit_tol"):
-        CCDSSOptions(amplitude_fit_tol=0.0)
+def test_options_and_removed_constraint_api():
+    """Validate new defaults and reject obsolete keywords normally."""
+    defaults = CCDSSOptions()
+    assert defaults.pair_density_becke_grid_level == 2
+    assert defaults.structure_factor_imag_tol == pytest.approx(1e-5)
+    for value in (-1.0, np.inf, np.nan):
+        with pytest.raises(ValueError, match="structure_factor_imag_tol"):
+            CCDSSOptions(structure_factor_imag_tol=value)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        CCDSSOptions(use_constraint_1=False)
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        KRCCD_SS(None, use_constraint_2=False)
 
 
-def test_options_object_cannot_be_ambiguously_mixed_with_overrides():
-    """Accept an options object only when keyword overrides stay at defaults."""
-    from fsec.singularity_subtraction.ccdss import _merge_options
-
-    options = CCDSSOptions(line_points=5)
-    assert _merge_options(
-        options,
-        use_constraint_1=True,
-        use_constraint_2=True,
-        line_points=3,
-        pair_density_becke_grid_level=0,
-        fit_with_coul=True,
-        fixed_sigma=None,
-        amplitude_fit_tol=1e-12,
-    ) is options
-    with pytest.raises(ValueError, match="line_points"):
-        _merge_options(
-            options,
-            use_constraint_1=True,
-            use_constraint_2=True,
-            line_points=4,
-            pair_density_becke_grid_level=0,
-            fit_with_coul=True,
-            fixed_sigma=None,
-            amplitude_fit_tol=1e-12,
-        )
-
-
-def test_constraint_1_relaxation_is_accepted_but_constraint_2_is_not():
-    """Accept full density contractions and reject unsupported momentum shifts."""
-    assert CCDSSOptions().use_constraint_1 is True
-    assert CCDSSOptions().use_constraint_2 is True
-    options = CCDSSOptions(use_constraint_1=False)
-    assert options.use_constraint_1 is False
-
-    def fake_init(self, *args, **kwargs):
-        """Provide the parent attributes needed by the constructor test."""
-        self.kpts = np.zeros((1, 3))
-        self.mo_occ = np.asarray([[2.0, 0.0]])
-        self._nocc = 1
-        self._nmo = 2
-
-    with mock.patch.object(KRCCD, "__init__", fake_init):
-        solver = KRCCD_SS(None, use_constraint_1=False)
-        assert solver.use_constraint_1 is False
-        with pytest.raises(NotImplementedError, match="use_constraint_2"):
-            KRCCD_SS(None, use_constraint_2=False)
-
-
-def test_occupied_orbital_shift_validation_broadcasts_and_copies():
-    """Normalize valid occupied shifts and reject malformed or unsafe values."""
-    scalar = _normalize_occupied_orbital_shift(-0.25, nkpts=2, nocc=3)
-    np.testing.assert_array_equal(scalar, np.full((2, 3), -0.25))
-
-    supplied = np.arange(6.0).reshape(2, 3)
-    normalized = _normalize_occupied_orbital_shift(supplied, nkpts=2, nocc=3)
-    supplied[0, 0] = 99.0
-    assert normalized[0, 0] == 0.0
-
-    for invalid in (
-        np.zeros(3),
-        np.zeros((3, 2)),
-        np.asarray([[1.0, np.inf], [2.0, 3.0]]),
-        1.0 + 0.0j,
-        True,
-        "0.1",
-    ):
-        with pytest.raises(ValueError, match="occupied_orbital_shift"):
-            _normalize_occupied_orbital_shift(invalid, nkpts=2, nocc=2)
-
-
-def test_custom_occupied_shift_replaces_exxdiv_and_respects_padding():
-    """Apply a custom shift only to active occupied Fock diagonal entries."""
-
-    def run(keep_exxdiv):
-        """Build ERIs with one inherited exchange-divergence setting."""
-        solver = solver_shell(nkpts=2, nocc=2, nvir=1)
-        # A custom shift wins even if either inherited correction switch is
-        # subsequently enabled by user code.
-        solver.madelung_orbital = True
-        solver.keep_exxdiv = keep_exxdiv
-        solver.occupied_orbital_shift = np.asarray(
-            [[0.1, -0.2], [0.3, 8.0]]
-        )
-        observed_correction_flags = []
-
-        def make_eris(_mo_coeff=None):
-            """Record internal correction flags and return a small ERI shell."""
-            observed_correction_flags.append(
-                (solver.keep_exxdiv, solver.madelung_orbital)
-            )
-            return SimpleNamespace(
-                fock=np.asarray(
-                    [
-                        [[1.0, 0.4, 0.0], [0.4, 2.0, 0.5], [0.0, 0.5, 6.0]],
-                        [[3.0, 0.6, 0.0], [0.6, 4.0, 0.7], [0.0, 0.7, 7.0]],
-                    ]
-                ),
-                mo_energy=[np.zeros(3), np.zeros(3)],
-            )
-
-        with mock.patch.object(
-            kccsd_rhf.RCCSD, "ao2mo", side_effect=make_eris
-        ), mock.patch(
-            "fsec.singularity_subtraction.ccdss.padding_k_idx",
-            return_value=(
-                [np.asarray([0, 1]), np.asarray([0])],
-                [np.asarray([0]), np.asarray([0, 1])],
-            ),
-        ), mock.patch("fsec.staggered_mesh.cc.krccd.logger.warn") as warn:
-            eris = solver.ao2mo()
-
-        assert observed_correction_flags == [(False, False)]
-        assert solver.keep_exxdiv is keep_exxdiv
-        assert solver.madelung_orbital is True
-        warn.assert_not_called()
-        np.testing.assert_allclose(
-            eris.fock,
-            [
-                [[1.1, 0.4, 0.0], [0.4, 1.8, 0.5], [0.0, 0.5, 6.0]],
-                [[3.3, 0.6, 0.0], [0.6, 4.0, 0.7], [0.0, 0.7, 7.0]],
-            ],
-        )
-        np.testing.assert_allclose(
-            eris.mo_energy,
-            [[1.1, 1.8, 6.0], [3.3, 4.0, 7.0]],
-        )
-        return eris
-
-    without_exxdiv = run(False)
-    with_exxdiv = run(True)
-    np.testing.assert_allclose(without_exxdiv.fock, with_exxdiv.fock)
-    np.testing.assert_allclose(without_exxdiv.mo_energy, with_exxdiv.mo_energy)
-
-
-def test_missing_occupied_shift_preserves_default_ao2mo_path():
-    """Delegate unchanged to KRCCD when no custom orbital shift is supplied."""
-    solver = solver_shell()
-    solver.keep_exxdiv = True
-    expected = SimpleNamespace()
-    with mock.patch.object(KRCCD, "ao2mo", return_value=expected) as ao2mo:
-        assert solver.ao2mo() is expected
-    ao2mo.assert_called_once_with(None)
-    assert solver.keep_exxdiv is True
-
-
-def test_custom_occupied_shift_restores_flags_when_ao2mo_fails():
-    """Restore inherited correction flags if the custom-shift ERI build fails."""
-    solver = solver_shell()
-    solver.occupied_orbital_shift = np.zeros((1, 1))
-    solver.keep_exxdiv = True
-    solver.madelung_orbital = True
-    with mock.patch.object(
-        kccsd_rhf.RCCSD, "ao2mo", side_effect=RuntimeError("failed ERI build")
-    ), pytest.raises(RuntimeError, match="failed ERI build"):
-        solver.ao2mo()
-    assert solver.keep_exxdiv is True
-    assert solver.madelung_orbital is True
-
-
-def test_line_sampling_uses_positive_mesh_steps():
-    """Sample the origin and positive multiples of each reciprocal mesh step."""
+def test_line_sampling_and_gaussian_fit():
+    """Retain positive reciprocal lines and unit-Gaussian fitting."""
+    kpts = np.zeros((2, 3))
     with mock.patch(
         "fsec.singularity_subtraction.ccdss.tools.get_monkhorst_pack_size",
-        return_value=np.asarray([1, 2, 4]),
+        return_value=np.asarray([2, 3, 4]),
     ):
-        points, metadata, nks = _line_samples(
-            FakeCell(), np.zeros((8, 3)), line_points=2
-        )
-    np.testing.assert_array_equal(nks, [1, 2, 4])
+        points, metadata, mesh = _line_samples(FakeCell(), kpts, 2)
+    np.testing.assert_array_equal(mesh, [2, 3, 4])
     np.testing.assert_allclose(
         points,
-        [
-            [0, 0, 0],
-            [2, 0, 0],
-            [4, 0, 0],
-            [0, 1.5, 0],
-            [0, 3, 0],
-            [0, 0, 1],
-            [0, 0, 2],
-        ],
+        [[0, 0, 0], [1, 0, 0], [2, 0, 0], [0, 1, 0], [0, 2, 0],
+         [0, 0, 1], [0, 0, 2]],
     )
     assert len(metadata) == 3
+    sigma = 0.8
+    values = np.exp(-np.linalg.norm(points, axis=1) ** 2 / (2 * sigma**2))
+    assert _fit_unit_gaussian(points, values) == pytest.approx(sigma, rel=1e-6)
 
 
-def test_k_shift_maps_treat_scaled_k_points_as_periodic():
-    """Map roundoff near a Brillouin-zone boundary to the periodic image."""
-
-    class IdentityScaledCell:
-        """Treat Cartesian test points as already scaled k points."""
-
-        @staticmethod
-        def get_scaled_kpts(kpts):
-            """Return the supplied points without a coordinate transform."""
-            return np.asarray(kpts)
-
-    solver = solver_shell()
-    solver._scf = SimpleNamespace(cell=IdentityScaledCell())
-    # The tiny negative component is numerically equivalent to zero modulo a
-    # reciprocal lattice vector.  A non-periodic KD-tree sees it at 1 instead.
-    q_vectors = np.asarray([[0.0, 0.0, -1e-18]])
-    plus, minus = solver._build_k_shift_maps(q_vectors)
-    np.testing.assert_array_equal(plus, [[0]])
-    np.testing.assert_array_equal(minus, [[0]])
-
-
-def test_pair_density_origin_is_exact_identity_and_complex_values_are_finite():
-    """Set F(0) exactly to identity and keep padded complex factors finite."""
-    solver = solver_shell(nkpts=2, nocc=2, nvir=2)
-    solver._ss_q_vectors = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    solver._ss_plus = np.asarray([[0, 1], [1, 0]])
-    solver._ss_minus = np.asarray([[0, 1], [1, 0]])
-    solver._scf = SimpleNamespace(cell=SimpleNamespace())
-    solver.kpts = np.zeros((2, 3))
-
-    coords = np.asarray([[0.37, 0.0, 0.0]])
-    weights = np.asarray([1.0])
-    rng = np.random.default_rng(12)
-    u = rng.normal(size=(2, 4, 1)) + 1j * rng.normal(size=(2, 4, 1))
-    u[:, -1] = 0.0
-    norms = np.ones((2, 4))
-    norms[:, -1] = 0.0
-    wrapped_kpts = np.zeros((2, 3))
-    solver._ss_pair_orbitals = (coords, weights, u, norms, wrapped_kpts)
-
-    densities = solver._build_pair_densities()
-    np.testing.assert_array_equal(densities[0], np.broadcast_to(np.eye(4), (2, 4, 4)))
-    assert np.iscomplexobj(densities)
-    assert np.all(np.isfinite(densities))
-    np.testing.assert_array_equal(densities[1, :, -1, -1], 1.0)
-
-    solver.options = CCDSSOptions(
-        use_constraint_1=False, use_constraint_2=True, fixed_sigma=None
-    )
-    solver._ss_pair_densities = densities
-    raw = solver._contract_aggregate_structure_factors(
-        np.ones((2, 2, 2, 2, 2, 2, 2), dtype=complex)
-    )
-    assert np.all(np.isfinite(raw))
-
-
-@pytest.mark.parametrize("weighted", [False, True])
-def test_unit_gaussian_fit_recovers_sigma(weighted):
-    """Recover an exact Gaussian width with and without Coulomb weighting."""
-    q = np.asarray(
-        [[0, 0, 0], [0.2, 0, 0], [0, 0.35, 0], [0, 0, 0.5]]
-    )
-    sigma = 0.63
-    values = np.exp(-np.einsum("qi,qi->q", q, q) / (2 * sigma**2))
-    fitted = _fit_unit_gaussian(q, values, fit_with_coul=weighted)
-    assert fitted == pytest.approx(sigma, rel=1e-7)
-
-
-def test_gaussian_fit_rejects_nonfinite_data():
-    """Reject nonfinite structure-factor samples before optimization."""
-    with pytest.raises(ValueError, match="finite"):
-        _fit_unit_gaussian(np.asarray([[0, 0, 0], [1, 0, 0]]), [1, np.nan])
-
-
-def test_gaussian_fit_rejects_nonfinite_optimizer_result():
-    """Reject an optimizer result whose fitted width is nonfinite."""
-    result = SimpleNamespace(success=True, x=np.asarray([np.nan]))
-    with mock.patch(
-        "fsec.singularity_subtraction.ccdss.least_squares", return_value=result
-    ), pytest.raises(ValueError, match="non-finite sigma"):
-        _fit_unit_gaussian(np.asarray([[0, 0, 0], [1, 0, 0]]), [1, 0.5])
-
-
-def test_fixed_sigma_limits_and_six_channel_signs():
-    """Check zero/infinite widths and the +,+,-,-,-,- channel combination."""
-    solver = solver_shell()
-    assert solver._gaussian_xi(0.0) == 0.0
-    assert solver._gaussian_xi(np.inf) == pytest.approx(0.75)
-    solver.ss_xi = np.asarray([1, 2, 3, 4, 5, 6], dtype=float)
-    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
-    coefficient = solver._ss_residual_coefficient(t2)
-    assert coefficient.item() == 1 + 2 - 3 - 4 - 5 - 6
-
-
-def test_infinite_sigma_is_exact_madelung_residual():
-    """Reduce the infinite-width six-channel coefficient to 2*xi_Madelung."""
-    solver = solver_shell()
-    solver.options = CCDSSOptions(fixed_sigma=np.inf)
-    t2 = np.full((1, 1, 1, 1, 1, 1, 1), 2.0)
-    coefficient = solver._ss_residual_coefficient(t2)
-    assert coefficient.item() == pytest.approx(2.0 * solver.madelung_constant)
-
-
-def test_residual_is_combined_with_numerator_before_division():
-    """Add the fitted correction to the CCD numerator before division."""
-    solver = solver_shell()
-    t2 = np.full((1, 1, 1, 1, 1, 1, 1), 3.0)
-    t2new = np.full_like(t2, 5.0)
-    eris = SimpleNamespace(mo_energy=[np.asarray([1.0, 4.0])])
-    solver.ss_xi = np.asarray([0.5, 0.5, 0, 0, 0, 0])
-    with mock.patch(
-        "fsec.singularity_subtraction.ccdss.padding_k_idx",
-        return_value=([np.asarray([0])], [np.asarray([0])]),
-    ):
-        solver._inject_ss_residual(t2new, t2, eris)
-    # denominator = (1-4) + (1-4) = -6; (5*-6 + 1*3) / -6
-    assert t2new.item() == pytest.approx(4.5)
-    assert solver.last_ss_residual_norm == pytest.approx(3.0)
-
-
-def test_residual_denominators_preserve_padded_band_masks():
-    """Update active amplitudes without reviving padded orbital entries."""
-    solver = solver_shell(nocc=2, nvir=2)
-    t2 = np.ones((1, 1, 1, 2, 2, 2, 2))
-    t2new = np.zeros_like(t2)
-    eris = SimpleNamespace(mo_energy=[np.asarray([1.0, 2.0, 4.0, 5.0])])
-    solver.ss_xi = np.asarray([1, 0, 0, 0, 0, 0], dtype=float)
-    with mock.patch(
-        "fsec.singularity_subtraction.ccdss.padding_k_idx",
-        return_value=([np.asarray([0])], [np.asarray([1])]),
-    ):
-        solver._inject_ss_residual(t2new, t2, eris)
-    assert t2new[0, 0, 0, 0, 0, 1, 1] == pytest.approx(1.0 / -8.0)
-    assert abs(t2new[0, 0, 0, 1, 0, 1, 1]) < 1e-10
-
-
-@pytest.mark.parametrize("use_constraint_1", [True, False])
-def test_fixed_sigma_is_cached_once_without_sampling_or_fitting(use_constraint_1):
-    """Prepare a fixed-width correction once without curves, fits, or logs."""
-    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
-    solver = solver_shell()
-    solver.options = CCDSSOptions(
-        use_constraint_1=use_constraint_1, fixed_sigma=0.0
-    )
-    solver.verbose = logger.DEBUG2
+def test_pair_densities_cache_separate_occupied_and_virtual_blocks():
+    """Store exact identity origins and no occupied--virtual blocks."""
+    solver = solver_shell(nkpts=2, nocc=1, nvir=2, fixed_sigma=None)
+    solver._ss_q_vectors = np.zeros((1, 3))
+    solver._ss_plus = np.asarray([[0, 1]])
+    solver._ss_minus = np.asarray([[0, 1]])
+    coords = np.zeros((2, 3))
+    weights = np.ones(2)
+    u = np.ones((2, 3, 2), dtype=complex)
+    norms = np.ones((2, 3))
     with mock.patch.object(
-        solver, "_aggregate_channel_samples"
-    ) as samples, mock.patch.object(
-        solver, "_gaussian_xi", return_value=0.25
-    ) as xi, mock.patch(
-        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian"
-    ) as fit:
-        solver._ss_residual_coefficient(t2)
-        solver._ss_residual_coefficient(2 * t2)
-    assert solver.ss_prepare_count == 1
-    assert solver.ss_fit_count == 0
-    assert solver.ss_sigmas.shape == (6,)
-    assert solver.ss_xi.shape == (6,)
-    samples.assert_not_called()
-    fit.assert_not_called()
-    xi.assert_called_once_with(0.0)
-    assert "CCDSS_SF_NORM " not in solver.stdout.getvalue()
-
-
-def test_xi_preparation_reports_cpu_and_wall_time_at_info():
-    """Report preparation CPU and wall times at PySCF's INFO level."""
-    solver = solver_shell()
-    solver.verbose = logger.INFO
-    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
-    with mock.patch(
-        "fsec.singularity_subtraction.ccdss.logger.process_clock",
-        side_effect=[10.0, 12.0],
-    ), mock.patch(
-        "fsec.singularity_subtraction.ccdss.logger.perf_counter",
-        side_effect=[20.0, 23.5],
+        solver,
+        "_build_pair_orbitals",
+        return_value=(coords, weights, u, norms, np.zeros((2, 3))),
     ):
-        solver._prepare_ss(t2)
+        first = solver._build_pair_densities()
+        second = solver._build_pair_densities()
+    assert first is second
+    rho_oo, rho_vv = first
+    assert rho_oo.shape == (1, 2, 1, 1)
+    assert rho_vv.shape == (1, 2, 2, 2)
+    np.testing.assert_array_equal(rho_oo[0], np.broadcast_to(np.eye(1), (2, 1, 1)))
+    np.testing.assert_array_equal(rho_vv[0], np.broadcast_to(np.eye(2), (2, 2, 2)))
 
-    assert (
-        "KRCCDSS xi precomputation CPU 2.00 sec, wall 3.50 sec"
-        in solver.stdout.getvalue()
+
+def test_all_six_contractions_match_complex_shifted_loop_reference():
+    """Match literal loops with complex densities, shifted T2, and padding."""
+    solver = aggregate_solver()
+    rng = np.random.default_rng(44)
+    t2 = rng.normal(size=(3, 3, 3, 2, 2, 2, 2)) + 1j * rng.normal(
+        size=(3, 3, 3, 2, 2, 2, 2)
     )
+    expected = explicit_structure_factors(solver, t2)
+    actual = solver._contract_aggregate_structure_factors(t2)
+    np.testing.assert_allclose(actual, expected, rtol=2e-13, atol=2e-13)
 
 
-@pytest.mark.parametrize("use_constraint_1", [True, False])
-def test_density_only_aggregates_match_complex_nested_loop_references(
-    use_constraint_1,
-):
-    """Match all six density-only channels and ignore changed or zero T2."""
-    if use_constraint_1:
-        solver = _aggregate_solver_for_tests()
-        reference = lambda: _explicit_diagonal_density_raw(solver, 1)
-    else:
-        solver, pair_densities = _relaxed_aggregate_solver_for_tests()
-        reference = lambda: _explicit_full_density_raw(solver, pair_densities, 1)
-    rng = np.random.default_rng(43)
-    t2 = rng.normal(size=(2, 2, 2, 2, 2, 2, 2)) + 1j * rng.normal(
-        size=(2, 2, 2, 2, 2, 2, 2)
-    )
+def test_physical_origins_equal_aggregate_t2_and_normalize_to_one():
+    """Recover the common aggregate origin for pair-symmetric amplitudes."""
+    solver = aggregate_solver()
+    t2 = symmetric_t2(solver)
     raw = solver._contract_aggregate_structure_factors(t2)
-    active_count = solver._ss_active_count
-    expected = np.stack(
-        (np.full(6, active_count), reference()), axis=1
-    )
-    np.testing.assert_allclose(raw, expected)
-    np.testing.assert_allclose(
-        solver._aggregate_channel_samples(t2)[:, 1],
-        expected[:, 1] / active_count,
-    )
-    np.testing.assert_array_equal(
-        solver._aggregate_channel_samples(np.zeros_like(t2))[:, 0],
-        np.ones(6),
-    )
-    np.testing.assert_allclose(
-        solver._aggregate_channel_samples(np.zeros_like(t2)),
-        solver._aggregate_channel_samples(3.0 * t2),
-    )
+    occupied, virtual = solver._build_active_masks()
+    aggregate = 0.0
+    for ki in range(solver.nkpts):
+        for kj in range(solver.nkpts):
+            for ka in range(solver.nkpts):
+                kb = solver.khelper.kconserv[ki, ka, kj]
+                aggregate += t2[ki, kj, ka][
+                    np.ix_(occupied[ki], occupied[kj], virtual[ka], virtual[kb])
+                ].sum()
+    np.testing.assert_allclose(raw[:, 0], aggregate, atol=1e-12)
+    normalized = solver._normalize_aggregate_structure_factors(raw)
+    np.testing.assert_array_equal(normalized[:, 0], np.ones(6))
 
 
-def test_full_density_masks_padded_external_and_internal_states():
-    """Exclude padded endpoint states from external and internal sums."""
-    solver, pair_densities = _relaxed_aggregate_solver_for_tests(
-        nocc=2, nvir=2
+def test_normalization_rejects_small_origins_and_large_imaginary_residues():
+    """Project small residues but diagnose unsafe raw or normalized values."""
+    solver = solver_shell(fixed_sigma=None)
+    solver._ss_q_vectors = np.zeros((2, 3))
+    raw = np.ones((6, 2), dtype=complex)
+    raw[2, 0] = 1e-14
+    with pytest.raises(ValueError, match=r"L3.*origin.*amplitude_fit_tol"):
+        solver._normalize_aggregate_structure_factors(raw)
+
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_imag_tol=1e-5
     )
-    occupied = np.asarray([[True, False], [True, True]])
-    virtual = np.asarray([[True, True], [False, True]])
-    solver._ss_active_masks = occupied, virtual
-    solver._ss_active_count = None
-    pair_densities[1] = 1.0 + 0.5j
-    raw = solver._contract_aggregate_structure_factors(
-        np.zeros((2, 2, 2, 2, 2, 2, 2), dtype=complex)
-    )
-    active_count = sum(
-        occupied[ki].sum()
-        * occupied[kj].sum()
-        * virtual[ka].sum()
-        * virtual[solver.khelper.kconserv[ki, ka, kj]].sum()
-        for ki in range(2)
-        for kj in range(2)
-        for ka in range(2)
-    )
-    expected = np.stack(
-        (
-            np.full(6, active_count),
-            _explicit_full_density_raw(solver, pair_densities, 1),
-        ),
-        axis=1,
-    )
-    np.testing.assert_allclose(raw, expected)
-    assert raw[0, 1] != raw[0, 0]
+    raw[:] = 2.0 + 1e-6j
+    raw[:, 1] = 1.0 + 2e-6j
+    normalized = solver._normalize_aggregate_structure_factors(raw)
+    assert np.max(np.abs(normalized.imag)) < 1e-5
+
+    raw[4, 1] = 1.0 + 3e-5j
+    with pytest.raises(
+        ValueError, match=r"L5 sample 1.*raw imaginary.*1\.499999.*1\.000000"
+    ):
+        solver._normalize_aggregate_structure_factors(raw)
 
 
-def test_diagonal_transition_densities_reproduce_the_constrained_path():
-    """Reduce full-density contractions to the unchanged diagonal factors."""
-    constrained = _aggregate_solver_for_tests()
-    relaxed = _aggregate_solver_for_tests()
-    factors = constrained._ss_pair_factors
-    pair_densities = np.zeros(
-        (2, 2, constrained.nmo, constrained.nmo), dtype=complex
+def test_normalization_checks_imaginary_part_created_by_complex_origin():
+    """Check normalized phase even when every raw imaginary part is small."""
+    solver = solver_shell(fixed_sigma=None)
+    solver._ss_q_vectors = np.zeros((2, 3))
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_imag_tol=1e-5
     )
-    for q_index in range(2):
-        for k in range(2):
-            pair_densities[q_index, k] = np.diag(factors[q_index, k])
-    relaxed.options = CCDSSOptions(
-        use_constraint_1=False, use_constraint_2=True, fixed_sigma=None
+    raw = np.ones((6, 2), dtype=complex)
+    raw[1, 0] = 1.0 + 9e-6j
+    raw[1, 1] = 0.1 - 9.5e-6j
+    with pytest.raises(ValueError, match=r"L2 sample 1 normalized imaginary"):
+        solver._normalize_aggregate_structure_factors(raw)
+
+
+def test_two_fitted_residual_updates_refit_changed_amplitudes():
+    """Perform six fits per update and pass changed real curves to fitting."""
+    solver = aggregate_solver(imag_tol=1e6)
+    solver._ss_active_masks = (
+        np.ones((3, 2), dtype=bool), np.ones((3, 2), dtype=bool)
     )
-    relaxed._ss_pair_densities = pair_densities
-    relaxed._ss_pair_factors = None
-    rng = np.random.default_rng(47)
-    t2 = rng.normal(size=(2, 2, 2, 2, 2, 2, 2)) + 1j * rng.normal(
-        size=(2, 2, 2, 2, 2, 2, 2)
-    )
-    np.testing.assert_allclose(
-        relaxed._contract_aggregate_structure_factors(t2),
-        constrained._contract_aggregate_structure_factors(t2),
-    )
+    first = symmetric_t2(solver, seed=4)
+    changed = first.copy()
+    changed[0, 0, 0, 0, 0, 0, 0] += 0.7
+    fitted_curves = []
 
-
-def test_relaxed_off_diagonal_density_elements_change_the_aggregate():
-    """Include off-diagonal transitions instead of silently using diagonals."""
-    solver, pair_densities = _relaxed_aggregate_solver_for_tests()
-    diagonal = np.diagonal(pair_densities, axis1=2, axis2=3).copy()
-    diagonal_densities = np.zeros_like(pair_densities)
-    for q_index in range(2):
-        for k in range(2):
-            diagonal_densities[q_index, k] = np.diag(diagonal[q_index, k])
-    t2 = np.arange(2**7, dtype=float).reshape((2,) * 7) + 1j
-    full = solver._contract_aggregate_structure_factors(t2)
-    solver._ss_pair_densities = diagonal_densities
-    diagonal_raw = solver._contract_aggregate_structure_factors(t2)
-    assert np.max(np.abs(full[:, 1] - diagonal_raw[:, 1])) > 1e-8
-
-
-@pytest.mark.parametrize("use_constraint_1", [True, False])
-def test_density_only_fit_is_cached_once_for_both_constraint_1_modes(
-    use_constraint_1,
-):
-    """Perform exactly six fits, then reuse them for later residual updates."""
-    if use_constraint_1:
-        solver = _aggregate_solver_for_tests(nocc=1, nvir=1)
-    else:
-        solver, _ = _relaxed_aggregate_solver_for_tests(nocc=1, nvir=1)
-    t2 = np.ones((2, 2, 2, 1, 1, 1, 1), dtype=complex)
-    changed = 3.0 * t2
-    fit_values = []
-
-    def fake_fit(q_vectors, values, fit_with_coul=True):
-        """Capture one normalized curve and return a distinct width."""
-        fit_values.append(np.array(values, copy=True))
-        return float(len(fit_values))
+    def fake_fit(_q, values, fit_with_coul=True):
+        fitted_curves.append(np.array(values, copy=True))
+        return 0.5 + 0.01 * len(fitted_curves)
 
     with mock.patch(
         "fsec.singularity_subtraction.ccdss._fit_unit_gaussian",
         side_effect=fake_fit,
-    ), mock.patch.object(solver, "_gaussian_xi", side_effect=lambda sigma: sigma):
-        solver._prepare_ss(t2)
-        coefficient_a = solver._ss_residual_coefficient(t2)
-        coefficient_b = solver._ss_residual_coefficient(changed)
+    ), mock.patch.object(solver, "_gaussian_xi", side_effect=lambda x: x):
+        solver._ss_residual_coefficient(first)
+        first_xi = solver.ss_xi.copy()
+        solver._ss_residual_coefficient(changed)
 
-    assert len(fit_values) == 6
-    assert solver.ss_fit_count == 6
-    assert solver.ss_prepare_count == 1
-    assert solver.ss_sigmas.shape == (6,)
-    assert solver.ss_xi.shape == (6,)
-    assert coefficient_a == pytest.approx(1 + 2 - 3 - 4 - 5 - 6)
-    assert coefficient_b == coefficient_a
-
-
-def test_debug2_reports_one_row_per_aggregate_channel_and_q_sample():
-    """Emit parseable fit diagnostics for every channel and sampled q point."""
-    solver = _aggregate_solver_for_tests(nocc=1, nvir=1)
-    solver.verbose = logger.DEBUG2
-    t2 = np.ones((2, 2, 2, 1, 1, 1, 1), dtype=complex)
-    samples = np.ones((6, 2), dtype=complex)
-    samples[:, 1] = np.arange(1, 7) * (0.1 - 0.2j)
-    with mock.patch.object(
-        solver, "_aggregate_channel_samples", return_value=samples
-    ), mock.patch(
-        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian",
-        return_value=2.0,
-    ), mock.patch.object(solver, "_gaussian_xi", return_value=0.25):
-        solver._prepare_ss(t2)
-
-    lines = [
-        line
-        for line in solver.stdout.getvalue().splitlines()
-        if line.startswith("CCDSS_SF ")
-    ]
-    assert len(lines) == 12
-    assert "prep=1 channel=L1 q_index=0" in lines[0]
-    assert "prep=1 channel=L6 q_index=1" in lines[-1]
-    assert "ki=" not in lines[0] and " i=" not in lines[0]
-    raw = samples[2, 1]
-    fit = np.exp(-1.0 / 8.0)
-    residual = fit - raw
-    row = lines[2 * 2 + 1]
-    assert "channel=L3 q_index=1" in row
-    assert f"raw_real={raw.real:.16e}" in row
-    assert f"raw_imag={raw.imag:.16e}" in row
-    assert "qx=1.0000000000000000e+00" in row
-    assert "sigma=2.0000000000000000e+00" in row
-    assert "xi=2.5000000000000000e-01" in row
-    assert f"fit={fit:.16e}" in row
-    assert f"residual_real={residual.real:.16e}" in row
-    assert f"residual_imag={residual.imag:.16e}" in row
-
-
-def test_debug2_reports_raw_aggregate_normalization_per_channel():
-    """Emit the physical active-entry count for every channel origin."""
-    solver = _aggregate_solver_for_tests(nocc=1, nvir=1)
-    solver.verbose = logger.DEBUG2
-    t2 = np.full(
-        (2, 2, 2, 1, 1, 1, 1), 1.0 + 0.5j, dtype=complex
+    assert solver.ss_prepare_count == 2
+    assert solver.ss_fit_count == 12
+    assert len(fitted_curves) == 12
+    assert any(
+        not np.allclose(fitted_curves[channel], fitted_curves[channel + 6])
+        for channel in range(6)
     )
-    solver._build_active_masks()
-    active_count = solver._ss_active_count
+    assert not np.array_equal(first_xi, solver.ss_xi)
+    assert solver.ss_sigmas.shape == solver.ss_xi.shape == (6,)
+
+
+def test_failed_fitted_preparation_does_not_advance_state_or_counters():
+    """Commit counters and latest arrays only after all six fits succeed."""
+    solver = aggregate_solver(imag_tol=1e6)
+    t2 = symmetric_t2(solver)
     with mock.patch(
         "fsec.singularity_subtraction.ccdss._fit_unit_gaussian",
-        return_value=2.0,
+        side_effect=[1.0, 1.0, ValueError("fit failed")],
+    ), mock.patch.object(
+        solver, "_gaussian_xi", return_value=0.1
+    ), pytest.raises(ValueError, match="fit failed"):
+        solver._prepare_ss(t2)
+    assert solver.ss_prepare_count == solver.ss_fit_count == 0
+    assert solver.ss_sigmas is None and solver.ss_xi is None
+
+
+def test_fixed_sigma_is_cached_without_sampling_or_fitting():
+    """Prepare an amplitude-independent fixed width exactly once."""
+    solver = solver_shell(fixed_sigma=np.inf)
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    with mock.patch.object(
+        solver, "_aggregate_channel_samples"
+    ) as sample, mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian"
+    ) as fit:
+        first = solver._prepare_ss(t2)
+        second = solver._prepare_ss(3 * t2)
+    assert first is second
+    np.testing.assert_array_equal(first, np.full(6, 0.75))
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 0
+    sample.assert_not_called()
+    fit.assert_not_called()
+
+
+def test_debug2_reports_raw_and_normalized_rows_on_every_fit():
+    """Emit one parseable row per preparation, channel, and q sample."""
+    solver = solver_shell(fixed_sigma=None)
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_imag_tol=1e-5
+    )
+    solver._ss_q_vectors = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=float)
+    solver.verbose = logger.DEBUG2
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    raw = np.ones((6, 2), dtype=complex) * 2
+    normalized = raw / 2
+    with mock.patch.object(
+        solver, "_aggregate_channel_samples", return_value=(raw, normalized)
+    ), mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian", return_value=2.0
     ), mock.patch.object(solver, "_gaussian_xi", return_value=0.25):
         solver._prepare_ss(t2)
-
-    lines = [
-        line
-        for line in solver.stdout.getvalue().splitlines()
-        if line.startswith("CCDSS_SF_NORM ")
+        solver._prepare_ss(t2)
+    rows = [
+        line for line in solver.stdout.getvalue().splitlines()
+        if line.startswith("CCDSS_SF ")
     ]
-    assert len(lines) == 6
-    for channel, line in enumerate(lines, start=1):
-        assert f"prep=1 channel=L{channel} " in line
-        assert f"norm_real={active_count:.16e}" in line
-        assert "norm_imag=0.0000000000000000e+00" in line
-        assert f"norm_abs={active_count:.16e}" in line
+    assert len(rows) == 24
+    assert "prep=1 channel=L1 q_index=0" in rows[0]
+    assert "prep=2 channel=L6 q_index=1" in rows[-1]
+    for field in (
+        "raw_real=", "raw_imag=", "normalized_real=", "normalized_imag=",
+        "sigma=", "xi=", "fit=", "residual_real=", "residual_imag=",
+    ):
+        assert field in rows[0]
 
 
-def test_init_amps_prepares_fitted_state_once():
-    """Prepare the cached six-channel state during amplitude initialization."""
+def test_fixed_sigma_limits_signs_and_residual_before_division():
+    """Retain six signs, Madelung limits, and numerator-level injection."""
     solver = solver_shell()
-    solver.options = CCDSSOptions(fixed_sigma=None)
-    eris = SimpleNamespace()
-    solver.verbose = logger.DEBUG2
+    solver.ss_xi = np.arange(1.0, 7.0)
+    assert solver._ss_residual_coefficient(np.ones((1,) * 7)) == -15.0
+
+    solver.ss_xi = np.asarray([0.5, 0.5, 0, 0, 0, 0])
+    t2 = np.full((1, 1, 1, 1, 1, 1, 1), 3.0)
+    t2new = np.full_like(t2, 5.0)
+    eris = SimpleNamespace(mo_energy=[np.asarray([-1.0, 2.0])])
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss.padding_k_idx",
+        return_value=([np.asarray([0])], [np.asarray([0])]),
+    ):
+        result = solver._inject_ss_residual(t2new, t2, eris)
+    denominator = -6.0
+    assert result.item() == pytest.approx((5.0 * denominator + 3.0) / denominator)
+    assert solver._gaussian_xi(0.0) == 0.0
+    assert solver._gaussian_xi(np.inf) == 0.75
+
+
+def test_occupied_orbital_shift_validation_and_application():
+    """Broadcast custom shifts and apply them only to active occupied states."""
+    scalar = _normalize_occupied_orbital_shift(-0.2, 2, 2)
+    np.testing.assert_array_equal(scalar, np.full((2, 2), -0.2))
+    for invalid in (np.zeros(2), np.inf, 1 + 0j, True):
+        with pytest.raises(ValueError, match="occupied_orbital_shift"):
+            _normalize_occupied_orbital_shift(invalid, 2, 2)
+
+    solver = solver_shell(nkpts=2, nocc=2, nvir=1)
+    solver.occupied_orbital_shift = np.asarray([[0.1, -0.2], [0.3, 9.0]])
+    solver.keep_exxdiv = True
+    eris = SimpleNamespace(
+        fock=np.asarray([np.diag([1.0, 2.0, 3.0]), np.diag([4.0, 5.0, 6.0])]),
+        mo_energy=[np.asarray([1.0, 2.0, 3.0]), np.asarray([4.0, 5.0, 6.0])],
+    )
     with mock.patch.object(
-        KRCCD_SS, "_prepare_ss"
-    ) as prepare, mock.patch.object(
-        KRCCD,
-        "init_amps",
+        kccsd_rhf.RCCSD, "ao2mo", return_value=eris
+    ), mock.patch(
+        "fsec.singularity_subtraction.ccdss.padding_k_idx",
         return_value=(
-            1.0,
-            np.zeros((1, 1, 1)),
-                np.ones((1, 1, 1, 1, 1, 1, 1)),
-            ),
-        ):
-        result = solver.init_amps(eris)
-    prepare.assert_called_once_with(result[2])
+            [np.asarray([0, 1]), np.asarray([0])],
+            [np.asarray([0]), np.asarray([0])],
+        ),
+    ):
+        result = solver.ao2mo()
+    np.testing.assert_allclose(np.diagonal(result.fock, axis1=1, axis2=2),
+                               [[1.1, 1.8, 3.0], [4.3, 5.0, 6.0]])
+    assert solver.keep_exxdiv is True and solver.madelung_orbital is True
 
 
-def test_update_amps_keeps_t1_zero_and_validates_t2_shape():
-    """Enforce CCD singles and validate doubles before the parent update."""
-    solver = solver_shell()
+def test_init_defers_fitted_preparation_and_update_keeps_t1_zero():
+    """Do no fitted work in initialization and keep CCD singles zero."""
+    solver = solver_shell(fixed_sigma=None)
     t1 = np.ones((1, 1, 1))
     t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
-    with pytest.raises(ValueError, match="t2 must have shape"):
-        solver.update_amps(t1, t2[..., 0], SimpleNamespace())
+    with mock.patch.object(
+        KRCCD, "init_amps", return_value=(1.0, t1, t2)
+    ), mock.patch.object(solver, "_prepare_ss") as prepare:
+        _, initial_t1, _ = solver.init_amps(SimpleNamespace())
+    np.testing.assert_array_equal(initial_t1, 0)
+    prepare.assert_not_called()
 
     with mock.patch.object(
-        kccsd_rhf.RCCSD,
-        "update_amps",
-        return_value=(np.ones_like(t1), np.full_like(t2, 2.0)),
-    ), mock.patch.object(KRCCD_SS, "_inject_ss_residual", lambda self, out, *_: out):
-        out_t1, out_t2 = solver.update_amps(t1, t2, SimpleNamespace())
-    np.testing.assert_array_equal(out_t1, np.zeros_like(t1))
-    np.testing.assert_array_equal(out_t2, np.full_like(t2, 2.0))
+        kccsd_rhf.RCCSD, "update_amps", return_value=(t1, 2 * t2)
+    ), mock.patch.object(solver, "_inject_ss_residual", side_effect=lambda out, *_: out):
+        updated_t1, updated_t2 = solver.update_amps(t1, t2, SimpleNamespace())
+    np.testing.assert_array_equal(updated_t1, 0)
+    np.testing.assert_array_equal(updated_t2, 2)
 
 
 @pytest.mark.slow
-def test_h2_1x1x2_limits_and_default_fit():
-    """Check fitted execution and exact fixed-width limits on a small cell."""
+def test_h2_1x1x2_limits_and_dynamic_fit():
+    """Converge H2 with level-2 densities and six fits per CCD update."""
     cell = gto.Cell()
     cell.unit = "Bohr"
     cell.atom = "H 0 0 0; H 1.8 0 0"
@@ -910,41 +594,30 @@ def test_h2_1x1x2_limits_and_default_fit():
     calculations = {
         "orbital": KRCCD(mf, madelung_orbital=True),
         "zero": KRCCD_SS(mf, fixed_sigma=0.0),
-        "custom_madelung": KRCCD_SS(
-            mf,
-            fixed_sigma=0.0,
-            occupied_orbital_shift=-tools.madelung(cell, kpts),
-        ),
         "madelung": KRCCD(mf, madelung_orbital=True, madelung_eri=True),
         "infinite": KRCCD_SS(mf, fixed_sigma=np.inf),
         "fitted": KRCCD_SS(mf),
-        "constraint_1_off": KRCCD_SS(mf, use_constraint_1=False),
     }
-    energies = {}
+    results = {}
     for name, cc in calculations.items():
         cc.keep_exxdiv = False
         cc.conv_tol = 1e-7
-        cc.max_cycle = 20
-        energy, _, _ = cc.kernel()
-        energies[name] = energy
-        assert cc.converged
-        assert np.isfinite(energy)
+        cc.max_cycle = 30
+        energy, _, t2 = cc.kernel()
+        assert cc.converged and np.isfinite(energy)
+        results[name] = energy, t2
 
-    assert energies["zero"] == pytest.approx(energies["orbital"], abs=1e-11)
-    assert energies["custom_madelung"] == pytest.approx(
-        energies["zero"], abs=1e-11
+    assert results["zero"][0] == pytest.approx(results["orbital"][0], abs=1e-11)
+    assert results["infinite"][0] == pytest.approx(
+        results["madelung"][0], abs=1e-11
     )
-    assert energies["infinite"] == pytest.approx(energies["madelung"], abs=1e-11)
-
     fitted = calculations["fitted"]
-    assert fitted.ss_prepare_count == 1
-    assert fitted.ss_fit_count == 6
-    assert fitted.ss_sigmas.shape == (6,)
-    assert fitted.ss_xi.shape == (6,)
-    np.testing.assert_array_equal(fitted._ss_pair_factors[0], 1.0)
-    relaxed = calculations["constraint_1_off"]
-    assert relaxed.ss_prepare_count == 1
-    assert relaxed.ss_fit_count == 6
-    assert np.all(np.isfinite(relaxed.ss_sigmas))
-    assert calculations["zero"].ss_prepare_count == 1
-    assert calculations["infinite"].ss_prepare_count == 1
+    assert fitted.options.pair_density_becke_grid_level == 2
+    assert fitted.ss_prepare_count == fitted.cycles
+    assert fitted.ss_fit_count == 6 * fitted.ss_prepare_count
+    assert np.all(np.isfinite(fitted.ss_sigmas))
+    assert fitted.ss_sigmas.shape == fitted.ss_xi.shape == (6,)
+    raw, normalized = fitted._aggregate_channel_samples(results["fitted"][1])
+    scaled_raw_imag = np.abs(raw.imag) / np.abs(raw[:, :1])
+    assert np.max(scaled_raw_imag) < 1e-5
+    assert np.max(np.abs(normalized.imag)) < 1e-5

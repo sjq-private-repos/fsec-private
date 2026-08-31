@@ -12,13 +12,6 @@ from fsec.singularity_subtraction import KRCCD_SS
 BVK_MESH = np.asarray([2, 2, 2])
 N_PRIMITIVE_CELLS = int(np.prod(BVK_MESH))
 
-# Gamma-containing primitive-cell 2x2x2 reference from
-# diamond_2x2x2_krccdss_constraint_1_relaxed_no_exxss.log.
-REFERENCE_SCF_PER_CELL = -9.469387390682694
-REFERENCE_CCDSS_CORR_PER_CELL = -0.09914847536862217
-REFERENCE_CCDSS_TOTAL_PER_CELL = -9.568535866051317
-
-
 cell = gto.Cell()
 cell.unit = "Bohr"
 cell.atom = """
@@ -53,8 +46,6 @@ print(f"supercell volume: {supercell.vol:.15f}")
 print(f"supercell mesh: {supercell.mesh}")
 print(f"number of k-points: {len(kpts)}")
 print(f"k-points: {kpts}")
-print("constraint (1): False")
-print("constraint (2): True")
 print("ExxSS applied: False")
 
 kmf = scf.KRHF(supercell, kpts).density_fit()
@@ -68,12 +59,7 @@ if not kmf.converged:
 e_scf_per_cell = e_scf / N_PRIMITIVE_CELLS
 print(f"SCF energy, supercell = {e_scf:.15f}")
 print(f"SCF energy / primitive cell = {e_scf_per_cell:.15f}")
-print(
-    "SCF delta from primitive 2x2x2 Gamma-containing mesh / cell = "
-    f"{e_scf_per_cell - REFERENCE_SCF_PER_CELL:+.15e}"
-)
-
-cc = KRCCD_SS(kmf, use_constraint_1=False, use_constraint_2=True)
+cc = KRCCD_SS(kmf)
 cc.keep_exxdiv = False
 cc.conv_tol = 1e-7
 cc.max_cycle = 30
@@ -90,14 +76,6 @@ print(f"CCDSS E_corr, supercell = {e_corr:.15f}")
 print(f"CCDSS E_corr / primitive cell = {e_corr_per_cell:.15f}")
 print(f"CCDSS total energy, supercell = {e_total:.15f}")
 print(f"CCDSS total energy / primitive cell = {e_total_per_cell:.15f}")
-print(
-    "CCDSS E_corr delta from primitive 2x2x2 Gamma-containing mesh / cell = "
-    f"{e_corr_per_cell - REFERENCE_CCDSS_CORR_PER_CELL:+.15e}"
-)
-print(
-    "CCDSS total delta from primitive 2x2x2 Gamma-containing mesh / cell = "
-    f"{e_total_per_cell - REFERENCE_CCDSS_TOTAL_PER_CELL:+.15e}"
-)
 print(f"ss_prepare_count = {cc.ss_prepare_count}")
 print(f"ss_fit_count = {cc.ss_fit_count}")
 print(f"||R_SS|| = {cc.last_ss_residual_norm:.8e}")

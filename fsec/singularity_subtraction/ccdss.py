@@ -19,23 +19,13 @@ from fsec.staggered_mesh.cc.krccd import KRCCD
 
 """Iterative singularity subtraction for restricted periodic CCD.
 
-Let ``F_n(k,Q)`` be the normalized diagonal transition-density factor linking
-orbital ``n,k`` to ``n,k+q``, including the reciprocal wrap in ``Q = q+G``.
-The corresponding full transition density is ``rho[p,s](k,Q)``.  PySCF
-stores doubles as ``t2[ki,kj,ka,i,j,a,b]`` and determines
-``kb = kconserv[ki,ka,kj]``.
+The fitted curves are the complete, k-point-summed structure factors
+``S1``--``S6`` from Eqs. (2.1) and (2.3)--(2.7) of ``ccd-ss.pdf``.  PySCF
+stores doubles as ``t2[ki,kj,ka,i,j,a,b]`` and determines the fourth momentum
+with ``kb = kconserv[ki,ka,kj]``.  Each curve therefore depends on the current
+doubles amplitudes and is rebuilt on every fitted CCD update.
 
-The six fitted curves are density-only aggregates.  With constraint (1)
-enabled, each channel uses the existing diagonal factor product.  With it
-disabled, the two factors are contracted over the internal orbital indices as
-``ki,jl->ij``, ``ac,db->ab``, ``ac,ik->ia``, ``bc,jk->jb``, ``ac,jk->ja``,
-and ``bc,ik->ib``.  Every active external orbital and k-point index is then
-summed.  Constraint (2) fixes the T2 momentum at its q=0 block, so T2 is
-factored out of fitting entirely.  Each curve is normalized by the exact
-number of physical active entries at q=0 and its origin is set exactly to one.
-
-The six fitted corrections are reused throughout CCD.  The correction added
-to the current doubles residual is
+The resulting correction added to the doubles residual is
 ``(xi1 + xi2 - xi3 - xi4 - xi5 - xi6) * t2``.
 """
 
@@ -48,17 +38,16 @@ class CCDSSOptions:
     direction.  Samples are separated by ``b_i / n_i``, where ``n_i`` is the
     Monkhorst--Pack mesh size.  The Gaussian is
     ``exp(-|Q|**2 / (2*sigma**2))`` and its coefficient is fixed to one.
-    ``use_constraint_1`` selects diagonal pair factors or full transition
-    densities.  Constraint (2) relaxation is not currently supported.
+    ``structure_factor_imag_tol`` bounds both raw and normalized imaginary
+    residues relative to the magnitude of the channel origin.
     """
 
-    use_constraint_2: bool = True
-    use_constraint_1: bool = True
     line_points: int = 3
-    pair_density_becke_grid_level: int = 0
+    pair_density_becke_grid_level: int = 2
     fit_with_coul: bool = True
     fixed_sigma: float | None = None
     amplitude_fit_tol: float = 1e-12
+    structure_factor_imag_tol: float = 1e-5
 
     def __post_init__(self):
         if isinstance(self.line_points, bool) or not isinstance(
@@ -90,8 +79,17 @@ class CCDSSOptions:
         if not np.isfinite(tol) or tol <= 0:
             raise ValueError("amplitude_fit_tol must be a finite positive number")
         object.__setattr__(self, "amplitude_fit_tol", tol)
-        object.__setattr__(self, "use_constraint_1", bool(self.use_constraint_1))
-        object.__setattr__(self, "use_constraint_2", bool(self.use_constraint_2))
+        try:
+            imag_tol = float(self.structure_factor_imag_tol)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "structure_factor_imag_tol must be a finite non-negative number"
+            ) from exc
+        if not np.isfinite(imag_tol) or imag_tol < 0:
+            raise ValueError(
+                "structure_factor_imag_tol must be a finite non-negative number"
+            )
+        object.__setattr__(self, "structure_factor_imag_tol", imag_tol)
         object.__setattr__(self, "fit_with_coul", bool(self.fit_with_coul))
 
 
@@ -195,10 +193,8 @@ def _fit_unit_gaussian(q_vectors, values, fit_with_coul=True):
 class KRCCD_SS(KRCCD):
     """Restricted k-point CCD with six-channel singularity subtraction.
 
-    The active path evaluates six scalar, density-only ``S_tilde_n(Q)``
-    aggregates.  Constraint (1) selects diagonal transition factors or full
-    transition-density matrices.  Constraint (2) keeps the T2 momentum at its
-    q=0 value; relaxing constraint (2) is unsupported.
+    The active path evaluates the six complete scalar structure factors using
+    full occupied--occupied and virtual--virtual transition densities.
     """
 
     _keys = KRCCD._keys.union(
@@ -220,26 +216,23 @@ class KRCCD_SS(KRCCD):
         mo_coeff=None,
         mo_occ=None,
         options=None,
-        use_constraint_2=True,
         line_points=3,
-        pair_density_becke_grid_level=0,
+        pair_density_becke_grid_level=2,
         fit_with_coul=True,
         fixed_sigma=None,
         amplitude_fit_tol=1e-12,
+        structure_factor_imag_tol=1e-5,
         occupied_orbital_shift=None,
-        use_constraint_1=True,
     ):
         self.options = _merge_options(
             options,
-            use_constraint_1=use_constraint_1,
-            use_constraint_2=use_constraint_2,
             line_points=line_points,
             pair_density_becke_grid_level=pair_density_becke_grid_level,
             fit_with_coul=fit_with_coul,
             fixed_sigma=fixed_sigma,
             amplitude_fit_tol=amplitude_fit_tol,
+            structure_factor_imag_tol=structure_factor_imag_tol,
         )
-        self._validate_constraints()
         super().__init__(
             mf,
             frozen=frozen,
@@ -256,42 +249,26 @@ class KRCCD_SS(KRCCD):
         self.last_ss_residual_norm = 0.0
         self.ss_sigmas = None
         self.ss_xi = None
-        self._ss_pair_factors = None
         self._ss_pair_densities = None
         self._ss_pair_orbitals = None
         self._ss_q_vectors = None
         self._ss_plus = None
         self._ss_minus = None
         self._ss_active_masks = None
-        self._ss_active_count = None
-
-    @property
-    def use_constraint_1(self):
-        return self.options.use_constraint_1
-
-    @property
-    def use_constraint_2(self):
-        return self.options.use_constraint_2
-
-    def _validate_constraints(self):
-        """Reject the unsupported constraint-(2)-relaxed contraction."""
-        if not self.options.use_constraint_2:
-            raise NotImplementedError(
-                "constraint (2) relaxation is unsupported; "
-                "use_constraint_2 must be True"
-            )
 
     def dump_flags(self, verbose=None):
         result = super().dump_flags(verbose)
         log = logger.new_logger(self, verbose)
-        log.info("CCD SS constraint (1) = %s", self.options.use_constraint_1)
-        log.info("CCD SS constraint (2) = %s", self.options.use_constraint_2)
         log.info("CCD SS positive line samples = %d", self.options.line_points)
         log.info(
             "CCD SS Becke grid level = %d",
             self.options.pair_density_becke_grid_level,
         )
         log.info("CCD SS fixed sigma = %s", self.options.fixed_sigma)
+        log.info(
+            "CCD SS structure-factor imaginary tolerance = %g",
+            self.options.structure_factor_imag_tol,
+        )
         if self.occupied_orbital_shift is None:
             log.info("CCD SS occupied-orbital shift = Madelung default")
         else:
@@ -343,10 +320,10 @@ class KRCCD_SS(KRCCD):
     def init_amps(self, eris):
         emp2, t1, t2 = super().init_amps(eris)
         t1 = np.zeros_like(t1)
-        # The density-only curves do not depend on the initial amplitudes.  Do
-        # the one-time preparation here so the first CCD update can reuse the
-        # cached six widths and corrections.
-        self._prepare_ss(t2)
+        # Fitted curves depend on T2 and are prepared by each residual update.
+        # Fixed widths are amplitude-independent and may be cached now.
+        if self.options.fixed_sigma is not None:
+            self._prepare_ss(t2)
         return emp2, t1, t2
 
     def _validate_t2(self, t2):
@@ -428,49 +405,28 @@ class KRCCD_SS(KRCCD):
         self._ss_pair_orbitals = cached
         return cached
 
-    def _build_pair_factors(self):
-        """Build the diagonal, constraint-(1) transition-density factors."""
-        cached = getattr(self, "_ss_pair_factors", None)
-        if cached is not None:
-            return cached
-        self._prepare_sampling_maps()
-        coords, weights, u, norms, wrapped_kpts = self._build_pair_orbitals()
-        factors = np.ones(
-            (len(self._ss_q_vectors), self.nkpts, self.nmo), dtype=np.complex128
-        )
-        for iq, q in enumerate(self._ss_q_vectors[1:], start=1):
-            target = self._ss_plus[iq]
-            unwrapped = self.kpts + q
-            wrapped = wrapped_kpts[target]
-            gdiff = unwrapped - wrapped
-            wrap_phase = np.exp(-1j * (coords @ gdiff.T)).T
-            u_target = u[target] * wrap_phase[:, None, :]
-            overlap = lib.einsum("knr,r,knr->kn", u.conj(), weights, u_target)
-            valid = (np.abs(norms) > 1e-14) & (
-                np.abs(norms[target]) > 1e-14
-            )
-            factors[iq, valid] = overlap[valid] / np.sqrt(
-                norms[valid] * norms[target][valid]
-            )
-            # Preserve the historical padded-orbital safeguard.  Those
-            # elements are removed from CCD denominators later.
-            factors[iq, ~valid] = 1.0
-        factors[0] = 1.0
-        self._ss_pair_factors = factors
-        return factors
-
     def _build_pair_densities(self):
-        """Build normalized transition-density matrices for relaxed constraint 1."""
+        """Build normalized occupied and virtual transition densities.
+
+        ``rho[q, k, p, s]`` links an orbital ``p`` at ``k`` to an orbital
+        ``s`` at ``plus[q, k]``.  Occupied--virtual blocks are never needed by
+        the six chapter-2 structure factors and are not stored.
+        """
         cached = getattr(self, "_ss_pair_densities", None)
         if cached is not None:
             return cached
         self._prepare_sampling_maps()
         coords, weights, u, norms, wrapped_kpts = self._build_pair_orbitals()
-        densities = np.zeros(
-            (len(self._ss_q_vectors), self.nkpts, self.nmo, self.nmo),
-            dtype=np.complex128,
+        nsamples = len(self._ss_q_vectors)
+        nvir = self.nmo - self.nocc
+        rho_oo = np.zeros(
+            (nsamples, self.nkpts, self.nocc, self.nocc), dtype=np.complex128
         )
-        densities[0] = np.eye(self.nmo, dtype=np.complex128)
+        rho_vv = np.zeros(
+            (nsamples, self.nkpts, nvir, nvir), dtype=np.complex128
+        )
+        rho_oo[0] = np.eye(self.nocc, dtype=np.complex128)
+        rho_vv[0] = np.eye(nvir, dtype=np.complex128)
 
         for iq, q in enumerate(self._ss_q_vectors[1:], start=1):
             target = self._ss_plus[iq]
@@ -479,41 +435,40 @@ class KRCCD_SS(KRCCD):
             gdiff = unwrapped - wrapped
             wrap_phase = np.exp(-1j * (coords @ gdiff.T)).T
             u_target = u[target] * wrap_phase[:, None, :]
-            overlap = lib.einsum(
-                "kpr,r,ksr->kps", u.conj(), weights, u_target
-            )
-            denominator = np.sqrt(
-                np.maximum(
-                    norms[:, :, None] * norms[target][:, None, :], 0.0
+            for output, orbital_slice in (
+                (rho_oo, slice(None, self.nocc)),
+                (rho_vv, slice(self.nocc, None)),
+            ):
+                source_orbitals = u[:, orbital_slice]
+                target_orbitals = u_target[:, orbital_slice]
+                overlap = lib.einsum(
+                    "kpr,r,ksr->kps",
+                    source_orbitals.conj(),
+                    weights,
+                    target_orbitals,
                 )
-            )
-            valid = denominator > 1e-14
-            np.divide(overlap, denominator, out=densities[iq], where=valid)
+                source_norms = norms[:, orbital_slice]
+                target_norms = norms[target, orbital_slice]
+                denominator = np.sqrt(
+                    np.maximum(
+                        source_norms[:, :, None] * target_norms[:, None, :],
+                        0.0,
+                    )
+                )
+                np.divide(
+                    overlap,
+                    denominator,
+                    out=output[iq],
+                    where=denominator > 1e-14,
+                )
 
-            # A padded state has no grid norm.  Keep its diagonal finite and
-            # compatible with the legacy diagonal factors while leaving
-            # off-diagonal transitions zero.  The origin is set exactly above.
-            diagonal = np.diag_indices(self.nmo)
-            for k in range(self.nkpts):
-                invalid_diagonal = ~valid[k].diagonal()
-                densities[
-                    iq,
-                    k,
-                    diagonal[0][invalid_diagonal],
-                    diagonal[1][invalid_diagonal],
-                ] = 1.0
-
-        self._ss_pair_densities = densities
-        self._ss_pair_factors = np.diagonal(densities, axis1=2, axis2=3).copy()
-        self._ss_pair_factors[0] = 1.0
-        return densities
+        self._ss_pair_densities = rho_oo, rho_vv
+        return self._ss_pair_densities
 
     def _build_active_masks(self):
         """Return boolean occupied and virtual masks for every k point."""
         cached = getattr(self, "_ss_active_masks", None)
         if cached is not None:
-            if getattr(self, "_ss_active_count", None) is None:
-                self._ss_active_count = self._count_active_entries(*cached)
             return cached
 
         nonzero_occupied, nonzero_virtual = padding_k_idx(self, kind="split")
@@ -536,216 +491,174 @@ class KRCCD_SS(KRCCD):
             virtual[k, indices] = True
 
         self._ss_active_masks = occupied, virtual
-        self._ss_active_count = self._count_active_entries(occupied, virtual)
         return self._ss_active_masks
 
-    def _count_active_entries(self, occupied, virtual):
-        """Count physical doubles entries over all momentum blocks."""
-        occupied_count = occupied.sum(axis=1).astype(int)
-        virtual_count = virtual.sum(axis=1).astype(int)
-        kb_map = np.asarray(self.khelper.kconserv)
-        return int(
-            sum(
-                int(occupied_count[ki])
-                * int(occupied_count[kj])
-                * int(virtual_count[ka])
-                * int(virtual_count[kb_map[ki, ka, kj]])
-                for ki in range(self.nkpts)
-                for kj in range(self.nkpts)
-                for ka in range(self.nkpts)
-            )
-        )
+    def _contract_aggregate_structure_factors(self, t2):
+        """Evaluate the complete scalar ``S1``--``S6`` curves.
 
-    @staticmethod
-    def _masked_density(density, row_mask, column_mask):
-        """Mask both endpoints of a transition density without T2 storage."""
-        return density * row_mask[:, None] * column_mask[None, :]
-
-    @staticmethod
-    def _masked_factor(factors, source, target, active):
-        """Mask a diagonal factor at both physical ends of its transition."""
-        valid = active[source] & active[target]
-        return factors[source] * valid
-
-    def _diagonal_channel_partials(
-        self, factors, q_index, ki, kj, ka, kb, occupied, virtual
-    ):
-        """Return the six diagonal density-only partial matrices."""
-        occupied_factors = factors[:, : self.nocc]
-        virtual_factors = factors[:, self.nocc :]
-        plus = self._ss_plus[q_index]
-        minus = self._ss_minus[q_index]
-        occupied_i = self._masked_factor(
-            occupied_factors, minus[ki], ki, occupied
-        )
-        occupied_j = self._masked_factor(
-            occupied_factors, kj, plus[kj], occupied
-        )
-        occupied_i_at_ki = self._masked_factor(
-            occupied_factors, ki, plus[ki], occupied
-        )
-        virtual_a = self._masked_factor(
-            virtual_factors, ka, plus[ka], virtual
-        )
-        virtual_b = self._masked_factor(
-            virtual_factors, kb, plus[kb], virtual
-        )
-        virtual_b_at_minus = self._masked_factor(
-            virtual_factors, minus[kb], kb, virtual
-        )
-        return (
-            lib.einsum("i,j->ij", occupied_i, occupied_j.conj()),
-            lib.einsum("a,b->ab", virtual_a, virtual_b_at_minus.conj()),
-            lib.einsum("a,i->ia", virtual_a, occupied_i_at_ki.conj()),
-            lib.einsum("b,j->jb", virtual_b, occupied_j.conj()),
-            lib.einsum("a,j->ja", virtual_a, occupied_j.conj()),
-            lib.einsum("b,i->ib", virtual_b, occupied_i_at_ki.conj()),
-        )
-
-    def _full_density_channel_partials(
-        self, densities, q_index, ki, kj, ka, kb, occupied, virtual
-    ):
-        """Return the six full-density-only partial matrices.
-
-        A density row is masked at its source momentum and its column at the
-        corresponding plus-momentum.  L1 and L2 use the inverse minus maps for
-        the factors whose external index is at ``ki`` or ``kb``.
+        Every density endpoint and amplitude axis is sliced with the padding
+        mask at its actual, possibly shifted momentum.  Each ``einsum``
+        contracts directly to a scalar, so no aggregate T2-sized intermediate
+        is constructed.
         """
-        plus = self._ss_plus[q_index]
-        minus = self._ss_minus[q_index]
-        density = densities[q_index]
-        occupied_density = density[:, : self.nocc, : self.nocc]
-        virtual_density = density[:, self.nocc :, self.nocc :]
-        rho_ki = self._masked_density(
-            occupied_density[minus[ki]], occupied[minus[ki]], occupied[ki]
-        )
-        rho_j = self._masked_density(
-            occupied_density[kj], occupied[kj], occupied[plus[kj]]
-        )
-        rho_i = self._masked_density(
-            occupied_density[ki], occupied[ki], occupied[plus[ki]]
-        )
-        rho_a = self._masked_density(
-            virtual_density[ka], virtual[ka], virtual[plus[ka]]
-        )
-        rho_b_minus = self._masked_density(
-            virtual_density[minus[kb]], virtual[minus[kb]], virtual[kb]
-        )
-        rho_b = self._masked_density(
-            virtual_density[kb], virtual[kb], virtual[plus[kb]]
-        )
-        return (
-            lib.einsum("ki,jl->ij", rho_ki, rho_j.conj()),
-            lib.einsum("ac,db->ab", rho_a, rho_b_minus.conj()),
-            lib.einsum("ac,ik->ia", rho_a, rho_i.conj()),
-            lib.einsum("bc,jk->jb", rho_b, rho_j.conj()),
-            lib.einsum("ac,jk->ja", rho_a, rho_j.conj()),
-            lib.einsum("bc,ik->ib", rho_b, rho_i.conj()),
-        )
-
-    def _contract_aggregate_structure_factors(self, t2=None):
-        """Accumulate six scalar, density-only structure-factor curves.
-
-        ``t2`` is accepted for compatibility with the old private helper and
-        is deliberately ignored after shape validation.  The common driver
-        handles active-index counting, momentum traversal, constraint-(1)
-        dispatch, and scalar accumulation for both modes.
-        """
-        if t2 is not None:
-            self._validate_t2(t2)
+        self._validate_t2(t2)
         self._prepare_sampling_maps()
         occupied, virtual = self._build_active_masks()
-        occupied_count = occupied.sum(axis=1).astype(int)
-        virtual_count = virtual.sum(axis=1).astype(int)
+        occupied_indices = tuple(np.flatnonzero(mask) for mask in occupied)
+        virtual_indices = tuple(np.flatnonzero(mask) for mask in virtual)
         nsamples = len(self._ss_q_vectors)
         raw = np.zeros((6, nsamples), dtype=np.complex128)
-        kb_map = np.asarray(self.khelper.kconserv)
-        active_count = 0
+        rho_oo_all, rho_vv_all = self._build_pair_densities()
+        kconserv = np.asarray(self.khelper.kconserv)
 
-        factors = None
-        densities = None
-        if self.options.use_constraint_1:
-            factors = self._build_pair_factors()
-        else:
-            densities = self._build_pair_densities()
+        def density_block(density, source, row_indices, column_indices):
+            return density[source][np.ix_(row_indices, column_indices)]
 
-        for ki in range(self.nkpts):
-            noi = int(occupied_count[ki])
-            for kj in range(self.nkpts):
-                noj = int(occupied_count[kj])
-                for ka in range(self.nkpts):
-                    kb = int(kb_map[ki, ka, kj])
-                    nva = int(virtual_count[ka])
-                    nvb = int(virtual_count[kb])
-                    active_count += noi * noj * nva * nvb
-                    for q_index in range(1, nsamples):
-                        if self.options.use_constraint_1:
-                            partials = self._diagonal_channel_partials(
-                                factors[q_index],
-                                q_index,
-                                ki,
-                                kj,
-                                ka,
-                                kb,
-                                occupied,
-                                virtual,
-                            )
-                        else:
-                            partials = self._full_density_channel_partials(
-                                densities,
-                                q_index,
-                                ki,
-                                kj,
-                                ka,
-                                kb,
-                                occupied,
-                                virtual,
-                            )
-                        raw[:, q_index] += (
-                            np.sum(partials[0]) * nva * nvb,
-                            np.sum(partials[1]) * noi * noj,
-                            np.sum(partials[2]) * noj * nvb,
-                            np.sum(partials[3]) * noi * nva,
-                            np.sum(partials[4]) * noi * nvb,
-                            np.sum(partials[5]) * noj * nva,
+        def amplitude_block(k1, k2, ka):
+            kb = int(kconserv[k1, ka, k2])
+            indices = np.ix_(
+                occupied_indices[k1],
+                occupied_indices[k2],
+                virtual_indices[ka],
+                virtual_indices[kb],
+            )
+            return t2[k1, k2, ka][indices]
+
+        for q_index in range(nsamples):
+            plus = self._ss_plus[q_index]
+            minus = self._ss_minus[q_index]
+            rho_oo = rho_oo_all[q_index]
+            rho_vv = rho_vv_all[q_index]
+            for ki in range(self.nkpts):
+                plus_i = int(plus[ki])
+                minus_i = int(minus[ki])
+                rho_i = density_block(
+                    rho_oo, ki, occupied_indices[ki], occupied_indices[plus_i]
+                )
+                rho_minus_i = density_block(
+                    rho_oo,
+                    minus_i,
+                    occupied_indices[minus_i],
+                    occupied_indices[ki],
+                )
+                for kj in range(self.nkpts):
+                    plus_j = int(plus[kj])
+                    rho_j = density_block(
+                        rho_oo,
+                        kj,
+                        occupied_indices[kj],
+                        occupied_indices[plus_j],
+                    )
+                    for ka in range(self.nkpts):
+                        kb = int(kconserv[ki, ka, kj])
+                        plus_a = int(plus[ka])
+                        plus_b = int(plus[kb])
+                        minus_b = int(minus[kb])
+                        rho_a = density_block(
+                            rho_vv,
+                            ka,
+                            virtual_indices[ka],
+                            virtual_indices[plus_a],
+                        )
+                        rho_b = density_block(
+                            rho_vv,
+                            kb,
+                            virtual_indices[kb],
+                            virtual_indices[plus_b],
+                        )
+                        rho_minus_b = density_block(
+                            rho_vv,
+                            minus_b,
+                            virtual_indices[minus_b],
+                            virtual_indices[kb],
                         )
 
-        if active_count <= 0:
-            raise ValueError("CCD SS fitting requires physical active entries")
-        self._ss_active_count = active_count
-        raw[:, 0] = active_count
+                        raw[0, q_index] += lib.einsum(
+                            "ki,jl,klab->",
+                            rho_minus_i,
+                            rho_j.conj(),
+                            amplitude_block(minus_i, plus_j, ka),
+                        )
+                        raw[1, q_index] += lib.einsum(
+                            "ac,db,ijcd->",
+                            rho_a,
+                            rho_minus_b.conj(),
+                            amplitude_block(ki, kj, plus_a),
+                        )
+                        raw[2, q_index] += lib.einsum(
+                            "ac,ik,kjcb->",
+                            rho_a,
+                            rho_i.conj(),
+                            amplitude_block(plus_i, kj, plus_a),
+                        )
+                        raw[3, q_index] += lib.einsum(
+                            "bc,jk,kica->",
+                            rho_b,
+                            rho_j.conj(),
+                            amplitude_block(plus_j, ki, plus_b),
+                        )
+                        raw[4, q_index] += lib.einsum(
+                            "ac,jk,kibc->",
+                            rho_a,
+                            rho_j.conj(),
+                            amplitude_block(plus_j, ki, kb),
+                        )
+                        raw[5, q_index] += lib.einsum(
+                            "bc,ik,kjac->",
+                            rho_b,
+                            rho_i.conj(),
+                            amplitude_block(plus_i, kj, ka),
+                        )
         return raw
 
-    def _normalize_aggregate_structure_factors(self, raw, active_count=None):
-        """Normalize curves by the exact physical q=0 entry count."""
+    def _normalize_aggregate_structure_factors(self, raw):
+        """Validate and independently normalize the six complex curves."""
         expected = (6, len(self._ss_q_vectors))
         if np.shape(raw) != expected:
             raise ValueError(
                 "aggregate CCD SS structure factors must have shape "
                 f"{expected}; received {np.shape(raw)}"
             )
-        if active_count is None or np.ndim(active_count) != 0 or not isinstance(
-            active_count, numbers.Integral
-        ):
-            active_count = getattr(self, "_ss_active_count", None)
-        if active_count is None:
-            self._build_active_masks()
-            active_count = self._ss_active_count
-        active_count = int(active_count)
-        if active_count <= 0:
-            raise ValueError("CCD SS fitting requires physical active entries")
-        samples = np.asarray(raw, dtype=np.complex128).copy()
-        samples /= active_count
-        samples[:, 0] = 1.0
-        return samples
+        raw = np.asarray(raw, dtype=np.complex128)
+        origins = raw[:, 0]
+        for channel, origin in enumerate(origins, start=1):
+            if abs(origin) < self.options.amplitude_fit_tol:
+                raise ValueError(
+                    f"CCD SS channel L{channel} origin magnitude {abs(origin):.16e} "
+                    "is below amplitude_fit_tol="
+                    f"{self.options.amplitude_fit_tol:.16e}"
+                )
 
-    def _aggregate_channel_samples(self, t2=None):
-        """Return six normalized, complex density-only aggregate curves."""
+        normalized = raw / origins[:, None]
+        tolerance = self.options.structure_factor_imag_tol
+        for channel in range(6):
+            origin_magnitude = abs(origins[channel])
+            for q_index in range(len(self._ss_q_vectors)):
+                raw_imag_scaled = abs(raw[channel, q_index].imag) / origin_magnitude
+                if raw_imag_scaled > tolerance:
+                    raise ValueError(
+                        f"CCD SS channel L{channel + 1} sample {q_index} raw "
+                        "imaginary magnitude scaled by |S(0)| "
+                        f"{raw_imag_scaled:.16e} exceeds "
+                        f"structure_factor_imag_tol={tolerance:.16e}"
+                    )
+                normalized_imag = abs(normalized[channel, q_index].imag)
+                if normalized_imag > tolerance:
+                    raise ValueError(
+                        f"CCD SS channel L{channel + 1} sample {q_index} "
+                        f"normalized imaginary magnitude {normalized_imag:.16e} "
+                        "exceeds structure_factor_imag_tol="
+                        f"{tolerance:.16e}"
+                    )
+        # Preserve the exact unit-coefficient condition used by the fit after
+        # validating the computed origins through the same equations.
+        normalized[:, 0] = 1.0
+        return normalized
+
+    def _aggregate_channel_samples(self, t2):
+        """Return unnormalized and normalized complex structure factors."""
         raw = self._contract_aggregate_structure_factors(t2)
-        samples = self._normalize_aggregate_structure_factors(raw)
-        if self.verbose >= logger.DEBUG2:
-            self._log_ss_norms(raw[:, 0], self.ss_prepare_count)
-        return samples
+        return raw, self._normalize_aggregate_structure_factors(raw)
 
     def _gaussian_xi(self, sigma):
         if sigma == 0.0:
@@ -794,37 +707,41 @@ class KRCCD_SS(KRCCD):
         cache[sigma] = xi
         return xi
 
-    def _log_ss_samples(self, samples, sigmas, xi, preparation_id):
-        """Log one DEBUG2 row per normalized aggregate channel sample."""
+    def _log_ss_samples(self, raw, normalized, sigmas, xi, preparation_id):
+        """Log raw and normalized values for every fitted channel sample."""
         for channel in range(6):
             sigma = float(sigmas[channel])
             correction = float(xi[channel])
             for q_index, q_vector in enumerate(self._ss_q_vectors):
                 qx, qy, qz = (float(value) for value in q_vector)
                 q_squared = qx * qx + qy * qy + qz * qz
-                raw = complex(samples[channel, q_index])
+                raw_value = complex(raw[channel, q_index])
+                normalized_value = complex(normalized[channel, q_index])
                 if sigma == 0.0:
                     fit = 1.0 if q_squared == 0.0 else 0.0
                 elif np.isinf(sigma):
                     fit = 1.0
                 else:
                     fit = float(np.exp(-q_squared / (2.0 * sigma * sigma)))
-                residual = fit - raw
+                residual = fit - normalized_value
                 logger.debug2(
                     self,
                     "CCDSS_SF prep=%d channel=L%d q_index=%d "
                     "qx=%.16e qy=%.16e qz=%.16e "
-                    "raw_real=%.16e raw_imag=%.16e sigma=%.16e "
-                    "xi=%.16e fit=%.16e residual_real=%.16e "
-                    "residual_imag=%.16e",
+                    "raw_real=%.16e raw_imag=%.16e "
+                    "normalized_real=%.16e normalized_imag=%.16e "
+                    "sigma=%.16e xi=%.16e fit=%.16e "
+                    "residual_real=%.16e residual_imag=%.16e",
                     int(preparation_id),
                     channel + 1,
                     int(q_index),
                     qx,
                     qy,
                     qz,
-                    raw.real,
-                    raw.imag,
+                    raw_value.real,
+                    raw_value.imag,
+                    normalized_value.real,
+                    normalized_value.imag,
                     sigma,
                     correction,
                     fit,
@@ -832,56 +749,45 @@ class KRCCD_SS(KRCCD):
                     residual.imag,
                 )
 
-    def _log_ss_norms(self, origins, preparation_id):
-        """Log one DEBUG2 row per raw aggregate channel origin."""
-        for channel, origin in enumerate(origins):
-            value = complex(origin)
-            logger.debug2(
-                self,
-                "CCDSS_SF_NORM prep=%d channel=L%d "
-                "norm_real=%.16e norm_imag=%.16e norm_abs=%.16e",
-                int(preparation_id),
-                channel + 1,
-                value.real,
-                value.imag,
-                abs(value),
-            )
-
     def _prepare_ss(self, t2=None):
-        self._validate_constraints()
         if t2 is not None:
             self._validate_t2(t2)
-        if self.ss_xi is not None:
+        fixed_sigma = self.options.fixed_sigma
+        if fixed_sigma is not None and self.ss_xi is not None:
             return self.ss_xi
         report_timing = self.verbose >= logger.INFO
         if report_timing:
             cpu0 = logger.process_clock()
             wall0 = logger.perf_counter()
-        self.ss_prepare_count += 1
-        if self.options.fixed_sigma is not None:
-            sigmas = np.full(6, self.options.fixed_sigma, dtype=float)
+        preparation_id = self.ss_prepare_count + 1
+        if fixed_sigma is not None:
+            sigmas = np.full(6, fixed_sigma, dtype=float)
             xi = np.full(
-                6, self._gaussian_xi(self.options.fixed_sigma), dtype=float
+                6, self._gaussian_xi(fixed_sigma), dtype=float
             )
         else:
-            samples = self._aggregate_channel_samples()
+            if t2 is None:
+                self._validate_t2(t2)
+            raw, normalized = self._aggregate_channel_samples(t2)
             sigmas = np.empty(6, dtype=float)
             xi = np.empty(6, dtype=float)
             for channel in range(6):
                 sigma = _fit_unit_gaussian(
                     self._ss_q_vectors,
-                    samples[channel],
+                    normalized[channel].real,
                     fit_with_coul=self.options.fit_with_coul,
                 )
                 sigmas[channel] = sigma
                 xi[channel] = self._gaussian_xi(sigma)
-                self.ss_fit_count += 1
             if self.verbose >= logger.DEBUG2:
                 self._log_ss_samples(
-                    samples, sigmas, xi, self.ss_prepare_count
+                    raw, normalized, sigmas, xi, preparation_id
                 )
         self.ss_sigmas = sigmas
         self.ss_xi = xi
+        self.ss_prepare_count += 1
+        if fixed_sigma is None:
+            self.ss_fit_count += 6
         if report_timing:
             logger.info(
                 self,
@@ -892,8 +798,7 @@ class KRCCD_SS(KRCCD):
         return xi
 
     def _ss_residual_coefficient(self, t2):
-        self._validate_constraints()
-        if self.ss_xi is None:
+        if self.options.fixed_sigma is None or self.ss_xi is None:
             self._prepare_ss(t2)
         xi = self.ss_xi
         return xi[0] + xi[1] - xi[2] - xi[3] - xi[4] - xi[5]

@@ -62,12 +62,9 @@ def run_ccdss(label, fixed_sigma=None):
     return e_corr, t1, t2
 
 
-# Default: fit six scalar density-only Gaussian structure-factor channels once
-# during amplitude initialization.  The stored sigma and xi states each have
-# six elements and are reused on every amplitude update.
-# Constraint (1) defaults to True; setting it to False selects full
-# transition-density contractions.  Constraint (2) remains enabled because its
-# relaxation is unsupported.
+# Default: rebuild the six complete amplitude-dependent structure factors and
+# fit six Gaussian widths on every CCD update.  The latest sigma and xi states
+# each contain six elements.
 run_ccdss("fitted CCDSS")
 
 # Fixed widths are amplitude-independent and are prepared once during

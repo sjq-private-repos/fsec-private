@@ -42,10 +42,10 @@ if not kmf.converged:
     raise RuntimeError("The KRHF calculation did not converge.")
 
 
-# DEBUG2 emits six CCDSS_SF_NORM rows with the raw L1-L6 origins, followed by
-# one CCDSS_SF row for every aggregate curve and q sample.  Fitted CCDSS
-# prepares these six density-only curves once before the iterations.
-# There are no tensor indices in the output.
+# Every fitted CCD update emits one CCDSS_SF row per channel and q sample.
+# Each row includes the unnormalized and normalized complex values, followed
+# by the real Gaussian fit and residual.  There are no tensor indices in the
+# output.
 cc = KRCCD_SS(kmf, line_points=3)
 cc.keep_exxdiv = False
 cc.verbose = logger.DEBUG2
