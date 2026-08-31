@@ -44,7 +44,10 @@ Focus especially on:
 - Idiomatic framework-specific best practices
 - Meaningful tests
 
-Tests should not cover only the happy path when additional edge cases or failure scenarios would be useful.
+Tests should be brief, meaningful and well-documented. Edge cases that are not physically, scienfiically, or 
+numerically meaningful should be limited. For example, extensive tests about API edge cases should not
+be prioritized. For each major implementation, try to triage at most 10-15 tests that you think are the most meaningful,
+and the fewer the better.
 
 After reviewing Luna’s work, decide whether to:
 
@@ -61,6 +64,9 @@ codex exec \
   -a never \
   'PLAN'
 """
+
+Only do this Luna-MAX orchestration for implementing Plans specifically. For everything else, just use
+whatever model is enabled.
 
 ## Coding Style & Naming Conventions
 

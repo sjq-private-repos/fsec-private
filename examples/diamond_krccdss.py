@@ -69,14 +69,17 @@ def run_ccdss(label, fixed_sigma=None):
     return e_corr, t1, t2
 
 
-# Default: refit six aggregate Gaussian structure-factor channels after every
-# amplitude update.  The stored sigma and xi states each have six elements.
-# The current implementation requires use_constraint_1=True and
-# use_constraint_2=True; either disabled option raises NotImplementedError.
+# Default: fit six scalar density-only Gaussian structure-factor channels once
+# during amplitude initialization.  The stored sigma and xi states each have
+# six elements and are reused on every amplitude update.
+# Constraint (1) defaults to True; setting it to False selects full
+# transition-density contractions.  Constraint (2) remains enabled because its
+# relaxation is unsupported.
 run_ccdss("fitted CCDSS")
 
-# Fixed widths are amplitude-independent and are prepared lazily once.  Zero
-# gives the orbital-only correction; infinity gives the exact
+# Fixed widths are amplitude-independent and are prepared once during
+# initialization (or lazily if initialization is bypassed).  Zero gives the
+# orbital-only correction; infinity gives the exact
 # orbital-plus-ERI Madelung correction.
 run_ccdss("sigma = 0", fixed_sigma=0.0)
 run_ccdss("sigma = infinity", fixed_sigma=np.inf)

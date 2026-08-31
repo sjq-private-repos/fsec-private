@@ -1,76 +1,97 @@
-# Independently Relax CCDSS Constraint (1)
+# CCDSS density-only one-time fit
 
-## Summary
+## Goal
 
-Add a separate switch for constraint (1). When only constraint (1) is disabled,
-sum over all internal orbital pairs in the pair densities while keeping the T2
-amplitude fixed at the external $t_{ij}^{ab}(k_i,k_j,k_a)$. Thus, $\xi$ remains
-precomputable whenever constraint (2) is enabled.
+Support `use_constraint_1=False` while retaining `use_constraint_2=True`.
+Constraint (1) selects diagonal pair factors or full transition-density
+contractions. Constraint (2) fixes the amplitude momentum at its q=0 block;
+`use_constraint_2=False` remains unsupported and raises `NotImplementedError`.
+Both switches default to `True`, and the public `KRCCD_SS` interface is
+unchanged.
 
-## Implementation
+## Aggregate implementation
 
-- Add `use_constraint_1: bool = True` to `CCDSSOptions` and `KRCCD_SS`, with a
-  property and `dump_flags` entry. Preserve both constraints as enabled by
-  default.
-- Build normalized transition-density matrices $\rho_{p k,r(k+q)}$ when
-  constraint (1) is disabled. Set their $q=0$ value to the exact identity.
-- With constraint (2) enabled, factor out the unchanged external T2 amplitude
-  and form density-only sums:
-  - L1: `ki,jl->ij`
-  - L2: `ac,db->ab`
-  - L3: `ac,ik->ia`
-  - L4: `bc,jk->jb`
-  - L5: `ac,jk->ja`
-  - L6: `bc,ik->ib`
-  Broadcast each result over its unaffected external indices, fit the normalized
-  channel, and continue scaling the resulting $\xi_n$ by the current external
-  T2 during every CCD iteration.
-- With constraint (2) disabled:
-  - Keep the existing shifted-amplitude behavior when constraint (1) is
-    enabled.
-  - When both constraints are disabled, evaluate the complete
-    density-amplitude contractions from Eqs. (13) and (21)-(25):
-    - L1: `ki,jl,klab->ijab`
-    - L2: `ac,db,ijcd->ijab`
-    - L3: `ac,ik,kjcb->ijab`
-    - L4: `bc,jk,kica->ijab`
-    - L5: `ac,jk,kibc->ijab`
-    - L6: `bc,ik,kjac->ijab`
-- Precompute and reuse `ss_xi` whenever constraint (2) is enabled, regardless
-  of constraint (1). Refit every update only when constraint (2) is disabled.
-- Preserve the existing small-external-amplitude safeguard for normalized
-  channels involving shifted T2 amplitudes.
-- Use PySCF-style `lib.einsum` and separate helpers for pair-density
-  construction, density-only sums, and full density-amplitude contractions.
+The six fitted curves are scalar and independent of T2. At each sampled `Q`,
+the implementation traverses every physical active `(ki,kj,ka,i,j,a,b)` entry.
+For `kb = kconserv[ki,ka,kj]`, the diagonal mode uses the existing products
 
-| Constraint 1 | Constraint 2 | Pair densities | T2 amplitude | Fitting |
-| --- | --- | --- | --- | --- |
-| on | on | matching indices | external T2 | once |
-| off | on | full orbital sums | external T2, outside sum | once |
-| on | off | matching indices | shifted T2 | every update |
-| off | off | full orbital sums | shifted internal-index T2 | every update |
+```text
+L1: F_i(ki-q) F_j(kj)*
+L2: F_a(ka) F_b(kb-q)*
+L3: F_a(ka) F_i(ki)*
+L4: F_b(kb) F_j(kj)*
+L5: F_a(ka) F_j(kj)*
+L6: F_b(kb) F_i(ki)*
+```
 
-## Tests
+The relaxed mode replaces each product by the corresponding full-density
+partial:
 
-- Extend option merging, properties, logging, and defaults for
-  `use_constraint_1`.
-- Verify all six density-only sums against explicit nested-loop references and
-  confirm the external T2 does not enter their construction.
-- Verify all six full contractions and shifted momentum mappings when both
-  constraints are disabled.
-- Test all four switch combinations, including that both constraint-(2)-enabled
-  cases precompute exactly once.
-- Verify exact origin normalization, complex pair densities, broadcasting over
-  unaffected indices, padded orbitals, and negligible external amplitudes.
-- Extend the small H2 integration test to cover constraint (1) disabled with
-  constraint (2) both enabled and disabled.
-- Run `PYTHONPATH=. pytest -q fsec/singularity_subtraction/tests/test_ccdss.py`,
-  including the slow test when feasible.
+```text
+L1: ki,jl -> ij
+L2: ac,db -> ab
+L3: ac,ik -> ia
+L4: bc,jk -> jb
+L5: ac,jk -> ja
+L6: bc,ik -> ib
+```
 
-## Assumptions
+The density momentum locations are unchanged: `ki-q,kj`; `ka,kb-q`; `ka,ki`;
+`kb,kj`; `ka,kj`; and `kb,ki` for L1 through L6. Every second density is
+complex-conjugated. Full-density internal indices are masked at their actual
+minus/plus momentum endpoints in addition to the external indices, so padded
+identity safeguards never enter a partial.
 
-- Disabling only constraint (1) changes the pair-density orbital sums, not the
-  indices or momentum of the external T2 amplitude.
-- Existing results remain unchanged with both default switches enabled.
-- Fixed-sigma behavior is independent of either structure-factor sampling
-  constraint.
+The shared driver uses `padding_k_idx(kind="split")` to build per-k occupied
+and virtual masks. For a block, let `ni`, `nj`, `na`, and `nb` be the active
+counts at `ki`, `kj`, `ka`, and `kb`. Its common physical-entry count is
+`ni*nj*na*nb`. The partial channel sums are weighted by the unaffected active
+counts:
+
+```text
+L1: active ij * nva*nvb
+L2: active ab * noi*noj
+L3: active ia * noj*nvb
+L4: active jb * noi*nva
+L5: active ja * noi*nvb
+L6: active ib * noj*nva
+```
+
+The q=0 raw value of every channel is the exact total
+`N_active = sum(ni*nj*na*nb)`. Curves are divided by `N_active`, and their
+origins are explicitly assigned to exactly `1`. No T2 value, `sum(t2)`, or
+near-zero-amplitude safeguard participates in fitting. The driver accumulates
+scalar partial results directly and never creates a T2-sized intermediate.
+
+## Preparation and residual update
+
+`init_amps` prepares the six widths and six scalar `xi` values once, before CCD
+iterations. A direct update path that bypasses initialization lazily performs
+the same preparation on its first residual update. Both constraint-(1) modes
+therefore fit exactly six curves in total, and later updates reuse the cached
+state. Fixed-sigma mode also prepares once, but evaluates no numerical fits.
+
+The residual correction remains
+
+```text
+(xi1 + xi2 - xi3 - xi4 - xi5 - xi6) * current_t2
+```
+
+and is injected into the CCD numerator before denominator division. Fitting has
+no L4/L5 T2 transpose because T2 is absent from all six curves. `ss_sigmas`
+and `ss_xi` remain arrays with shape `(6,)`. `amplitude_fit_tol` remains
+accepted and validated for compatibility and future constraint-(2) work, but
+is unused in the supported modes.
+
+## Tests and documentation
+
+Feature tests compare all six diagonal and relaxed aggregates with explicit
+complex nested-loop references, including momentum maps, off-diagonal density
+terms, active-index multiplicities, and padded external/internal states. They
+also verify exact origins, independence from changed or zero T2, one-time six-
+fit caching over multiple updates, fixed-sigma caching, diagonal-density
+equivalence, residual signs, and residual-before-denominator injection. The
+finite slow H2 calculation retains coverage for fitted and relaxed behavior.
+
+`CCDSS.md`, the examples, and the historical `CCDSS_REVIEW.md` status note
+describe this density-only one-time-fit behavior.

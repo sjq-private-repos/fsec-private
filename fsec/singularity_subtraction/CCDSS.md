@@ -59,11 +59,13 @@ cc = KRCCD_SS(kmf, occupied_orbital_shift=-exxss.chi)
 ```
 
 `CCDSSOptions` contains the method-specific controls, including both
-constraint switches. Both switches default to `True` and are required by the
-current aggregate implementation. Passing either switch as `False` to
-`KRCCD_SS` raises `NotImplementedError`; the fields are retained for a future
-relaxed contraction implementation. An options object can be passed instead of
-individual overrides, but the two forms may not be mixed ambiguously.
+constraint switches. Both switches default to `True`. Set
+`use_constraint_1=False` to sum over full occupied and virtual transition-
+density matrices. T2 is factored out of the fitted curves and only the current
+T2 multiplies the cached residual. Constraint (2) relaxation
+(`use_constraint_2=False`) remains unsupported and raises `NotImplementedError`.
+An options object can be passed instead of individual overrides, but the two
+forms may not be mixed ambiguously.
 
 ## Amplitude and momentum layout
 
@@ -89,12 +91,14 @@ The calculation has four main stages.
    it is replaced by the fitted singularity-subtraction residual.
 2. `_build_pair_factors` or `_build_pair_densities` creates a periodic Becke
    grid, evaluates the active padded molecular orbitals, and precomputes
-   normalized transition pair densities. The origin is normalized to exactly
-   one.
-3. `_prepare_ss` evaluates the six contracted practical structure factors
-   defined below, normalizes the resulting complex curves by their common
-   origin, fits a unit-coefficient isotropic Gaussian to each, and evaluates
-   its analytic-integral-minus-finite-quadrature correction `xi_n`.
+   normalized transition pair densities. Constraint (1) selects diagonal
+   factors or full occupied/virtual transition-density matrices. Per-k
+   occupied and virtual masks from `padding_k_idx(kind="split")` remove padded
+   external and internal states from the aggregate.
+3. `_prepare_ss` evaluates six scalar density-only structure factors, normalizes
+   them by the exact physical q=0 entry count, fits a unit-coefficient
+   isotropic Gaussian to each, and evaluates its
+   analytic-integral-minus-finite-quadrature correction `xi_n`.
 4. `_inject_ss_residual` combines the channels as
 
    ```text
@@ -122,7 +126,7 @@ Brillouin zone. Define
 
 \[
 \sum_{\mathcal I} =
-\sum_{k_i k_j k_a}\sum_{ijab},
+\sum_{k_i k_j k_a}\sum_{ijab}^{\rm active},
 \qquad k_b = k_i-k_a+k_j
 \]
 
@@ -132,44 +136,66 @@ contracted structure factors are evaluated explicitly as
 \[
 \begin{aligned}
 \widetilde S_1(Q) &= \sum_{\mathcal I}
- F_i(k_i-q,Q)F_j^*(k_j,Q)t_{ij}^{ab}(k_i,k_j,k_a), \\
+ F_i(k_i-q,Q)F_j^*(k_j,Q), \\
 \widetilde S_2(Q) &= \sum_{\mathcal I}
- F_a(k_a,Q)F_b^*(k_b-q,Q)t_{ij}^{ab}(k_i,k_j,k_a), \\
+ F_a(k_a,Q)F_b^*(k_b-q,Q), \\
 \widetilde S_3(Q) &= \sum_{\mathcal I}
- F_a(k_a,Q)F_i^*(k_i,Q)t_{ij}^{ab}(k_i,k_j,k_a), \\
+ F_a(k_a,Q)F_i^*(k_i,Q), \\
 \widetilde S_4(Q) &= \sum_{\mathcal I}
- F_b(k_b,Q)F_j^*(k_j,Q)t_{ji}^{ba}(k_j,k_i,k_b), \\
+ F_b(k_b,Q)F_j^*(k_j,Q), \\
 \widetilde S_5(Q) &= \sum_{\mathcal I}
- F_a(k_a,Q)F_j^*(k_j,Q)t_{ji}^{ba}(k_j,k_i,k_b), \\
+ F_a(k_a,Q)F_j^*(k_j,Q), \\
 \widetilde S_6(Q) &= \sum_{\mathcal I}
- F_b(k_b,Q)F_i^*(k_i,Q)t_{ij}^{ab}(k_i,k_j,k_a).
+ F_b(k_b,Q)F_i^*(k_i,Q).
 \end{aligned}
 \]
 
 Thus each sample is one number per channel and `Q`, stored in an array with
 shape `(6, n_samples)`. This is the distinction meant by *contracted*: every
-orbital, band, and external k-point label has been summed. The inactive
-uncontracted helpers instead leave `(ki,kj,ka,i,j,a,b)` open and produce one
-structure-factor curve for every T2 entry.
+orbital, band, and external k-point label has been summed, with no T2 weight.
 
-At the origin, `F_n(k,0) = 1`, so all six equations reduce to
+When constraint (1) is disabled, the diagonal factors are replaced by full
+normalized transition-density matrices. For each external momentum block, the
+internal orbital sums are the following scalar contractions (the second
+density is conjugated in every channel):
+
+```text
+L1: ki,jl -> ij
+L2: ac,db -> ab
+L3: ac,ik -> ia
+L4: bc,jk -> jb
+L5: ac,jk -> ja
+L6: bc,ik -> ib
+```
+
+The density momentum locations remain those in the diagonal equations above:
+L1 uses `ki-q` and `kj`, L2 uses `ka` and `kb-q`, L3 uses `ka` and `ki`,
+L4 uses `kb` and `kj`, L5 uses `ka` and `kj`, and L6 uses `kb` and `ki`.
+For a block `(ki,kj,ka)`, the full-density partials are respectively
+`ki,jl->ij`, `ac,db->ab`, `ac,ik->ia`, `bc,jk->jb`, `ac,jk->ja`, and
+`bc,ik->ib`. Internal density indices are masked at their actual source and
+target momenta as well as the external indices. The scalar contractions are
+accumulated directly with `pyscf.lib.einsum`.
+
+At the origin, `F_n(k,0) = 1`, so all six equations reduce to the exact number
+of physical active entries
 
 \[
-\widetilde S_n(0) = \sum_{\mathcal I}t_{ij}^{ab}(k_i,k_j,k_a)
-                   = \operatorname{sum}(T2).
+\widetilde S_n(0) = N_{\rm active}
+ = \sum_{k_i k_j k_a}n_i n_j n_a n_b,
+\qquad k_b = k_i-k_a+k_j.
 \]
 
 The curves passed to the fitter are therefore
 
 \[
 \widehat S_n(Q) =
-\frac{\widetilde S_n(Q)}{\widetilde S_n(0)},
+\frac{\widetilde S_n(Q)}{N_{\rm active}},
 \qquad \widehat S_n(0)=1.
 \]
 
-All momentum translations use the cached discrete q maps. Channels L4 and L5
-read the pair-transposed PySCF entry `t2[kj,ki,kb,j,i,b,a]` directly rather
-than allocating a transposed T2 tensor.
+All momentum translations use the cached discrete q maps. T2 is absent from
+the fitted curves, including channels L4 and L5; no T2 transpose is formed.
 
 ## Sampling and Gaussian fitting
 
@@ -197,28 +223,25 @@ of `h` minus its finite `(q+G)` quadrature.
 
 ## Constraints and update timing
 
-Constraint (1) retains only the diagonal orbital pair factors that contribute
-at the singular point. Constraint (2) evaluates the amplitudes at the
-unshifted external indices in the contracted practical equations above. Both
-are required for the current aggregate path; either disabled option is
-rejected clearly before a calculation starts.
+Constraint (1) retains only diagonal orbital pair factors when enabled. When it
+is disabled, all internal occupied and virtual orbital pairs are summed using
+the full transition-density matrices. Constraint (2) factors the amplitude
+momentum at q=0; its relaxation is unsupported and is rejected before a
+calculation starts.
 
-The uncontracted per-entry builders remain private for method comparisons, but
-no public option dispatches to them.
-
-In fitted mode, `_prepare_ss` is called for every CCD amplitude update. It
-rebuilds the six aggregate curves and performs exactly six independent fits,
-so `ss_prepare_count` increases by one and `ss_fit_count` by six per update.
-`init_amps` does not perform an extra fitted preparation. The common
-normalization value is the complex `sum(t2)`. If its magnitude is below
-`amplitude_fit_tol`, preparation stops with a clear error instead of dividing
-by a small amplitude. The normalized origin is assigned exactly `1` for all
-six channels.
+Fitted mode prepares the six scalar density-only curves during `init_amps` and
+performs exactly six independent fits. The resulting widths and corrections
+are reused for every CCD amplitude update; a direct update path that bypasses
+`init_amps` prepares them lazily on its first update. Thus a normal calculation
+has `ss_prepare_count == 1` and `ss_fit_count == 6`. The normalization value is
+the exact physical active-entry count, independent of T2, and every normalized
+origin is assigned exactly `1`. `amplitude_fit_tol` remains accepted and
+validated for compatibility, but is unused by the supported constraint modes.
 
 The most recent fitted state is stored in `ss_sigmas` and `ss_xi`, each with
 shape `(6,)`. Fixed-sigma modes are amplitude-independent: zero, infinity,
-and finite fixed widths prepare lazily once, do not perform numerical fits,
-and retain the same six-element state. The signed correction coefficient is
+and finite fixed widths prepare once (at initialization or lazily), do not
+perform numerical fits, and retain the same six-element state. The signed correction coefficient is
 `xi1 + xi2 - xi3 - xi4 - xi5 - xi6`; that scalar multiplies the current T2
 residual before denominator division.
 
@@ -226,14 +249,14 @@ The counters `ss_prepare_count` and `ss_fit_count` expose how often these
 operations occurred. The most recent fitted widths and corrections are
 available as `ss_sigmas` and `ss_xi`.
 At `verbose >= logger.INFO`, each preparation also reports its CPU and wall
-time.
+time. Both constraint-(1) modes use the same one-time preparation policy.
 
 Set `solver.verbose = logger.DEBUG2` to emit one `CCDSS_SF_NORM` text row for
 each channel and preparation before the sample rows. It reports the raw
 complex `tilde-S_n(0)` used to normalize that channel as `norm_real`,
-`norm_imag`, and `norm_abs`; in the current approximation, all six values are
-the common `sum(T2)`. The six rows retain independent channel labels for
-future relaxed contractions. The same setting emits one `CCDSS_SF` text row
+`norm_imag`, and `norm_abs`; all six values are the exact physical active-entry
+count. The six rows retain independent channel labels for both
+constraint-1 modes. The same setting emits one `CCDSS_SF` text row
 for each channel, zero-based `q_index`, and preparation. These rows contain
 the Cartesian `qx`, `qy`, and `qz` components of the sampled q vector (in the
 same reciprocal-vector units as `cell.reciprocal_vectors()`), the complex
@@ -242,7 +265,7 @@ normalized structure-factor sample as `raw_real`/`raw_imag`, its fitted
 `residual = fit - raw` as `residual_real`/`residual_imag`. The L3-L6 signs are
 applied only when the channel corrections are combined. Rows are emitted in
 channel and q-sample order and carry the one-based preparation number in
-`prep`. Fitted mode emits a new six-curve set on every amplitude update.
+`prep`. The six-curve set is emitted once for a normal initialized calculation.
 Fixed-sigma preparations do not construct samples and emit no rows.
 
 ## Fixed-sigma limits
@@ -253,8 +276,8 @@ Fixed-sigma preparations do not construct samples and emit no rows.
   orbital-corrected CCD.
 - A large finite width approaches the exact ERI Madelung correction.
 - `fixed_sigma=np.inf` uses the exact Madelung residual limit directly.
-- `fixed_sigma=None` performs the six Gaussian fits described above on every
-  amplitude update.
+- `fixed_sigma=None` performs the six Gaussian fits described above once during
+  amplitude initialization.
 
 The H2 example in `examples/h2_ccdss.py` demonstrates the fitted calculation
 and both exact limiting cases. `examples/h2_ccdss_structure_factors.py` runs

@@ -1,5 +1,13 @@
 # Review of the CCD singularity-subtraction implementation
 
+> Status update: The issue identified in this historical review has been
+> resolved by the approved density-only implementation. Both constraint-(1)
+> modes now build six scalar curves independent of T2, normalize by the exact
+> physical q=0 active-entry count, fit six `xi` values once during amplitude
+> initialization, and reuse them for later residual updates. See `CCDSS.md`
+> and `CCD_SS_CONSTRAINT_1_PLAN.md` for the current behavior; the analysis
+> below describes the superseded implementation.
+
 The six-channel signs, momentum shifts, pair transposes, and denominator
 injection in `ccdss.py` appear consistent with the explicit uncontracted
 structure-factor definitions discussed below. I did not find an obvious
