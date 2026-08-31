@@ -27,6 +27,41 @@ requires `FSEC_RUN_ARCHIVED_REFERENCE=1`.
 
 Furthermore, if there exists an `fsec-312` environment or something named similarly, use it.
 
+Finally, for anything that isn't changing just a few lines of code, or for plans that
+come out of Plan mode, use 5.6-sol (high) as an orchestrator that feeds the implementation
+details to Luna-MAX. Specifically, tell 5.6-sol the following prompt:
+
+"""
+TASK
+
+Your job is to orchestrate and review the Luna max-thinking agent.
+
+Focus especially on:
+
+- Code quality
+- Simple and understandable implementations
+- Useful comments and documentation
+- Idiomatic framework-specific best practices
+- Meaningful tests
+
+Tests should not cover only the happy path when additional edge cases or failure scenarios would be useful.
+
+After reviewing Luna’s work, decide whether to:
+
+1. Call Luna max-thinking again with the full context required to resolve the identified issues, or
+2. Fix the issues yourself when doing so would require substantially fewer tokens.
+
+START THE LUNA AGENT WITH:
+
+codex exec \
+  -m gpt-5.6-luna \
+  -c 'model_reasoning_effort="max"' \
+  --ephemeral \
+  -s workspace-write \
+  -a never \
+  'PLAN'
+"""
+
 ## Coding Style & Naming Conventions
 
 Follow existing Python style: four-space indentation, readable line lengths,
@@ -35,7 +70,7 @@ classes. Keep numerical array shapes, units, and physical sign conventions
 explicit in code and docstrings. No formatter or linter is configured, so
 preserve surrounding formatting and use standard-library-compatible imports.
 
-As much as possible, follow PySCF code-style
+As much as possible, follow PySCF code-style.
 
 ## Testing Guidelines
 
@@ -44,6 +79,9 @@ style of the target test file. Name files `test_<feature>.py` and test methods
 with descriptive `test_` names. Add regression coverage for numerical changes,
 including tolerances appropriate to the calculation, and run focused tests
 before the full suite. Avoid enabling slow tests by default in routine edits.
+
+Keep tests brief and meaningful, with a docstring for readability. For instance, 
+tests that probe API edge cases are almost certainly not needed.
 
 ## Commit & Pull Request Guidelines
 
