@@ -364,8 +364,8 @@ def test_physical_origins_equal_aggregate_t2_and_normalize_to_one():
     np.testing.assert_array_equal(normalized[:, 0], np.ones(6))
 
 
-def test_normalization_rejects_small_origins_and_large_imaginary_residues():
-    """Project small residues but diagnose unsafe raw or normalized values."""
+def test_normalization_rejects_small_origins_and_large_l1_l2_imaginary_residues():
+    """Guard L1/L2 complex residues while allowing complex L3--L6 curves."""
     solver = solver_shell(fixed_sigma=None)
     solver._ss_q_vectors = np.zeros((2, 3))
     raw = np.ones((6, 2), dtype=complex)
@@ -381,11 +381,11 @@ def test_normalization_rejects_small_origins_and_large_imaginary_residues():
     normalized = solver._normalize_aggregate_structure_factors(raw)
     assert np.max(np.abs(normalized.imag)) < 1e-5
 
-    raw[4, 1] = 1.0 + 3e-5j
-    with pytest.raises(
-        ValueError, match=r"L5 sample 1.*raw imaginary.*1\.499999.*1\.000000"
-    ):
-        solver._normalize_aggregate_structure_factors(raw)
+    raw[2:, 1] = np.asarray(
+        [1.0 + 3e-5j, 1.0 + 4e-5j, 1.0 + 5e-5j, 1.0 + 6e-5j]
+    )
+    normalized = solver._normalize_aggregate_structure_factors(raw)
+    assert np.all(np.abs(normalized[2:, 1].imag) > 1e-5)
 
 
 def test_normalization_checks_imaginary_part_created_by_complex_origin():
@@ -432,6 +432,7 @@ def test_two_fitted_residual_updates_refit_changed_amplitudes():
         not np.allclose(fitted_curves[channel], fitted_curves[channel + 6])
         for channel in range(6)
     )
+    assert all(np.isrealobj(values) for values in fitted_curves)
     assert not np.array_equal(first_xi, solver.ss_xi)
     assert solver.ss_sigmas.shape == solver.ss_xi.shape == (6,)
 

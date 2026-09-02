@@ -39,7 +39,8 @@ class CCDSSOptions:
     Monkhorst--Pack mesh size.  The Gaussian is
     ``exp(-|Q|**2 / (2*sigma**2))`` and its coefficient is fixed to one.
     ``structure_factor_imag_tol`` bounds both raw and normalized imaginary
-    residues relative to the magnitude of the channel origin.
+    residues for L1 and L2 relative to the magnitude of the channel origin.
+    L3--L6 are fitted to their real projections.
     """
 
     line_points: int = 3
@@ -631,7 +632,11 @@ class KRCCD_SS(KRCCD):
 
         normalized = raw / origins[:, None]
         tolerance = self.options.structure_factor_imag_tol
-        for channel in range(6):
+        # L3--L6 can carry a phase from the shifted transition densities.
+        # Their imaginary components are discarded by the real
+        # projection used for fitting, while L1 and L2 retain the guard
+        # against unexpected complex residues.
+        for channel in range(2):
             origin_magnitude = abs(origins[channel])
             for q_index in range(len(self._ss_q_vectors)):
                 raw_imag_scaled = abs(raw[channel, q_index].imag) / origin_magnitude
@@ -772,6 +777,8 @@ class KRCCD_SS(KRCCD):
             sigmas = np.empty(6, dtype=float)
             xi = np.empty(6, dtype=float)
             for channel in range(6):
+                # Fit real structure-factor values; L3--L6 may have a
+                # non-negligible imaginary component from transition phases.
                 sigma = _fit_unit_gaussian(
                     self._ss_q_vectors,
                     normalized[channel].real,

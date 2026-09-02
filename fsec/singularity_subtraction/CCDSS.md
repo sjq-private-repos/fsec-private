@@ -66,16 +66,18 @@ second tensor with the size of T2.
 
 The origin is evaluated by these same equations.  Each channel is normalized
 by its own `S_n(0)`, which gives an exact unit origin after validation.  An
-origin smaller than `amplitude_fit_tol` is rejected.  Before taking the real
-projection, both
+origin smaller than `amplitude_fit_tol` is rejected.  For L1 and L2, before
+taking the real projection, both
 
 ```text
 abs(Im S_n(q)) / abs(S_n(0))
 abs(Im (S_n(q) / S_n(0)))
 ```
 
-must not exceed `structure_factor_imag_tol`.  A failure identifies the
-channel, sample, measured value, and tolerance.
+must not exceed `structure_factor_imag_tol`.  L3--L6 are fitted to the real
+part of the normalized structure factor and their imaginary components are
+discarded.  A failure for L1 or L2 identifies the channel, sample, measured
+value, and tolerance.
 
 ## Fitting and CCD updates
 
