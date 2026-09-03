@@ -16,7 +16,7 @@ options = CCDSSOptions(
     fit_with_coul=True,
     fixed_sigma=None,
     amplitude_fit_tol=1e-12,
-    structure_factor_imag_tol=1e-5,
+    pair_density_identity_tol=1e-3,
 )
 cc = KRCCD_SS(kmf, options=options)
 ```
@@ -41,7 +41,7 @@ rho[k, p, s] = <u_p,k | exp(-i G.r) | u_s,k+q>
 ```
 
 is built on a periodic Becke grid.  Only the occupied--occupied and
-virtual--virtual matrices are cached.  With
+virtual--virtual matrices are cached after all origin checks succeed.  With
 `kb = kconserv[ki, ka, kj]`, the six scalar sums use:
 
 ```text
@@ -64,20 +64,15 @@ the actual momentum of each density endpoint and amplitude index.  Each block
 is contracted directly to a scalar; the implementation does not allocate a
 second tensor with the size of T2.
 
-The origin is evaluated by these same equations.  Each channel is normalized
-by its own `S_n(0)`, which gives an exact unit origin after validation.  An
-origin smaller than `amplitude_fit_tol` is rejected.  For L1 and L2, before
-taking the real projection, both
-
-```text
-abs(Im S_n(q)) / abs(S_n(0))
-abs(Im (S_n(q) / S_n(0)))
-```
-
-must not exceed `structure_factor_imag_tol`.  L3--L6 are fitted to the real
-part of the normalized structure factor and their imaginary components are
-discarded.  A failure for L1 or L2 identifies the channel, sample, measured
-value, and tolerance.
+The origin is evaluated by the same overlap, reciprocal-wrap, norm, and
+normalization path as every other sample, rather than being set to an
+identity.  Each channel is normalized by its own `S_n(0)`, which gives an
+exact unit origin after validation.  An origin smaller than
+`amplitude_fit_tol` is rejected.  At `q=0`, each active occupied and virtual
+block is checked against identity with `max(abs(rho-I))`; padded rows and
+columns are excluded.  A deviation above `pair_density_identity_tol` names
+the sector and k-point and aborts density caching.  All six normalized curves
+may remain complex; fitting uses their real projections.
 
 ## Fitting and CCD updates
 

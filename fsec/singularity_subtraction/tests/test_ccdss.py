@@ -75,12 +75,10 @@ def solver_shell(nkpts=1, nocc=1, nvir=1, fixed_sigma=0.0):
     return solver
 
 
-def aggregate_solver(imag_tol=1e6):
+def aggregate_solver():
     """Return a three-k-point shell with complex densities and padding."""
     solver = solver_shell(nkpts=3, nocc=2, nvir=2, fixed_sigma=None)
-    solver.options = CCDSSOptions(
-        fixed_sigma=None, structure_factor_imag_tol=imag_tol
-    )
+    solver.options = CCDSSOptions(fixed_sigma=None)
     solver._ss_q_vectors = np.asarray(
         [[0.0, 0.0, 0.0], [0.7, -0.2, 0.1]]
     )
@@ -275,13 +273,13 @@ def symmetric_t2(solver, seed=31):
 
 
 def test_options_and_removed_constraint_api():
-    """Validate new defaults and reject obsolete keywords normally."""
+    """Validate defaults and the pair-density identity tolerance."""
     defaults = CCDSSOptions()
     assert defaults.pair_density_becke_grid_level == 2
-    assert defaults.structure_factor_imag_tol == pytest.approx(1e-5)
+    assert defaults.pair_density_identity_tol == pytest.approx(1e-3)
     for value in (-1.0, np.inf, np.nan):
-        with pytest.raises(ValueError, match="structure_factor_imag_tol"):
-            CCDSSOptions(structure_factor_imag_tol=value)
+        with pytest.raises(ValueError, match="pair_density_identity_tol"):
+            CCDSSOptions(pair_density_identity_tol=value)
     with pytest.raises(TypeError, match="unexpected keyword"):
         CCDSSOptions(use_constraint_1=False)
     with pytest.raises(TypeError, match="unexpected keyword"):
@@ -308,29 +306,111 @@ def test_line_sampling_and_gaussian_fit():
     assert _fit_unit_gaussian(points, values) == pytest.approx(sigma, rel=1e-6)
 
 
-def test_pair_densities_cache_separate_occupied_and_virtual_blocks():
-    """Store exact identity origins and no occupied--virtual blocks."""
-    solver = solver_shell(nkpts=2, nocc=1, nvir=2, fixed_sigma=None)
+def q0_pair_density_solver(active_masks=None, identity_tol=1e-3):
+    """Return a two-k-point shell with a single sampled q=0 density."""
+    solver = solver_shell(nkpts=2, nocc=2, nvir=2, fixed_sigma=None)
+    # Make the second input k-point differ from its minimum-image
+    # representative so the fast test exercises the reciprocal-wrap path.
+    solver.kpts[1, 0] = np.pi
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, pair_density_identity_tol=identity_tol
+    )
     solver._ss_q_vectors = np.zeros((1, 3))
-    solver._ss_plus = np.asarray([[0, 1]])
-    solver._ss_minus = np.asarray([[0, 1]])
-    coords = np.zeros((2, 3))
+    solver._ss_plus = np.asarray([[0, 1]], dtype=int)
+    solver._ss_minus = np.asarray([[0, 1]], dtype=int)
+    if active_masks is None:
+        active_masks = (
+            np.ones((2, 2), dtype=bool),
+            np.ones((2, 2), dtype=bool),
+        )
+    solver._ss_active_masks = active_masks
+    return solver
+
+
+def q0_pair_orbitals(solver, occupied_residue=0.0, virtual_residue=0.0):
+    """Return normalized orbitals with controlled q=0 block residues."""
+    coords = np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
     weights = np.ones(2)
-    u = np.ones((2, 3, 2), dtype=complex)
-    norms = np.ones((2, 3))
+    u = np.zeros((solver.nkpts, solver.nmo, 2), dtype=complex)
+    u[:, 0] = [1.0, 0.0]
+    u[:, 1] = [
+        occupied_residue,
+        np.sqrt(1.0 - occupied_residue**2),
+    ]
+    u[:, 2] = [1.0, 0.0]
+    u[:, 3] = [
+        virtual_residue,
+        np.sqrt(1.0 - virtual_residue**2),
+    ]
+    norms = np.sum(u.conj() * u, axis=-1).real
+    return coords, weights, u, norms, np.zeros((solver.nkpts, 3))
+
+
+def test_pair_densities_compute_q0_residue_and_cache_after_success():
+    """Compute q=0 through overlaps and cache validated active blocks."""
+    solver = q0_pair_density_solver()
+    data = q0_pair_orbitals(solver, virtual_residue=2e-4)
     with mock.patch.object(
-        solver,
-        "_build_pair_orbitals",
-        return_value=(coords, weights, u, norms, np.zeros((2, 3))),
-    ):
+        solver, "_build_pair_orbitals", return_value=data
+    ) as build_pair_orbitals:
         first = solver._build_pair_densities()
         second = solver._build_pair_densities()
+
     assert first is second
+    build_pair_orbitals.assert_called_once()
     rho_oo, rho_vv = first
-    assert rho_oo.shape == (1, 2, 1, 1)
+    assert rho_oo.shape == (1, 2, 2, 2)
     assert rho_vv.shape == (1, 2, 2, 2)
-    np.testing.assert_array_equal(rho_oo[0], np.broadcast_to(np.eye(1), (2, 1, 1)))
-    np.testing.assert_array_equal(rho_vv[0], np.broadcast_to(np.eye(2), (2, 2, 2)))
+    np.testing.assert_array_equal(
+        rho_oo[0], np.broadcast_to(np.eye(2), (2, 2, 2))
+    )
+    assert rho_vv[0, 0, 0, 1] == pytest.approx(2e-4)
+    assert rho_vv[0, 0, 0, 1] != 0
+
+
+def test_pair_densities_reject_occupied_identity_residue_before_caching():
+    """Reject an active occupied q=0 block above its tolerance."""
+    solver = q0_pair_density_solver(identity_tol=1e-3)
+    data = q0_pair_orbitals(solver, occupied_residue=2e-3)
+    with mock.patch.object(
+        solver, "_build_pair_orbitals", return_value=data
+    ), pytest.raises(
+        ValueError,
+        match=r"sector=occupied.*k-point=0.*deviation=.*pair_density_identity_tol",
+    ):
+        solver._build_pair_densities()
+    assert solver._ss_pair_densities is None
+
+
+def test_pair_densities_reject_virtual_identity_residue_before_caching():
+    """Reject an active virtual q=0 block above its tolerance."""
+    solver = q0_pair_density_solver(identity_tol=1e-3)
+    data = q0_pair_orbitals(solver, virtual_residue=2e-3)
+    with mock.patch.object(
+        solver, "_build_pair_orbitals", return_value=data
+    ), pytest.raises(
+        ValueError,
+        match=r"sector=virtual.*k-point=0.*deviation=.*pair_density_identity_tol",
+    ):
+        solver._build_pair_densities()
+    assert solver._ss_pair_densities is None
+
+
+def test_pair_density_identity_check_ignores_padded_rows_and_columns():
+    """Validate only active orbitals when padded q=0 rows are nonidentity."""
+    active = np.asarray([[True, False], [True, False]])
+    solver = q0_pair_density_solver((active, active))
+    data = q0_pair_orbitals(solver, occupied_residue=1.0, virtual_residue=1.0)
+    with mock.patch.object(
+        solver, "_build_pair_orbitals", return_value=data
+    ):
+        densities = solver._build_pair_densities()
+
+    rho_oo, rho_vv = densities
+    assert abs(rho_oo[0, 0, 0, 1]) > 0.5
+    assert abs(rho_vv[0, 0, 0, 1]) > 0.5
+    np.testing.assert_array_equal(rho_oo[0, :, :1, :1], 1.0)
+    np.testing.assert_array_equal(rho_vv[0, :, :1, :1], 1.0)
 
 
 def test_all_six_contractions_match_complex_shifted_loop_reference():
@@ -364,8 +444,8 @@ def test_physical_origins_equal_aggregate_t2_and_normalize_to_one():
     np.testing.assert_array_equal(normalized[:, 0], np.ones(6))
 
 
-def test_normalization_rejects_small_origins_and_large_l1_l2_imaginary_residues():
-    """Guard L1/L2 complex residues while allowing complex L3--L6 curves."""
+def test_normalization_rejects_small_origins_and_preserves_complex_curves():
+    """Normalize each complex channel independently without residue guards."""
     solver = solver_shell(fixed_sigma=None)
     solver._ss_q_vectors = np.zeros((2, 3))
     raw = np.ones((6, 2), dtype=complex)
@@ -373,38 +453,27 @@ def test_normalization_rejects_small_origins_and_large_l1_l2_imaginary_residues(
     with pytest.raises(ValueError, match=r"L3.*origin.*amplitude_fit_tol"):
         solver._normalize_aggregate_structure_factors(raw)
 
-    solver.options = CCDSSOptions(
-        fixed_sigma=None, structure_factor_imag_tol=1e-5
+    raw = np.asarray(
+        [
+            [2.0 + 3.0j, 1.0 + 2.0j],
+            [3.0 - 4.0j, -1.0 + 2.0j],
+            [0.5 + 0.25j, 0.2 - 0.6j],
+            [4.0 + 0.5j, 0.1 + 1.0j],
+            [1.0 - 2.0j, -0.4 + 0.3j],
+            [2.0 + 0.1j, 0.7 - 0.8j],
+        ]
     )
-    raw[:] = 2.0 + 1e-6j
-    raw[:, 1] = 1.0 + 2e-6j
     normalized = solver._normalize_aggregate_structure_factors(raw)
-    assert np.max(np.abs(normalized.imag)) < 1e-5
-
-    raw[2:, 1] = np.asarray(
-        [1.0 + 3e-5j, 1.0 + 4e-5j, 1.0 + 5e-5j, 1.0 + 6e-5j]
-    )
-    normalized = solver._normalize_aggregate_structure_factors(raw)
-    assert np.all(np.abs(normalized[2:, 1].imag) > 1e-5)
-
-
-def test_normalization_checks_imaginary_part_created_by_complex_origin():
-    """Check normalized phase even when every raw imaginary part is small."""
-    solver = solver_shell(fixed_sigma=None)
-    solver._ss_q_vectors = np.zeros((2, 3))
-    solver.options = CCDSSOptions(
-        fixed_sigma=None, structure_factor_imag_tol=1e-5
-    )
-    raw = np.ones((6, 2), dtype=complex)
-    raw[1, 0] = 1.0 + 9e-6j
-    raw[1, 1] = 0.1 - 9.5e-6j
-    with pytest.raises(ValueError, match=r"L2 sample 1 normalized imaginary"):
-        solver._normalize_aggregate_structure_factors(raw)
+    expected = raw / raw[:, :1]
+    expected[:, 0] = 1.0
+    np.testing.assert_allclose(normalized, expected)
+    np.testing.assert_array_equal(normalized[:, 0], np.ones(6))
+    assert normalized[1, 1].imag != 0
 
 
 def test_two_fitted_residual_updates_refit_changed_amplitudes():
     """Perform six fits per update and pass changed real curves to fitting."""
-    solver = aggregate_solver(imag_tol=1e6)
+    solver = aggregate_solver()
     solver._ss_active_masks = (
         np.ones((3, 2), dtype=bool), np.ones((3, 2), dtype=bool)
     )
@@ -439,7 +508,7 @@ def test_two_fitted_residual_updates_refit_changed_amplitudes():
 
 def test_failed_fitted_preparation_does_not_advance_state_or_counters():
     """Commit counters and latest arrays only after all six fits succeed."""
-    solver = aggregate_solver(imag_tol=1e6)
+    solver = aggregate_solver()
     t2 = symmetric_t2(solver)
     with mock.patch(
         "fsec.singularity_subtraction.ccdss._fit_unit_gaussian",
@@ -474,9 +543,6 @@ def test_fixed_sigma_is_cached_without_sampling_or_fitting():
 def test_debug2_reports_raw_and_normalized_rows_on_every_fit():
     """Emit one parseable row per preparation, channel, and q sample."""
     solver = solver_shell(fixed_sigma=None)
-    solver.options = CCDSSOptions(
-        fixed_sigma=None, structure_factor_imag_tol=1e-5
-    )
     solver._ss_q_vectors = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=float)
     solver.verbose = logger.DEBUG2
     t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
@@ -618,7 +684,3 @@ def test_h2_1x1x2_limits_and_dynamic_fit():
     assert fitted.ss_fit_count == 6 * fitted.ss_prepare_count
     assert np.all(np.isfinite(fitted.ss_sigmas))
     assert fitted.ss_sigmas.shape == fitted.ss_xi.shape == (6,)
-    raw, normalized = fitted._aggregate_channel_samples(results["fitted"][1])
-    scaled_raw_imag = np.abs(raw.imag) / np.abs(raw[:, :1])
-    assert np.max(scaled_raw_imag) < 1e-5
-    assert np.max(np.abs(normalized.imag)) < 1e-5

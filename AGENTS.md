@@ -28,8 +28,8 @@ requires `FSEC_RUN_ARCHIVED_REFERENCE=1`.
 Furthermore, if there exists an `fsec-312` environment or something named similarly, use it.
 
 Finally, for anything that isn't changing just a few lines of code, or for plans that
-come out of Plan mode, use 5.6-sol (high) as an orchestrator that feeds the implementation
-details to Luna-MAX. Specifically, tell 5.6-sol the following prompt:
+come out of Plan mode, you (the current model) will be an orchestrator that feeds the implementation
+details to Luna-MAX. Specifically, after planning, tell yourself the following prompt:
 
 """
 TASK

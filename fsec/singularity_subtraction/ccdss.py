@@ -38,9 +38,10 @@ class CCDSSOptions:
     direction.  Samples are separated by ``b_i / n_i``, where ``n_i`` is the
     Monkhorst--Pack mesh size.  The Gaussian is
     ``exp(-|Q|**2 / (2*sigma**2))`` and its coefficient is fixed to one.
-    ``structure_factor_imag_tol`` bounds both raw and normalized imaginary
-    residues for L1 and L2 relative to the magnitude of the channel origin.
-    L3--L6 are fitted to their real projections.
+    The six complex structure-factor curves are normalized independently by
+    their origins and fitted to their real projections.
+    ``pair_density_identity_tol`` bounds the maximum elementwise deviation of
+    each active occupied and virtual ``q=0`` density block from identity.
     """
 
     line_points: int = 3
@@ -48,7 +49,7 @@ class CCDSSOptions:
     fit_with_coul: bool = True
     fixed_sigma: float | None = None
     amplitude_fit_tol: float = 1e-12
-    structure_factor_imag_tol: float = 1e-5
+    pair_density_identity_tol: float = 1e-3
 
     def __post_init__(self):
         if isinstance(self.line_points, bool) or not isinstance(
@@ -81,16 +82,16 @@ class CCDSSOptions:
             raise ValueError("amplitude_fit_tol must be a finite positive number")
         object.__setattr__(self, "amplitude_fit_tol", tol)
         try:
-            imag_tol = float(self.structure_factor_imag_tol)
+            identity_tol = float(self.pair_density_identity_tol)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "structure_factor_imag_tol must be a finite non-negative number"
+                "pair_density_identity_tol must be a finite non-negative number"
             ) from exc
-        if not np.isfinite(imag_tol) or imag_tol < 0:
+        if not np.isfinite(identity_tol) or identity_tol < 0:
             raise ValueError(
-                "structure_factor_imag_tol must be a finite non-negative number"
+                "pair_density_identity_tol must be a finite non-negative number"
             )
-        object.__setattr__(self, "structure_factor_imag_tol", imag_tol)
+        object.__setattr__(self, "pair_density_identity_tol", identity_tol)
         object.__setattr__(self, "fit_with_coul", bool(self.fit_with_coul))
 
 
@@ -222,7 +223,7 @@ class KRCCD_SS(KRCCD):
         fit_with_coul=True,
         fixed_sigma=None,
         amplitude_fit_tol=1e-12,
-        structure_factor_imag_tol=1e-5,
+        pair_density_identity_tol=1e-3,
         occupied_orbital_shift=None,
     ):
         self.options = _merge_options(
@@ -232,7 +233,7 @@ class KRCCD_SS(KRCCD):
             fit_with_coul=fit_with_coul,
             fixed_sigma=fixed_sigma,
             amplitude_fit_tol=amplitude_fit_tol,
-            structure_factor_imag_tol=structure_factor_imag_tol,
+            pair_density_identity_tol=pair_density_identity_tol,
         )
         super().__init__(
             mf,
@@ -267,8 +268,8 @@ class KRCCD_SS(KRCCD):
         )
         log.info("CCD SS fixed sigma = %s", self.options.fixed_sigma)
         log.info(
-            "CCD SS structure-factor imaginary tolerance = %g",
-            self.options.structure_factor_imag_tol,
+            "CCD SS pair-density identity tolerance = %g",
+            self.options.pair_density_identity_tol,
         )
         if self.occupied_orbital_shift is None:
             log.info("CCD SS occupied-orbital shift = Madelung default")
@@ -426,12 +427,14 @@ class KRCCD_SS(KRCCD):
         rho_vv = np.zeros(
             (nsamples, self.nkpts, nvir, nvir), dtype=np.complex128
         )
-        rho_oo[0] = np.eye(self.nocc, dtype=np.complex128)
-        rho_vv[0] = np.eye(nvir, dtype=np.complex128)
+        occupied, virtual = self._build_active_masks()
 
-        for iq, q in enumerate(self._ss_q_vectors[1:], start=1):
+        for iq, q in enumerate(self._ss_q_vectors):
             target = self._ss_plus[iq]
-            unwrapped = self.kpts + q
+            # ``u`` is defined with the minimum-image representative of each
+            # source k-point, so apply q to that same representative before
+            # determining the reciprocal-lattice wrap of the target.
+            unwrapped = wrapped_kpts + q
             wrapped = wrapped_kpts[target]
             gdiff = unwrapped - wrapped
             wrap_phase = np.exp(-1j * (coords @ gdiff.T)).T
@@ -462,6 +465,27 @@ class KRCCD_SS(KRCCD):
                     out=output[iq],
                     where=denominator > 1e-14,
                 )
+
+        tolerance = self.options.pair_density_identity_tol
+        for sector, densities, active_masks in (
+            ("occupied", rho_oo, occupied),
+            ("virtual", rho_vv, virtual),
+        ):
+            for k, active_mask in enumerate(active_masks):
+                active_indices = np.flatnonzero(active_mask)
+                if not len(active_indices):
+                    continue
+                block = densities[0, k][
+                    np.ix_(active_indices, active_indices)
+                ]
+                identity = np.eye(len(active_indices), dtype=np.complex128)
+                deviation = float(np.max(np.abs(block - identity)))
+                if not np.isfinite(deviation) or deviation > tolerance:
+                    raise ValueError(
+                        "CCD SS pair-density identity check failed: "
+                        f"sector={sector} k-point={k} deviation={deviation:.16e} "
+                        f"pair_density_identity_tol={tolerance:.16e}"
+                    )
 
         self._ss_pair_densities = rho_oo, rho_vv
         return self._ss_pair_densities
@@ -631,30 +655,6 @@ class KRCCD_SS(KRCCD):
                 )
 
         normalized = raw / origins[:, None]
-        tolerance = self.options.structure_factor_imag_tol
-        # L3--L6 can carry a phase from the shifted transition densities.
-        # Their imaginary components are discarded by the real
-        # projection used for fitting, while L1 and L2 retain the guard
-        # against unexpected complex residues.
-        for channel in range(2):
-            origin_magnitude = abs(origins[channel])
-            for q_index in range(len(self._ss_q_vectors)):
-                raw_imag_scaled = abs(raw[channel, q_index].imag) / origin_magnitude
-                if raw_imag_scaled > tolerance:
-                    raise ValueError(
-                        f"CCD SS channel L{channel + 1} sample {q_index} raw "
-                        "imaginary magnitude scaled by |S(0)| "
-                        f"{raw_imag_scaled:.16e} exceeds "
-                        f"structure_factor_imag_tol={tolerance:.16e}"
-                    )
-                normalized_imag = abs(normalized[channel, q_index].imag)
-                if normalized_imag > tolerance:
-                    raise ValueError(
-                        f"CCD SS channel L{channel + 1} sample {q_index} "
-                        f"normalized imaginary magnitude {normalized_imag:.16e} "
-                        "exceeds structure_factor_imag_tol="
-                        f"{tolerance:.16e}"
-                    )
         # Preserve the exact unit-coefficient condition used by the fit after
         # validating the computed origins through the same equations.
         normalized[:, 0] = 1.0
@@ -777,8 +777,8 @@ class KRCCD_SS(KRCCD):
             sigmas = np.empty(6, dtype=float)
             xi = np.empty(6, dtype=float)
             for channel in range(6):
-                # Fit real structure-factor values; L3--L6 may have a
-                # non-negligible imaginary component from transition phases.
+                # Fit the real projection while retaining complex samples for
+                # normalization and diagnostics.
                 sigma = _fit_unit_gaussian(
                     self._ss_q_vectors,
                     normalized[channel].real,
