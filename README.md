@@ -69,6 +69,11 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## Gaussian G0W0 finite-size correction
+
+See [G0W0SS.md](G0W0SS.md) for usage, the implementation plan, correction
+formulas, diagnostics, and the implementation and verification summary.
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,

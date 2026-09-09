@@ -56,3 +56,32 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2ExchangeSS,
 )
 from fsec.singularity_subtraction.analysis import OriginDiagnostics
+
+
+def __getattr__(name):
+    """Load the optional periodic G0W0 implementation on first use."""
+    if name == "G0W0SS":
+        from fsec.singularity_subtraction.g0w0ss import G0W0SS
+
+        return G0W0SS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "SingularitySubtraction",
+    "ExxSS",
+    "ExxSSGaussian",
+    "ExxSSQuarticExponential",
+    "DirectFourthOrderCorrectionConfig",
+    "DirectFullCorrectionConfig",
+    "DirectSecondOrderCorrectionConfig",
+    "DirectCorrectionResult",
+    "ExchangeCorrectionConfig",
+    "ExchangeCorrectionResult",
+    "MP2SS",
+    "MP2SSOptions",
+    "MP2DirectSS",
+    "MP2ExchangeSS",
+    "OriginDiagnostics",
+    "G0W0SS",
+]
