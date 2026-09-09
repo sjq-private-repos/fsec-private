@@ -16,8 +16,12 @@ from fsec.singularity_subtraction.ccdss import (
     CCDSSOptions,
     KRCCD_SS,
     _fit_unit_gaussian,
+    _fit_unit_quartic_exponential,
     _line_samples,
     _normalize_occupied_orbital_shift,
+)
+from fsec.singularity_subtraction.model_function.exx_modfunc import (
+    QuarticExponentialModel,
 )
 
 
@@ -65,6 +69,7 @@ def solver_shell(nkpts=1, nocc=1, nvir=1, fixed_sigma=0.0):
     )
     solver.ss_xi = None
     solver.ss_sigmas = None
+    solver.ss_model_parameters = None
     solver.ss_fit_count = 0
     solver.ss_prepare_count = 0
     solver.last_ss_residual_norm = 0.0
@@ -275,6 +280,8 @@ def symmetric_t2(solver, seed=31):
 def test_options_and_removed_constraint_api():
     """Validate defaults and the pair-density identity tolerance."""
     defaults = CCDSSOptions()
+    assert defaults.auxfunc == "Gauss"
+    assert defaults.structure_factor_mode == "separate"
     assert defaults.pair_density_becke_grid_level == 2
     assert defaults.pair_density_identity_tol == pytest.approx(1e-3)
     for value in (-1.0, np.inf, np.nan):
@@ -284,6 +291,14 @@ def test_options_and_removed_constraint_api():
         CCDSSOptions(use_constraint_1=False)
     with pytest.raises(TypeError, match="unexpected keyword"):
         KRCCD_SS(None, use_constraint_2=False)
+    with pytest.raises(ValueError, match="auxfunc"):
+        CCDSSOptions(auxfunc="Lorentzian")
+    with pytest.raises(ValueError, match="structure_factor_mode"):
+        CCDSSOptions(structure_factor_mode="aggregate")
+    with pytest.raises(ValueError, match="structure_factor_mode"):
+        KRCCD_SS(None, structure_factor_mode="aggregate")
+    with pytest.raises(ValueError, match="fixed_sigma"):
+        CCDSSOptions(auxfunc="QuarticExponential", fixed_sigma=0.0)
 
 
 def test_line_sampling_and_gaussian_fit():
@@ -304,6 +319,34 @@ def test_line_sampling_and_gaussian_fit():
     sigma = 0.8
     values = np.exp(-np.linalg.norm(points, axis=1) ** 2 / (2 * sigma**2))
     assert _fit_unit_gaussian(points, values) == pytest.approx(sigma, rel=1e-6)
+
+
+def test_quartic_fit_recovers_positive_synthetic_parameters():
+    """Recover a unit-coefficient quartic model from exact samples."""
+    points = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.4, 0.0, 0.0],
+            [0.8, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [0.0, 0.5, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.5, 0.0],
+            [0.0, 0.0, 0.6],
+            [0.0, 0.0, 1.2],
+            [0.0, 0.0, 1.8],
+        ]
+    )
+    expected = np.asarray([1.7, 0.8, 0.35])
+    values = QuarticExponentialModel(
+        num_primitives=1,
+        parameters=np.r_[1.0, expected].tolist(),
+    ).eval_model(points)
+
+    fitted = _fit_unit_quartic_exponential(points, values)
+
+    assert np.all(fitted > 0)
+    np.testing.assert_allclose(fitted, expected, rtol=1e-6, atol=1e-8)
 
 
 def q0_pair_density_solver(active_masks=None, identity_tol=1e-3):
@@ -471,6 +514,77 @@ def test_normalization_rejects_small_origins_and_preserves_complex_curves():
     assert normalized[1, 1].imag != 0
 
 
+def test_combined_signed_reduction_normalizes_once_and_preserves_complex_values():
+    """Reduce the six raw curves before validating and normalizing one curve."""
+    solver = solver_shell(fixed_sigma=None)
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_mode="combined"
+    )
+    solver._ss_q_vectors = np.zeros((2, 3))
+    raw = np.asarray(
+        [
+            [2.0 + 1.0j, 1.0 + 2.0j],
+            [3.0 - 2.0j, -1.0 + 1.0j],
+            [0.5 + 0.25j, 0.2 - 0.6j],
+            [1.0 - 0.5j, 0.1 + 1.0j],
+            [0.75 - 1.0j, -0.4 + 0.3j],
+            [1.5 + 0.1j, 0.7 - 0.8j],
+        ]
+    )
+    expected_raw = raw[0] + raw[1] - raw[2] - raw[3] - raw[4] - raw[5]
+    with mock.patch.object(
+        solver, "_contract_aggregate_structure_factors", return_value=raw
+    ):
+        combined_raw, normalized = solver._aggregate_channel_samples(None)
+
+    np.testing.assert_allclose(combined_raw, expected_raw)
+    np.testing.assert_allclose(normalized, expected_raw / expected_raw[0])
+    np.testing.assert_array_equal(normalized[0], 1.0)
+    assert normalized[1].imag != 0
+
+    raw[:, 0] = 0.0
+    raw[0, 0] = 1e-14
+    with mock.patch.object(
+        solver, "_contract_aggregate_structure_factors", return_value=raw
+    ), pytest.raises(ValueError, match=r"combined.*origin.*amplitude_fit_tol"):
+        solver._aggregate_channel_samples(None)
+
+
+def test_quartic_xi_matches_independent_truncated_reciprocal_sum():
+    """Use the model integral and exponent-32 reciprocal truncation."""
+    solver = solver_shell(fixed_sigma=None)
+    solver.options = CCDSSOptions(auxfunc="QuarticExponential")
+    solver._scf = SimpleNamespace(cell=FakeCell())
+    parameters = np.asarray([1.0, 1.2, 0.8, 0.3])
+
+    model = QuarticExponentialModel(
+        num_primitives=1, parameters=parameters.tolist()
+    )
+    rhs = 64.0 + 1024.0 / parameters[1]
+    cutoff_squared = 2.0 * rhs / (
+        parameters[2]
+        + np.sqrt(parameters[2] ** 2 + 4.0 * parameters[3] * rhs)
+    )
+    reciprocal = FakeCell().reciprocal_vectors()
+    shell = np.maximum(
+        1, np.ceil(np.sqrt(cutoff_squared) / np.linalg.norm(reciprocal, axis=1))
+    ).astype(int)
+    integers = np.stack(
+        np.meshgrid(
+            *[np.arange(-n, n + 1) for n in shell], indexing="ij"
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    qg = integers @ reciprocal
+    q2 = np.sum(qg * qg, axis=1)
+    values = model.eval_model(qg)
+    active = (q2 > 1e-20) & (values >= np.exp(-32.0))
+    quadrature = np.sum(4.0 * np.pi * values[active] / q2[active]) / FakeCell.vol
+    expected = model.coulomb_integral() - quadrature
+
+    assert solver._quartic_xi(parameters) == pytest.approx(expected, rel=1e-12)
+
+
 def test_two_fitted_residual_updates_refit_changed_amplitudes():
     """Perform six fits per update and pass changed real curves to fitting."""
     solver = aggregate_solver()
@@ -504,6 +618,55 @@ def test_two_fitted_residual_updates_refit_changed_amplitudes():
     assert all(np.isrealobj(values) for values in fitted_curves)
     assert not np.array_equal(first_xi, solver.ss_xi)
     assert solver.ss_sigmas.shape == solver.ss_xi.shape == (6,)
+    assert solver.ss_model_parameters.shape == (6, 2)
+    np.testing.assert_array_equal(solver.ss_model_parameters[:, 0], 1.0)
+    np.testing.assert_allclose(
+        solver.ss_model_parameters[:, 1], solver.ss_sigmas
+    )
+
+
+def test_combined_gaussian_updates_fit_once_and_use_minus_two_xi():
+    """Refit one signed curve per update and commit scalar combined state."""
+    solver = aggregate_solver()
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_mode="combined"
+    )
+    first = symmetric_t2(solver, seed=4)
+    changed = first.copy()
+    changed[0, 0, 0, 0, 0, 0, 0] += 0.7
+    fitted_curves = []
+    expected_curves = []
+    for amplitudes in (first, changed):
+        raw = solver._contract_aggregate_structure_factors(amplitudes)
+        combined_raw = raw[0] + raw[1] - raw[2] - raw[3] - raw[4] - raw[5]
+        normalized = combined_raw / combined_raw[0]
+        normalized[0] = 1.0
+        expected_curves.append(normalized.real)
+
+    def fake_fit(_q, values, fit_with_coul=True):
+        fitted_curves.append(np.array(values, copy=True))
+        return 0.5 + 0.01 * len(fitted_curves)
+
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian",
+        side_effect=fake_fit,
+    ), mock.patch.object(solver, "_gaussian_xi", side_effect=lambda x: x):
+        first_coefficient = solver._ss_residual_coefficient(first)
+        first_xi = solver.ss_xi
+        second_coefficient = solver._ss_residual_coefficient(changed)
+
+    assert len(fitted_curves) == 2
+    np.testing.assert_allclose(fitted_curves, expected_curves)
+    assert not np.allclose(fitted_curves[0], fitted_curves[1])
+    assert first_coefficient == pytest.approx(-2.0 * first_xi)
+    assert second_coefficient == pytest.approx(-2.0 * solver.ss_xi)
+    assert solver.ss_prepare_count == 2
+    assert solver.ss_fit_count == 2
+    assert np.isscalar(solver.ss_xi)
+    assert np.isscalar(solver.ss_sigmas)
+    assert solver.ss_model_parameters.shape == (2,)
+    assert solver.ss_model_parameters[0] == 1.0
+    assert solver.ss_model_parameters[1] == solver.ss_sigmas
 
 
 def test_failed_fitted_preparation_does_not_advance_state_or_counters():
@@ -521,6 +684,94 @@ def test_failed_fitted_preparation_does_not_advance_state_or_counters():
     assert solver.ss_sigmas is None and solver.ss_xi is None
 
 
+def test_quartic_preparation_fits_six_channels_and_commits_atomically():
+    """Fit exactly six quartic channels and retain state after a failed update."""
+    solver = aggregate_solver()
+    solver.options = CCDSSOptions(auxfunc="QuarticExponential")
+    t2 = symmetric_t2(solver)
+    fit_calls = []
+
+    def fake_fit(_q, values, fit_with_coul=True):
+        fit_calls.append(np.array(values, copy=True))
+        return np.asarray([1.0, 2.0, 3.0])
+
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_quartic_exponential",
+        side_effect=fake_fit,
+    ), mock.patch.object(solver, "_quartic_xi", return_value=0.1):
+        solver._prepare_ss(t2)
+
+    committed_parameters = solver.ss_model_parameters.copy()
+    committed_xi = solver.ss_xi.copy()
+    assert len(fit_calls) == 6
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 6
+    assert solver.ss_sigmas is None
+    assert committed_parameters.shape == (6, 4)
+    np.testing.assert_array_equal(
+        committed_parameters,
+        np.broadcast_to([1.0, 1.0, 2.0, 3.0], (6, 4)),
+    )
+
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_quartic_exponential",
+        side_effect=[
+            np.asarray([1.0, 2.0, 3.0]),
+            np.asarray([1.0, 2.0, 3.0]),
+            ValueError("quartic fit failed"),
+        ],
+    ) as quartic_fit, mock.patch.object(
+        solver, "_quartic_xi", return_value=0.2
+    ), pytest.raises(ValueError, match="quartic fit failed"):
+        solver._prepare_ss(t2)
+
+    assert quartic_fit.call_count == 3
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 6
+    np.testing.assert_array_equal(solver.ss_model_parameters, committed_parameters)
+    np.testing.assert_array_equal(solver.ss_xi, committed_xi)
+
+
+def test_combined_quartic_preparation_is_scalar_and_atomic():
+    """Fit one quartic signed curve and retain state after a failed update."""
+    solver = aggregate_solver()
+    solver.options = CCDSSOptions(
+        auxfunc="QuarticExponential", structure_factor_mode="combined"
+    )
+    t2 = symmetric_t2(solver)
+    fit_calls = []
+
+    def fake_fit(_q, values, fit_with_coul=True):
+        fit_calls.append(np.array(values, copy=True))
+        return np.asarray([1.0, 2.0, 3.0])
+
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_quartic_exponential",
+        side_effect=fake_fit,
+    ), mock.patch.object(solver, "_quartic_xi", return_value=0.1):
+        solver._prepare_ss(t2)
+
+    committed_parameters = solver.ss_model_parameters.copy()
+    committed_xi = solver.ss_xi
+    assert len(fit_calls) == 1
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 1
+    assert solver.ss_sigmas is None
+    assert committed_parameters.shape == (4,)
+    np.testing.assert_array_equal(committed_parameters, [1.0, 1.0, 2.0, 3.0])
+
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_quartic_exponential",
+        side_effect=ValueError("combined quartic fit failed"),
+    ), pytest.raises(ValueError, match="combined quartic fit failed"):
+        solver._prepare_ss(t2)
+
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 1
+    np.testing.assert_array_equal(solver.ss_model_parameters, committed_parameters)
+    assert solver.ss_xi == committed_xi
+
+
 def test_fixed_sigma_is_cached_without_sampling_or_fitting():
     """Prepare an amplitude-independent fixed width exactly once."""
     solver = solver_shell(fixed_sigma=np.inf)
@@ -536,6 +787,49 @@ def test_fixed_sigma_is_cached_without_sampling_or_fitting():
     np.testing.assert_array_equal(first, np.full(6, 0.75))
     assert solver.ss_prepare_count == 1
     assert solver.ss_fit_count == 0
+    np.testing.assert_array_equal(
+        solver.ss_model_parameters,
+        np.broadcast_to([1.0, np.inf], (6, 2)),
+    )
+    sample.assert_not_called()
+    fit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "fixed_sigma, expected_xi, expected_coefficient",
+    [(0.0, 0.0, 0.0), (np.inf, 0.75, -1.5)],
+)
+def test_combined_fixed_sigma_is_scalar_cached_and_madelung_consistent(
+    fixed_sigma, expected_xi, expected_coefficient
+):
+    """Handle zero and infinite fixed widths without sampling or fitting."""
+    solver = solver_shell(fixed_sigma=fixed_sigma)
+    solver.options = CCDSSOptions(
+        fixed_sigma=fixed_sigma, structure_factor_mode="combined"
+    )
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    with mock.patch.object(
+        solver, "_aggregate_channel_samples"
+    ) as sample, mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian"
+    ) as fit:
+        solver._prepare_ss(t2)
+        solver._prepare_ss(3 * t2)
+
+    assert solver.ss_prepare_count == 1
+    assert solver.ss_fit_count == 0
+    assert np.asarray(solver.ss_xi).shape == ()
+    assert solver.ss_xi == pytest.approx(expected_xi)
+    assert np.asarray(solver.ss_sigmas).shape == ()
+    assert solver.ss_sigmas == fixed_sigma
+    assert solver.ss_model_parameters.shape == (2,)
+    assert solver._ss_residual_coefficient(t2) == pytest.approx(
+        expected_coefficient
+    )
+    if np.isinf(fixed_sigma):
+        assert solver._ss_residual_coefficient(t2) == pytest.approx(
+            2.0 * solver.madelung_constant
+        )
     sample.assert_not_called()
     fit.assert_not_called()
 
@@ -562,11 +856,73 @@ def test_debug2_reports_raw_and_normalized_rows_on_every_fit():
     assert len(rows) == 24
     assert "prep=1 channel=L1 q_index=0" in rows[0]
     assert "prep=2 channel=L6 q_index=1" in rows[-1]
+    assert "auxfunc=Gauss" in rows[0]
     for field in (
         "raw_real=", "raw_imag=", "normalized_real=", "normalized_imag=",
         "sigma=", "xi=", "fit=", "residual_real=", "residual_imag=",
     ):
         assert field in rows[0]
+
+
+def test_debug2_combined_reports_one_row_per_q_sample():
+    """Emit exactly one combined diagnostic row for each sampled momentum."""
+    solver = solver_shell(fixed_sigma=None)
+    solver.options = CCDSSOptions(
+        fixed_sigma=None, structure_factor_mode="combined"
+    )
+    solver._ss_q_vectors = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=float)
+    solver.verbose = logger.DEBUG2
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    raw = np.asarray([2.0 + 0.5j, 1.0 - 0.25j])
+    normalized = raw / raw[0]
+    with mock.patch.object(
+        solver, "_aggregate_channel_samples", return_value=(raw, normalized)
+    ), mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_gaussian", return_value=2.0
+    ), mock.patch.object(solver, "_gaussian_xi", return_value=0.25):
+        solver._prepare_ss(t2)
+
+    rows = [
+        line for line in solver.stdout.getvalue().splitlines()
+        if line.startswith("CCDSS_SF ")
+    ]
+    assert len(rows) == 2
+    assert all("channel=combined" in row for row in rows)
+    assert all("channel=L" not in row for row in rows)
+    for field in (
+        "raw_real=", "raw_imag=", "normalized_real=", "normalized_imag=",
+        "sigma=", "xi=", "fit=", "residual_real=", "residual_imag=",
+    ):
+        assert field in rows[0]
+
+
+def test_debug2_reports_quartic_parameters():
+    """Emit model-specific quartic parameters in every diagnostic row."""
+    solver = solver_shell(fixed_sigma=None)
+    solver.options = CCDSSOptions(auxfunc="QuarticExponential")
+    solver._ss_q_vectors = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=float)
+    solver.verbose = logger.DEBUG2
+    t2 = np.ones((1, 1, 1, 1, 1, 1, 1))
+    raw = np.ones((6, 2), dtype=complex) * 2
+    normalized = raw / 2
+    with mock.patch.object(
+        solver, "_aggregate_channel_samples", return_value=(raw, normalized)
+    ), mock.patch(
+        "fsec.singularity_subtraction.ccdss._fit_unit_quartic_exponential",
+        return_value=np.asarray([1.0, 2.0, 3.0]),
+    ), mock.patch.object(solver, "_quartic_xi", return_value=0.25):
+        solver._prepare_ss(t2)
+
+    rows = [
+        line for line in solver.stdout.getvalue().splitlines()
+        if line.startswith("CCDSS_SF ")
+    ]
+    assert len(rows) == 12
+    assert "auxfunc=QuarticExponential" in rows[0]
+    assert "alpha=1.0000000000000000e+00" in rows[0]
+    assert "beta=2.0000000000000000e+00" in rows[0]
+    assert "kappa=3.0000000000000000e+00" in rows[0]
+    assert "sigma=" not in rows[0]
 
 
 def test_fixed_sigma_limits_signs_and_residual_before_division():
@@ -586,6 +942,18 @@ def test_fixed_sigma_limits_signs_and_residual_before_division():
         result = solver._inject_ss_residual(t2new, t2, eris)
     denominator = -6.0
     assert result.item() == pytest.approx((5.0 * denominator + 3.0) / denominator)
+
+    solver.options = CCDSSOptions(
+        fixed_sigma=0.5, structure_factor_mode="combined"
+    )
+    solver.ss_xi = 0.5
+    t2new.fill(5.0)
+    with mock.patch(
+        "fsec.singularity_subtraction.ccdss.padding_k_idx",
+        return_value=([np.asarray([0])], [np.asarray([0])]),
+    ):
+        result = solver._inject_ss_residual(t2new, t2, eris)
+    assert result.item() == pytest.approx((5.0 * denominator - 3.0) / denominator)
     assert solver._gaussian_xi(0.0) == 0.0
     assert solver._gaussian_xi(np.inf) == 0.75
 
@@ -642,7 +1010,7 @@ def test_init_defers_fitted_preparation_and_update_keeps_t1_zero():
 
 @pytest.mark.slow
 def test_h2_1x1x2_limits_and_dynamic_fit():
-    """Converge H2 with level-2 densities and six fits per CCD update."""
+    """Converge H2 with level-2 densities and both dynamic fit modes."""
     cell = gto.Cell()
     cell.unit = "Bohr"
     cell.atom = "H 0 0 0; H 1.8 0 0"
@@ -664,6 +1032,8 @@ def test_h2_1x1x2_limits_and_dynamic_fit():
         "madelung": KRCCD(mf, madelung_orbital=True, madelung_eri=True),
         "infinite": KRCCD_SS(mf, fixed_sigma=np.inf),
         "fitted": KRCCD_SS(mf),
+        "combined": KRCCD_SS(mf, structure_factor_mode="combined"),
+        "quartic": KRCCD_SS(mf, auxfunc="QuarticExponential"),
     }
     results = {}
     for name, cc in calculations.items():
@@ -684,3 +1054,22 @@ def test_h2_1x1x2_limits_and_dynamic_fit():
     assert fitted.ss_fit_count == 6 * fitted.ss_prepare_count
     assert np.all(np.isfinite(fitted.ss_sigmas))
     assert fitted.ss_sigmas.shape == fitted.ss_xi.shape == (6,)
+    combined = calculations["combined"]
+    assert combined.converged and np.isfinite(results["combined"][0])
+    assert combined.ss_prepare_count == combined.cycles
+    assert combined.ss_fit_count == combined.ss_prepare_count
+    assert np.asarray(combined.ss_xi).shape == ()
+    assert np.asarray(combined.ss_sigmas).shape == ()
+    assert np.isfinite(combined.ss_xi)
+    assert np.isfinite(combined.ss_sigmas)
+    assert combined.ss_model_parameters.shape == (2,)
+    quartic = calculations["quartic"]
+    assert quartic.converged and np.isfinite(results["quartic"][0])
+    assert quartic.ss_prepare_count == quartic.cycles
+    assert quartic.ss_fit_count == 6 * quartic.ss_prepare_count
+    assert quartic.ss_sigmas is None
+    assert quartic.ss_model_parameters.shape == (6, 4)
+    assert np.all(np.isfinite(quartic.ss_model_parameters))
+    assert np.all(quartic.ss_model_parameters[:, 1:] > 0)
+    assert quartic.ss_xi.shape == (6,)
+    assert np.all(np.isfinite(quartic.ss_xi))

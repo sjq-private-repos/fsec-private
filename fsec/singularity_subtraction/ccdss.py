@@ -15,6 +15,9 @@ from pyscf.pbc.dft import gen_grid as pbc_gen_grid
 from pyscf.pbc.mp import kmp2
 from pyscf.pbc.mp.kmp2 import padding_k_idx
 
+from fsec.singularity_subtraction.model_function.exx_modfunc import (
+    QuarticExponentialModel,
+)
 from fsec.staggered_mesh.cc.krccd import KRCCD
 
 """Iterative singularity subtraction for restricted periodic CCD.
@@ -30,6 +33,11 @@ The resulting correction added to the doubles residual is
 """
 
 
+_COMBINED_STRUCTURE_FACTOR_WEIGHTS = np.asarray(
+    [1.0, 1.0, -1.0, -1.0, -1.0, -1.0]
+)
+
+
 @dataclass(frozen=True)
 class CCDSSOptions:
     """Configuration for :class:`KRCCD_SS`.
@@ -38,10 +46,15 @@ class CCDSSOptions:
     direction.  Samples are separated by ``b_i / n_i``, where ``n_i`` is the
     Monkhorst--Pack mesh size.  The Gaussian is
     ``exp(-|Q|**2 / (2*sigma**2))`` and its coefficient is fixed to one.
-    The six complex structure-factor curves are normalized independently by
-    their origins and fitted to their real projections.
+    In separate mode, the six complex structure-factor curves are normalized
+    independently by their origins and fitted to their real projections.  In
+    combined mode, their signed raw sum is normalized and fitted once.
     ``pair_density_identity_tol`` bounds the maximum elementwise deviation of
     each active occupied and virtual ``q=0`` density block from identity.
+    ``auxfunc`` selects the unit-coefficient Gaussian or quartic-exponential
+    model.  ``fixed_sigma`` is available only for the Gaussian model.
+    ``structure_factor_mode`` selects independent six-channel fitting or the
+    signed combined curve.
     """
 
     line_points: int = 3
@@ -50,8 +63,20 @@ class CCDSSOptions:
     fixed_sigma: float | None = None
     amplitude_fit_tol: float = 1e-12
     pair_density_identity_tol: float = 1e-3
+    auxfunc: str = "Gauss"
+    structure_factor_mode: str = "separate"
 
     def __post_init__(self):
+        if not isinstance(self.structure_factor_mode, str) or (
+            self.structure_factor_mode not in ("separate", "combined")
+        ):
+            raise ValueError(
+                'structure_factor_mode must be "separate" or "combined"'
+            )
+        if self.auxfunc not in ("Gauss", "QuarticExponential"):
+            raise ValueError(
+                'auxfunc must be "Gauss" or "QuarticExponential"'
+            )
         if isinstance(self.line_points, bool) or not isinstance(
             self.line_points, numbers.Integral
         ) or self.line_points < 1:
@@ -74,6 +99,10 @@ class CCDSSOptions:
             if np.isnan(sigma) or sigma < 0:
                 raise ValueError("fixed_sigma must be None or a non-negative number")
             object.__setattr__(self, "fixed_sigma", sigma)
+            if self.auxfunc == "QuarticExponential":
+                raise ValueError(
+                    "fixed_sigma is only supported with auxfunc=\"Gauss\""
+                )
         try:
             tol = float(self.amplitude_fit_tol)
         except (TypeError, ValueError) as exc:
@@ -192,6 +221,71 @@ def _fit_unit_gaussian(q_vectors, values, fit_with_coul=True):
     return sigma
 
 
+def _fit_unit_quartic_exponential(q_vectors, values, fit_with_coul=True):
+    """Fit a unit-coefficient quartic exponential.
+
+    The returned values are ``[alpha, beta, kappa]``.  All three parameters
+    are positive and optimized in logarithmic coordinates.
+    """
+    q_vectors = np.asarray(q_vectors, dtype=float)
+    values = np.asarray(values)
+    if q_vectors.ndim != 2 or q_vectors.shape[1] != 3:
+        raise ValueError("q_vectors must have shape (n, 3)")
+    if values.shape != (len(q_vectors),):
+        raise ValueError(
+            "Quartic-exponential fit values must have shape (n_samples,)"
+        )
+    if not np.all(np.isfinite(q_vectors)) or not np.all(np.isfinite(values)):
+        raise ValueError("Quartic-exponential fitting data must be finite")
+
+    norms = np.linalg.norm(q_vectors, axis=1)
+    active = norms > 1e-14
+    if not np.any(active):
+        raise ValueError(
+            "Quartic-exponential fitting requires at least one nonzero sample"
+        )
+    q_vectors = q_vectors[active]
+    q2 = norms[active] ** 2
+    target = values[active]
+    weights = 1.0 / q2 if fit_with_coul else np.ones_like(q2)
+
+    scale = max(float(np.min(norms[active])), 1e-12)
+    log_scale = np.log(scale)
+    initial = np.asarray([0.0, -2.0 * log_scale, -4.0 * log_scale])
+    log_width = np.log(1e8)
+
+    model = QuarticExponentialModel(
+        num_primitives=1,
+        parameters=[1.0, 1.0, scale ** -2, scale ** -4],
+    )
+
+    def residual(log_parameters):
+        parameters = np.r_[1.0, np.exp(log_parameters)]
+        model.set_parameters(parameters)
+        fitted = model.eval_model(q_vectors)
+        delta = (fitted - target) * np.sqrt(weights)
+        return np.r_[delta.real, delta.imag]
+
+    result = least_squares(
+        residual,
+        initial,
+        bounds=(initial - log_width, initial + log_width),
+        ftol=1e-14,
+        xtol=1e-14,
+        gtol=1e-14,
+    )
+    parameters = np.exp(result.x)
+    if (
+        not result.success
+        or not np.all(np.isfinite(parameters))
+        or not np.all(parameters > 0)
+    ):
+        raise ValueError(
+            "Quartic-exponential fitting produced non-finite parameters"
+        )
+    return parameters
+
+
 class KRCCD_SS(KRCCD):
     """Restricted k-point CCD with six-channel singularity subtraction.
 
@@ -207,6 +301,7 @@ class KRCCD_SS(KRCCD):
             "ss_prepare_count",
             "last_ss_residual_norm",
             "ss_sigmas",
+            "ss_model_parameters",
             "ss_xi",
         }
     )
@@ -225,6 +320,8 @@ class KRCCD_SS(KRCCD):
         amplitude_fit_tol=1e-12,
         pair_density_identity_tol=1e-3,
         occupied_orbital_shift=None,
+        auxfunc="Gauss",
+        structure_factor_mode: str = "separate",
     ):
         self.options = _merge_options(
             options,
@@ -234,6 +331,8 @@ class KRCCD_SS(KRCCD):
             fixed_sigma=fixed_sigma,
             amplitude_fit_tol=amplitude_fit_tol,
             pair_density_identity_tol=pair_density_identity_tol,
+            auxfunc=auxfunc,
+            structure_factor_mode=structure_factor_mode,
         )
         super().__init__(
             mf,
@@ -250,6 +349,7 @@ class KRCCD_SS(KRCCD):
         self.ss_prepare_count = 0
         self.last_ss_residual_norm = 0.0
         self.ss_sigmas = None
+        self.ss_model_parameters = None
         self.ss_xi = None
         self._ss_pair_densities = None
         self._ss_pair_orbitals = None
@@ -261,6 +361,11 @@ class KRCCD_SS(KRCCD):
     def dump_flags(self, verbose=None):
         result = super().dump_flags(verbose)
         log = logger.new_logger(self, verbose)
+        log.info("CCD SS auxiliary model = %s", self.options.auxfunc)
+        log.info(
+            "CCD SS structure-factor mode = %s",
+            self.options.structure_factor_mode,
+        )
         log.info("CCD SS positive line samples = %d", self.options.line_points)
         log.info(
             "CCD SS Becke grid level = %d",
@@ -637,14 +742,37 @@ class KRCCD_SS(KRCCD):
         return raw
 
     def _normalize_aggregate_structure_factors(self, raw):
-        """Validate and independently normalize the six complex curves."""
-        expected = (6, len(self._ss_q_vectors))
-        if np.shape(raw) != expected:
+        """Validate and normalize the complex structure-factor curve(s)."""
+        nsamples = len(self._ss_q_vectors)
+        raw = np.asarray(raw, dtype=np.complex128)
+        if self.options.structure_factor_mode == "combined":
+            if raw.shape == (6, nsamples):
+                raw = self._combine_aggregate_structure_factors(raw)
+            expected = (nsamples,)
+            if raw.shape != expected:
+                raise ValueError(
+                    "combined CCD SS structure factor must have shape "
+                    f"{expected}; received {raw.shape}"
+                )
+            origin = raw[0]
+            if abs(origin) < self.options.amplitude_fit_tol:
+                raise ValueError(
+                    "CCD SS combined origin magnitude "
+                    f"{abs(origin):.16e} is below amplitude_fit_tol="
+                    f"{self.options.amplitude_fit_tol:.16e}"
+                )
+            normalized = raw / origin
+            # Preserve the exact unit-coefficient condition used by the fit
+            # after validating the computed signed origin.
+            normalized[0] = 1.0
+            return normalized
+
+        expected = (6, nsamples)
+        if raw.shape != expected:
             raise ValueError(
                 "aggregate CCD SS structure factors must have shape "
-                f"{expected}; received {np.shape(raw)}"
+                f"{expected}; received {raw.shape}"
             )
-        raw = np.asarray(raw, dtype=np.complex128)
         origins = raw[:, 0]
         for channel, origin in enumerate(origins, start=1):
             if abs(origin) < self.options.amplitude_fit_tol:
@@ -660,17 +788,34 @@ class KRCCD_SS(KRCCD):
         normalized[:, 0] = 1.0
         return normalized
 
+    def _combine_aggregate_structure_factors(self, raw):
+        """Reduce six raw curves with the chapter-2 signed coefficients."""
+        expected = (6, len(self._ss_q_vectors))
+        raw = np.asarray(raw, dtype=np.complex128)
+        if raw.shape != expected:
+            raise ValueError(
+                "aggregate CCD SS structure factors must have shape "
+                f"{expected}; received {raw.shape}"
+            )
+        return np.tensordot(
+            _COMBINED_STRUCTURE_FACTOR_WEIGHTS,
+            raw,
+            axes=(0, 0),
+        )
+
     def _aggregate_channel_samples(self, t2):
         """Return unnormalized and normalized complex structure factors."""
         raw = self._contract_aggregate_structure_factors(t2)
+        if self.options.structure_factor_mode == "combined":
+            raw = self._combine_aggregate_structure_factors(raw)
         return raw, self._normalize_aggregate_structure_factors(raw)
 
     def _gaussian_xi(self, sigma):
         if sigma == 0.0:
             return 0.0
         if np.isinf(sigma):
-            # Each channel xi is the positive Madelung quadrature defect.  The
-            # 2-positive/4-negative sign pattern then gives 2*signed_xi*T2.
+            # Residual assembly applies either the six-channel signs or the
+            # combined -2 prefactor to this positive quadrature defect.
             return -self.madelung_constant
 
         cache = getattr(self, "_ss_xi_cache", None)
@@ -712,47 +857,251 @@ class KRCCD_SS(KRCCD):
         cache[sigma] = xi
         return xi
 
-    def _log_ss_samples(self, raw, normalized, sigmas, xi, preparation_id):
+    def _quartic_xi(self, model_parameters):
+        """Return the quartic continuous-integral minus mesh quadrature defect."""
+        parameters = np.asarray(model_parameters, dtype=float)
+        if parameters.shape == (3,):
+            parameters = np.r_[1.0, parameters]
+        if parameters.shape != (4,):
+            raise ValueError(
+                "quartic model parameters must have shape (3,) or (4,)"
+            )
+        if not np.isclose(parameters[0], 1.0):
+            raise ValueError("quartic model coefficient must be fixed at one")
+        if not np.all(np.isfinite(parameters[1:])) or np.any(parameters[1:] <= 0):
+            raise ValueError("quartic model parameters must be finite and positive")
+
+        parameters = np.array(parameters, dtype=float, copy=True)
+        cache = getattr(self, "_ss_xi_cache", None)
+        if cache is None:
+            cache = self._ss_xi_cache = {}
+        cache_key = ("QuarticExponential", *parameters)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        alpha, beta, kappa = parameters[1:]
+        # Solve alpha * (sqrt(1 + beta/alpha*r^2 + kappa/alpha*r^4) - 1)
+        # = 32 for the radial cutoff used in the reciprocal-lattice sum.
+        rhs = 64.0 + 1024.0 / alpha
+        discriminant = beta * beta + 4.0 * kappa * rhs
+        cutoff_squared = 2.0 * rhs / (beta + np.sqrt(discriminant))
+        cutoff = np.sqrt(cutoff_squared)
+
+        cell = self._scf.cell
+        volume = float(cell.vol)
+        reciprocal = np.asarray(cell.reciprocal_vectors())
+        qmesh = np.asarray(self.kpts) - np.asarray(self.kpts[0])
+        bnorm = np.linalg.norm(reciprocal, axis=1)
+        qmesh_norm = np.max(np.linalg.norm(qmesh, axis=1), initial=0.0)
+        # Include the first reciprocal shell containing the shifted q mesh;
+        # points beyond the model exponent cutoff are removed below.
+        shell = np.maximum(
+            1, np.ceil((cutoff + qmesh_norm) / bnorm).astype(int)
+        )
+        shell_size = len(qmesh)
+        for extent in shell:
+            shell_size *= 2 * int(extent) + 1
+            if shell_size > 2_000_000:
+                return -self.madelung_constant
+
+        integers = np.stack(
+            np.meshgrid(
+                *[np.arange(-n, n + 1) for n in shell], indexing="ij"
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        gvectors = integers @ reciprocal
+        qg = (qmesh[:, None, :] + gvectors[None, :, :]).reshape(-1, 3)
+        q2 = lib.einsum("qi,qi->q", qg, qg)
+
+        model = QuarticExponentialModel(
+            num_primitives=1, parameters=parameters.tolist()
+        )
+        model_values = np.asarray(model.eval_model(qg), dtype=float)
+        active = (
+            (q2 > 1e-20)
+            & np.isfinite(q2)
+            & np.isfinite(model_values)
+            & (model_values >= np.exp(-32.0))
+        )
+        quadrature = (
+            np.sum(4.0 * np.pi * model_values[active] / q2[active])
+            / (self.nkpts * volume)
+        )
+        integral = float(model.coulomb_integral())
+        if not np.isfinite(integral):
+            raise ValueError("quartic correction produced a non-finite integral")
+        xi = float(integral - quadrature)
+        if not np.isfinite(xi):
+            raise ValueError("quartic correction produced a non-finite value")
+        cache[cache_key] = xi
+        return xi
+
+    def _log_ss_samples(
+        self, raw, normalized, model_parameters, xi, preparation_id
+    ):
         """Log raw and normalized values for every fitted channel sample."""
-        for channel in range(6):
-            sigma = float(sigmas[channel])
-            correction = float(xi[channel])
+        quartic = self.options.auxfunc == "QuarticExponential"
+        quartic_model = (
+            QuarticExponentialModel(num_primitives=1)
+            if quartic
+            else None
+        )
+        if self.options.structure_factor_mode == "combined":
+            correction = float(xi)
+            if quartic:
+                parameters = model_parameters
+                quartic_model.set_parameters(parameters)
+                fits = quartic_model.eval_model(self._ss_q_vectors)
+            else:
+                sigma = float(model_parameters[1])
             for q_index, q_vector in enumerate(self._ss_q_vectors):
                 qx, qy, qz = (float(value) for value in q_vector)
                 q_squared = qx * qx + qy * qy + qz * qz
-                raw_value = complex(raw[channel, q_index])
-                normalized_value = complex(normalized[channel, q_index])
-                if sigma == 0.0:
+                raw_value = complex(raw[q_index])
+                normalized_value = complex(normalized[q_index])
+                if quartic:
+                    fit = float(fits[q_index])
+                elif sigma == 0.0:
                     fit = 1.0 if q_squared == 0.0 else 0.0
                 elif np.isinf(sigma):
                     fit = 1.0
                 else:
                     fit = float(np.exp(-q_squared / (2.0 * sigma * sigma)))
                 residual = fit - normalized_value
-                logger.debug2(
-                    self,
-                    "CCDSS_SF prep=%d channel=L%d q_index=%d "
-                    "qx=%.16e qy=%.16e qz=%.16e "
-                    "raw_real=%.16e raw_imag=%.16e "
-                    "normalized_real=%.16e normalized_imag=%.16e "
-                    "sigma=%.16e xi=%.16e fit=%.16e "
-                    "residual_real=%.16e residual_imag=%.16e",
-                    int(preparation_id),
-                    channel + 1,
-                    int(q_index),
-                    qx,
-                    qy,
-                    qz,
-                    raw_value.real,
-                    raw_value.imag,
-                    normalized_value.real,
-                    normalized_value.imag,
-                    sigma,
-                    correction,
-                    fit,
-                    residual.real,
-                    residual.imag,
-                )
+                if quartic:
+                    logger.debug2(
+                        self,
+                        "CCDSS_SF prep=%d channel=combined q_index=%d "
+                        "auxfunc=QuarticExponential "
+                        "qx=%.16e qy=%.16e qz=%.16e "
+                        "raw_real=%.16e raw_imag=%.16e "
+                        "normalized_real=%.16e normalized_imag=%.16e "
+                        "alpha=%.16e beta=%.16e kappa=%.16e "
+                        "xi=%.16e fit=%.16e "
+                        "residual_real=%.16e residual_imag=%.16e",
+                        int(preparation_id),
+                        int(q_index),
+                        qx,
+                        qy,
+                        qz,
+                        raw_value.real,
+                        raw_value.imag,
+                        normalized_value.real,
+                        normalized_value.imag,
+                        parameters[1],
+                        parameters[2],
+                        parameters[3],
+                        correction,
+                        fit,
+                        residual.real,
+                        residual.imag,
+                    )
+                else:
+                    logger.debug2(
+                        self,
+                        "CCDSS_SF prep=%d channel=combined q_index=%d "
+                        "auxfunc=Gauss "
+                        "qx=%.16e qy=%.16e qz=%.16e "
+                        "raw_real=%.16e raw_imag=%.16e "
+                        "normalized_real=%.16e normalized_imag=%.16e "
+                        "sigma=%.16e xi=%.16e fit=%.16e "
+                        "residual_real=%.16e residual_imag=%.16e",
+                        int(preparation_id),
+                        int(q_index),
+                        qx,
+                        qy,
+                        qz,
+                        raw_value.real,
+                        raw_value.imag,
+                        normalized_value.real,
+                        normalized_value.imag,
+                        sigma,
+                        correction,
+                        fit,
+                        residual.real,
+                        residual.imag,
+                    )
+            return
+
+        for channel in range(6):
+            correction = float(xi[channel])
+            if quartic:
+                parameters = model_parameters[channel]
+                quartic_model.set_parameters(parameters)
+                fits = quartic_model.eval_model(self._ss_q_vectors)
+            else:
+                sigma = float(model_parameters[channel, 1])
+            for q_index, q_vector in enumerate(self._ss_q_vectors):
+                qx, qy, qz = (float(value) for value in q_vector)
+                q_squared = qx * qx + qy * qy + qz * qz
+                raw_value = complex(raw[channel, q_index])
+                normalized_value = complex(normalized[channel, q_index])
+                if quartic:
+                    fit = float(fits[q_index])
+                else:
+                    if sigma == 0.0:
+                        fit = 1.0 if q_squared == 0.0 else 0.0
+                    elif np.isinf(sigma):
+                        fit = 1.0
+                    else:
+                        fit = float(np.exp(-q_squared / (2.0 * sigma * sigma)))
+                residual = fit - normalized_value
+                if quartic:
+                    logger.debug2(
+                        self,
+                        "CCDSS_SF prep=%d channel=L%d q_index=%d "
+                        "auxfunc=QuarticExponential "
+                        "qx=%.16e qy=%.16e qz=%.16e "
+                        "raw_real=%.16e raw_imag=%.16e "
+                        "normalized_real=%.16e normalized_imag=%.16e "
+                        "alpha=%.16e beta=%.16e kappa=%.16e "
+                        "xi=%.16e fit=%.16e "
+                        "residual_real=%.16e residual_imag=%.16e",
+                        int(preparation_id),
+                        channel + 1,
+                        int(q_index),
+                        qx,
+                        qy,
+                        qz,
+                        raw_value.real,
+                        raw_value.imag,
+                        normalized_value.real,
+                        normalized_value.imag,
+                        parameters[1],
+                        parameters[2],
+                        parameters[3],
+                        correction,
+                        fit,
+                        residual.real,
+                        residual.imag,
+                    )
+                else:
+                    logger.debug2(
+                        self,
+                        "CCDSS_SF prep=%d channel=L%d q_index=%d "
+                        "auxfunc=Gauss "
+                        "qx=%.16e qy=%.16e qz=%.16e "
+                        "raw_real=%.16e raw_imag=%.16e "
+                        "normalized_real=%.16e normalized_imag=%.16e "
+                        "sigma=%.16e xi=%.16e fit=%.16e "
+                        "residual_real=%.16e residual_imag=%.16e",
+                        int(preparation_id),
+                        channel + 1,
+                        int(q_index),
+                        qx,
+                        qy,
+                        qz,
+                        raw_value.real,
+                        raw_value.imag,
+                        normalized_value.real,
+                        normalized_value.imag,
+                        sigma,
+                        correction,
+                        fit,
+                        residual.real,
+                        residual.imag,
+                    )
 
     def _prepare_ss(self, t2=None):
         if t2 is not None:
@@ -760,41 +1109,93 @@ class KRCCD_SS(KRCCD):
         fixed_sigma = self.options.fixed_sigma
         if fixed_sigma is not None and self.ss_xi is not None:
             return self.ss_xi
+        combined = self.options.structure_factor_mode == "combined"
         report_timing = self.verbose >= logger.INFO
         if report_timing:
             cpu0 = logger.process_clock()
             wall0 = logger.perf_counter()
         preparation_id = self.ss_prepare_count + 1
         if fixed_sigma is not None:
-            sigmas = np.full(6, fixed_sigma, dtype=float)
-            xi = np.full(
-                6, self._gaussian_xi(fixed_sigma), dtype=float
-            )
+            sigma = float(fixed_sigma)
+            xi = float(self._gaussian_xi(sigma))
+            if combined:
+                model_parameters = np.asarray([1.0, sigma])
+            else:
+                sigmas = np.full(6, sigma, dtype=float)
+                xi = np.full(6, xi, dtype=float)
+                model_parameters = np.column_stack((np.ones(6), sigmas))
         else:
             if t2 is None:
                 self._validate_t2(t2)
             raw, normalized = self._aggregate_channel_samples(t2)
-            sigmas = np.empty(6, dtype=float)
-            xi = np.empty(6, dtype=float)
-            for channel in range(6):
-                # Fit the real projection while retaining complex samples for
-                # normalization and diagnostics.
-                sigma = _fit_unit_gaussian(
-                    self._ss_q_vectors,
-                    normalized[channel].real,
-                    fit_with_coul=self.options.fit_with_coul,
-                )
-                sigmas[channel] = sigma
-                xi[channel] = self._gaussian_xi(sigma)
+            if combined:
+                if self.options.auxfunc == "Gauss":
+                    sigma = _fit_unit_gaussian(
+                        self._ss_q_vectors,
+                        normalized.real,
+                        fit_with_coul=self.options.fit_with_coul,
+                    )
+                    xi = float(self._gaussian_xi(sigma))
+                    model_parameters = np.asarray([1.0, sigma])
+                else:
+                    parameters = _fit_unit_quartic_exponential(
+                        self._ss_q_vectors,
+                        normalized.real,
+                        fit_with_coul=self.options.fit_with_coul,
+                    )
+                    model_parameters = np.r_[1.0, parameters]
+                    xi = float(self._quartic_xi(model_parameters))
+            elif self.options.auxfunc == "Gauss":
+                xi = np.empty(6, dtype=float)
+                sigmas = np.empty(6, dtype=float)
+                for channel in range(6):
+                    # Fit the real projection while retaining complex samples
+                    # for normalization and diagnostics.
+                    sigma = _fit_unit_gaussian(
+                        self._ss_q_vectors,
+                        normalized[channel].real,
+                        fit_with_coul=self.options.fit_with_coul,
+                    )
+                    sigmas[channel] = sigma
+                    xi[channel] = self._gaussian_xi(sigma)
+                model_parameters = np.column_stack((np.ones(6), sigmas))
+            else:
+                xi = np.empty(6, dtype=float)
+                model_parameters = np.empty((6, 4), dtype=float)
+                for channel in range(6):
+                    # Fit the real projection while retaining complex samples
+                    # for normalization and diagnostics.
+                    parameters = _fit_unit_quartic_exponential(
+                        self._ss_q_vectors,
+                        normalized[channel].real,
+                        fit_with_coul=self.options.fit_with_coul,
+                    )
+                    model_parameters[channel] = np.r_[1.0, parameters]
+                    xi[channel] = self._quartic_xi(model_parameters[channel])
             if self.verbose >= logger.DEBUG2:
                 self._log_ss_samples(
-                    raw, normalized, sigmas, xi, preparation_id
+                    raw, normalized, model_parameters, xi, preparation_id
                 )
-        self.ss_sigmas = sigmas
-        self.ss_xi = xi
+
+        if combined:
+            self.ss_sigmas = (
+                float(model_parameters[1])
+                if self.options.auxfunc == "Gauss"
+                else None
+            )
+            self.ss_xi = float(xi)
+            fit_increment = 0 if fixed_sigma is not None else 1
+        else:
+            self.ss_sigmas = (
+                model_parameters[:, 1].copy()
+                if self.options.auxfunc == "Gauss"
+                else None
+            )
+            self.ss_xi = np.asarray(xi, dtype=float).copy()
+            fit_increment = 0 if fixed_sigma is not None else 6
+        self.ss_model_parameters = model_parameters.copy()
         self.ss_prepare_count += 1
-        if fixed_sigma is None:
-            self.ss_fit_count += 6
+        self.ss_fit_count += fit_increment
         if report_timing:
             logger.info(
                 self,
@@ -802,12 +1203,14 @@ class KRCCD_SS(KRCCD):
                 logger.process_clock() - cpu0,
                 logger.perf_counter() - wall0,
             )
-        return xi
+        return self.ss_xi
 
     def _ss_residual_coefficient(self, t2):
         if self.options.fixed_sigma is None or self.ss_xi is None:
             self._prepare_ss(t2)
         xi = self.ss_xi
+        if self.options.structure_factor_mode == "combined":
+            return -2.0 * xi
         return xi[0] + xi[1] - xi[2] - xi[3] - xi[4] - xi[5]
 
     def _inject_ss_residual(self, t2new, t2, eris):
@@ -857,5 +1260,6 @@ __all__ = [
     "KRCCD_SS",
     "KCCD_SS",
     "_fit_unit_gaussian",
+    "_fit_unit_quartic_exponential",
     "_line_samples",
 ]
