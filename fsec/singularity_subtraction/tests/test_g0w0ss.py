@@ -126,6 +126,65 @@ def test_gaussian_coefficients_cutoff_convergence_and_lattice_bound():
             assert np.array_equal(monkhorst_pack_shape(cell, cell.make_kpts(mesh)), mesh)
 
 
+def test_custom_gaussian_sigma_controls_analytic_and_reciprocal_terms():
+    """A custom inverse-Bohr width is used in every coefficient term."""
+    cell = _cell()
+    mesh = np.asarray([2, 1, 1])
+    sigma = 0.37
+    cutoff_sigma = 6.0
+    coefficients = compute_gaussian_coefficients(
+        cell, mesh=mesh, cutoff_sigma=cutoff_sigma, sigma=sigma
+    )
+    vectors = reciprocal_supercell_lattice(cell, mesh, cutoff_sigma * sigma)
+    q2 = np.einsum("gi,gi->g", vectors, vectors)
+    gaussian = np.exp(-q2 / (2.0 * sigma**2))
+
+    assert coefficients.sigma == sigma
+    np.testing.assert_allclose(
+        coefficients.head_integral, np.sqrt(2.0 / np.pi) * sigma
+    )
+    np.testing.assert_allclose(
+        coefficients.wing_integral,
+        np.sqrt(4.0 * np.pi * cell.vol) * sigma**2 / (2.0 * np.pi**2),
+    )
+    np.testing.assert_allclose(
+        coefficients.head_quadrature,
+        -4.0 * np.pi / (cell.vol * np.prod(mesh)) * np.sum(gaussian / q2),
+    )
+    np.testing.assert_allclose(
+        coefficients.wing_quadrature,
+        -np.sqrt(4.0 * np.pi * cell.vol) / (cell.vol * np.prod(mesh))
+        * np.sum(gaussian / np.sqrt(q2)),
+    )
+
+
+def test_none_gaussian_sigma_matches_geometry_derived_default():
+    """Explicit ``None`` retains the legacy geometry-derived coefficients."""
+    cell = _cell()
+    mesh = [2, 1, 1]
+    implicit = compute_gaussian_coefficients(cell, mesh=mesh)
+    explicit = compute_gaussian_coefficients(cell, mesh=mesh, sigma=None)
+    legacy_sigma = (6.0 * np.pi**2 / (cell.vol * np.prod(mesh))) ** (1.0 / 3.0)
+    assert explicit.sigma == legacy_sigma
+    assert explicit == implicit
+
+
+def test_gaussian_sigma_is_a_registered_writable_gw_option(reference_mf):
+    """The custom width is initialized and registered like PySCF options."""
+    gw = G0W0SS(reference_mf)
+    assert gw.gaussian_sigma is None
+    assert "gaussian_sigma" in gw._keys
+    gw.gaussian_sigma = 0.5
+    assert gw.gaussian_sigma == 0.5
+
+
+@pytest.mark.parametrize("sigma", [0.0, -0.37, np.nan, np.inf, -np.inf, [0.37]])
+def test_invalid_gaussian_sigma_is_rejected(sigma):
+    """Zero, negative, non-finite, and nonscalar widths fail clearly."""
+    with pytest.raises(ValueError, match="positive finite scalar"):
+        compute_gaussian_coefficients(_cell(), mesh=[1, 1, 1], sigma=sigma)
+
+
 def test_gaussian_radial_integrals_match_closed_forms():
     """The continuum radial integrals retain the head and wing factors."""
     cell = _cell()
@@ -214,6 +273,7 @@ def test_periodic_spherical_coefficients_reproduce_pyscf(reference_mf):
     )
 
     gw = _initialized_gw(G0W0SS, reference_mf)
+    gw.gaussian_sigma = 0.5
     sigma = compute_gaussian_coefficients(
         gw.mol, nkpts=gw.nkpts, mesh=monkhorst_pack_shape(gw.mol, gw.kpts)
     )
@@ -228,7 +288,32 @@ def test_periodic_spherical_coefficients_reproduce_pyscf(reference_mf):
     )
     gw.gaussian_coefficients = spherical
     actual, _ = get_sigma(gw, freqs, wts, ef, gw.mo_energy, orbs=[0, 1], kptlist=[0])
+    assert gw.gaussian_coefficients is spherical
     assert np.allclose(actual, expected, atol=1e-12, rtol=1e-11)
+
+
+def test_custom_sigma_kernel_uses_one_coefficient_for_correlation_and_exchange(reference_mf):
+    """The selected width controls corrected correlation and exchange terms."""
+    gw = _initialized_gw(G0W0SS, reference_mf)
+    gw.gaussian_sigma = 0.5
+    gw.nw = 32
+    gw.ac_pade_npts = 10
+    raw_exchange = gw.get_sigma_exchange()
+
+    gw.kernel(orbs=[0, 1], kptlist=[1])
+
+    expected = compute_gaussian_coefficients(
+        gw.mol,
+        nkpts=gw.nkpts,
+        mesh=monkhorst_pack_shape(gw.mol, gw.kpts),
+        sigma=gw.gaussian_sigma,
+    )
+    assert gw.gaussian_coefficients == expected
+    assert np.linalg.norm(gw.fc_sigma_head) > 0
+    assert np.linalg.norm(gw.fc_sigma_wing) > 0
+    expected_exchange = raw_exchange.copy()
+    expected_exchange[:, 0, 0] -= 2.0 / np.pi * expected.sigma
+    np.testing.assert_allclose(gw.vk, expected_exchange, atol=1e-12)
 
 
 def test_periodic_gaussian_head_wing_and_fullsigma(reference_mf):

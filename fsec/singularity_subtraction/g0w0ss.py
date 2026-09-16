@@ -178,6 +178,7 @@ def compute_gaussian_coefficients(
     mesh=None,
     cutoff_sigma=8.0,
     chunk_size=8192,
+    sigma=None,
 ):
     """Compute Gaussian head and wing coefficients.
 
@@ -195,6 +196,9 @@ def compute_gaussian_coefficients(
         Reciprocal-vector cutoff in units of the Gaussian width.
     chunk_size
         Maximum number of reciprocal vectors accumulated in one chunk.
+    sigma
+        Gaussian width in inverse Bohr.  If ``None``, use the geometry-derived
+        value ``(6*pi**2/(cell.vol*nkpts))**(1/3)``.
     """
     if mesh is None:
         if nkpts is None:
@@ -219,7 +223,24 @@ def compute_gaussian_coefficients(
         raise ValueError("cell volume must be positive")
 
     volume = float(cell.vol)
-    sigma = (6.0 * np.pi**2 / (volume * nk)) ** (1.0 / 3.0)
+    if sigma is None:
+        sigma = (6.0 * np.pi**2 / (volume * nk)) ** (1.0 / 3.0)
+    else:
+        sigma_error = "sigma must be a positive finite scalar in inverse Bohr"
+        try:
+            sigma_array = np.asarray(sigma)
+        except (TypeError, ValueError) as error:
+            raise ValueError(sigma_error) from error
+        if (sigma_array.ndim != 0 or np.iscomplexobj(sigma_array)
+                or np.issubdtype(sigma_array.dtype, np.bool_)
+                or sigma_array.dtype.kind in "SU"):
+            raise ValueError(sigma_error)
+        try:
+            sigma = float(sigma_array)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(sigma_error) from error
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError(sigma_error)
     cutoff = float(cutoff_sigma) * sigma
     sum_head = 0.0
     sum_wing = 0.0
@@ -241,6 +262,16 @@ def compute_gaussian_coefficients(
         wing_integral=wing_integral,
         wing_quadrature=wing_quadrature,
         wing=wing_integral + wing_quadrature,
+    )
+
+
+def _compute_gw_gaussian_coefficients(gw):
+    """Construct the Gaussian coefficients selected by a G0W0 object."""
+    return compute_gaussian_coefficients(
+        gw.mol,
+        nkpts=gw.nkpts,
+        mesh=monkhorst_pack_shape(gw.mol, gw.kpts),
+        sigma=getattr(gw, "gaussian_sigma", None),
     )
 
 
@@ -419,11 +450,7 @@ def get_sigma(
     q_abs = None
     if gw.fc:
         if gaussian is None:
-            gaussian = compute_gaussian_coefficients(
-                gw.mol,
-                nkpts=nkpts,
-                mesh=monkhorst_pack_shape(gw.mol, gw.kpts),
-            )
+            gaussian = _compute_gw_gaussian_coefficients(gw)
             gw.gaussian_coefficients = gaussian
         q_points = _finite_q_points(gw.fc_grid)
         q_abs = gw.mol.get_abs_kpts(q_points)
@@ -587,12 +614,9 @@ def kernel(gw):
 
     vk = gw.get_sigma_exchange()
     if gw.fc:
-        gw.gaussian_coefficients = compute_gaussian_coefficients(
-            gw.mol,
-            nkpts=nkpts,
-            mesh=monkhorst_pack_shape(gw.mol, gw.kpts),
-        )
-        vk_corr = -2.0 / np.pi * gw.gaussian_coefficients.sigma
+        gaussian = _compute_gw_gaussian_coefficients(gw)
+        gw.gaussian_coefficients = gaussian
+        vk_corr = -2.0 / np.pi * gaussian.sigma
         for k in range(nkpts):
             for i in range(nocc):
                 vk[k][i, i] += vk_corr
@@ -682,10 +706,18 @@ def kernel(gw):
 class G0W0SS(KRGWAC):
     """Periodic spin-restricted G0W0 with Gaussian finite-size correction.
 
-    With ``fc=True``, the auxiliary function is ``exp(-Q**2/(2*sigma**2))``
-    with ``sigma=(6*pi**2/(cell.vol*nkpts))**(1/3)`` in inverse Bohr.  The
+    With ``fc=True``, the auxiliary function is ``exp(-Q**2/(2*sigma**2))``.
+    Set ``gaussian_sigma`` to a positive finite scalar in inverse Bohr to
+    select the width.  Its default ``None`` uses
+    ``sigma=(6*pi**2/(cell.vol*nkpts))**(1/3)``.  The
     integral-minus-quadrature coefficients use all nonzero reciprocal
-    supercell vectors within ``8*sigma``.  Exchange retains PySCF's Eq. 46.
+    supercell vectors within ``8*sigma``, where ``sigma`` is the selected
+    width.  Exchange retains PySCF's Eq. 46.
+
+    The width is writable after construction, for example::
+
+        gw = G0W0SS(kmf)
+        gw.gaussian_sigma = 0.5  # inverse Bohr
 
     After a corrected calculation, ``gaussian_coefficients`` stores the
     width and separate signed integral/quadrature terms.  ``fc_eps_inv_00``
@@ -694,6 +726,20 @@ class G0W0SS(KRGWAC):
     additions of shape ``(len(kptlist), len(orbs), nw_sigma)``, even with
     ``fullsigma=True``.  Energies and self-energies are in hartree.
     """
+
+    def __init__(self, mf, frozen=None):
+        super().__init__(mf, frozen=frozen)
+        self.gaussian_sigma = None
+        self._keys.update(["gaussian_sigma"])
+
+    def dump_flags(self, verbose=None):
+        super().dump_flags(verbose=verbose)
+        log = logger.Logger(self.stdout, self.verbose)
+        log.info(
+            "Gaussian width = %s (inverse Bohr; None selects the geometry-derived width)",
+            self.gaussian_sigma,
+        )
+        return
 
     def kernel(self, orbs=None, kptlist=None):
         """Run G0W0, optionally selecting full-space orbitals and k-points."""

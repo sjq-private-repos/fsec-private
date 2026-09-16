@@ -3,15 +3,16 @@
 ## Usage and defaults
 
 For a three-dimensional, spin-restricted insulating calculation on a complete
-uniform k-point mesh, `G0W0SS` applies a geometry-derived Gaussian correction
-to the imaginary-axis self-energy before analytic continuation.  It uses
-PySCF's GDF integrals and has the same orbital, k-point, continuation, and
-quasiparticle controls as `KRGWAC`.  The API is tested with PySCF 2.14.
+uniform k-point mesh, `G0W0SS` applies a Gaussian correction to the
+imaginary-axis self-energy before analytic continuation.  It uses PySCF's GDF
+integrals and has the same orbital, k-point, continuation, and quasiparticle
+controls as `KRGWAC`.  The API is tested with PySCF 2.14.
 
 ```python
 from fsec.singularity_subtraction import G0W0SS
 
 gw = G0W0SS(kmf)
+gw.gaussian_sigma = 0.5  # inverse Bohr
 gw.nw = 80
 gw.kernel(orbs=[0, 1], kptlist=[0])
 print("G0W0 quasiparticle energies:", gw.mo_energy[0, [0, 1]])
@@ -19,13 +20,15 @@ print("G0W0 quasiparticle energies:", gw.mo_energy[0, [0, 1]])
 
 The default `fc_grid=False` follows the PySCF small-q direction; set it to
 `True` to invert and average all small-q directions separately.  Set
-`gw.fc = False` to retain PySCF's uncorrected self-energy path.  The Gaussian
-width is `sigma=(6*pi**2/(V*Nk))**(1/3)`, and the separate analytic and
-reciprocal-mesh head and wing coefficients are available as
-`gw.gaussian_coefficients`.  Its quadrature fields include the subtraction
-sign, so each total is `integral + quadrature`.  The Gaussian sum includes
-nonzero reciprocal-supercell vectors through `8*sigma`; there is no auxiliary
-function fitting.  Standard GW analytic-continuation fitting is retained.
+`gw.fc = False` to retain PySCF's uncorrected self-energy path.  By default,
+`gaussian_sigma=None` selects `sigma=(6*pi**2/(V*Nk))**(1/3)` in inverse Bohr;
+assigning a positive finite scalar to `gw.gaussian_sigma` selects a custom
+width.  The separate analytic and reciprocal-mesh head and wing coefficients
+are available as `gw.gaussian_coefficients`.  Its quadrature fields include
+the subtraction sign, so each total is `integral + quadrature`.  The Gaussian
+sum includes nonzero reciprocal-supercell vectors through `8*sigma`, where
+`sigma` is the selected width; there is no auxiliary function fitting.
+Standard GW analytic-continuation fitting is retained.
 Frequency-dependent dielectric limits and the
 separate head and wing self-energy additions are available as
 `gw.fc_eps_inv_00`, `gw.fc_eps_inv_p0`, `gw.fc_sigma_head`, and
@@ -44,12 +47,17 @@ Eq. 46.
 ### Gaussian coefficients
 
 Let $V=\Omega_{\mathrm{cell}}$ and $N_k$ be the number of k-points. Use the
-EXX Gaussian convention and the geometry-derived volume rule:
+EXX Gaussian convention.  For the default `gaussian_sigma=None`, the
+geometry-derived volume rule is:
 
 $$
 h(Q)=e^{-|Q|^2/(2\sigma^2)},\qquad
 \sigma=\left(\frac{6\pi^2}{VN_k}\right)^{1/3}.
 $$
+
+When `gaussian_sigma` is set, its positive finite inverse-Bohr value replaces
+this default in the auxiliary function, analytic integrals, reciprocal sum,
+and cutoff.
 
 For the periodized $Q=q+G$ mesh, define
 
@@ -99,7 +107,8 @@ $1/\pi$ normalization. All quantities use atomic units.
   inverse elements, correcting the upstream cumulative-head averaging error.
 - Infer the complete Monkhorst–Pack mesh shape independently of a common
   shift or ordering. Construct its unshifted reciprocal-supercell lattice
-  and include every nonzero vector within `8*sigma`. Derive enumeration
+  and include every nonzero vector within `8*sigma`, where `sigma` is the
+  selected Gaussian width. Derive enumeration
   bounds from the inverse reciprocal basis for skewed cells and evaluate
   sums in bounded chunks.
 - Apply corrections only to diagonal self-energy entries, including with
@@ -121,11 +130,14 @@ smeared occupations, mixed/FFT density fitting, and out-of-core self-energy
 evaluation. Frozen masks must be the same at every k-point.
 
 `fc=True` selects Gaussian correlation corrections plus Eq. 46;
-`fc=False` delegates to PySCF's uncorrected kernel. The Gaussian width is
-always geometry-derived; only standard analytic-continuation fitting remains.
+`fc=False` delegates to PySCF's uncorrected kernel. With `fc=True`,
+`gaussian_sigma=None` selects the geometry-derived width and a positive finite
+`gaussian_sigma` selects a custom width; only standard analytic-continuation
+fitting remains beyond the Gaussian correction.
 
 | Diagnostic | Contents |
 | --- | --- |
+| `gaussian_sigma` | Writable input width in inverse Bohr; `None` selects the geometry-derived default |
 | `gaussian_coefficients` | Width, separate signed integral/quadrature terms, and total head/wing coefficients |
 | `fc_eps_inv_00` | Inverse dielectric head, shape `(nw,)`, on `gw.freqs` |
 | `fc_eps_inv_p0` | Inverse dielectric wing, shape `(nw, naux)`, on `gw.freqs` |

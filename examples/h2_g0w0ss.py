@@ -25,6 +25,7 @@ if not kmf.converged:
     raise RuntimeError("Hartree-Fock calculation did not converge")
 
 gw = G0W0SS(kmf)
+gw.gaussian_sigma = 0.5  # inverse Bohr
 gw.kernel(orbs=[0, 1], kptlist=[0])
 print("Gaussian width:", gw.gaussian_coefficients.sigma)
 print("QP energies:", gw.mo_energy[0, [0, 1]])
