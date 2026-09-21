@@ -7,7 +7,7 @@ from scipy.integrate import quad
 from pyscf import lib
 from pyscf.ao2mo import _ao2mo
 from pyscf.ao2mo.incore import _conc_mos
-from pyscf.pbc import df, gto, scf
+from pyscf.pbc import df, gto, scf, tools
 from pyscf.pbc.gw import krgw_ac as pyscf_krgw_ac
 
 from fsec.singularity_subtraction import G0W0SS
@@ -176,6 +176,8 @@ def test_gaussian_sigma_is_a_registered_writable_gw_option(reference_mf):
     assert "gaussian_sigma" in gw._keys
     gw.gaussian_sigma = 0.5
     assert gw.gaussian_sigma == 0.5
+    assert gw.exchange_correction == "gaussian"
+    assert "exchange_correction" in gw._keys
 
 
 @pytest.mark.parametrize("sigma", [0.0, -0.37, np.nan, np.inf, -np.inf, [0.37]])
@@ -313,6 +315,26 @@ def test_custom_sigma_kernel_uses_one_coefficient_for_correlation_and_exchange(r
     assert np.linalg.norm(gw.fc_sigma_wing) > 0
     expected_exchange = raw_exchange.copy()
     expected_exchange[:, 0, 0] -= 2.0 / np.pi * expected.sigma
+    np.testing.assert_allclose(gw.vk, expected_exchange, atol=1e-12)
+
+
+def test_madelung_exchange_correction_does_not_use_gaussian_width(reference_mf):
+    """Madelung mode applies only the conventional Ewald exchange shift."""
+    gw = _initialized_gw(G0W0SS, reference_mf)
+    gw.gaussian_sigma = 0.5
+    gw.exchange_correction = "madelung"
+    gw.nw = 32
+    gw.ac_pade_npts = 10
+    raw_exchange = gw.get_sigma_exchange()
+
+    gw.kernel(orbs=[0, 1], kptlist=[1])
+
+    madelung = tools.madelung(gw.mol, gw.kpts)
+    expected_exchange = raw_exchange.copy()
+    for kpoint in range(gw.nkpts):
+        for orbital in range(gw.nocc):
+            expected_exchange[kpoint, orbital, orbital] -= madelung
+    assert gw.exchange_correction_value == pytest.approx(-madelung)
     np.testing.assert_allclose(gw.vk, expected_exchange, atol=1e-12)
 
 

@@ -45,7 +45,7 @@ from pyscf.ao2mo.incore import _conc_mos
 from pyscf.gw.utils.ac_grid import PadeAC, TwoPoleAC
 from pyscf.gw.utils.gw_np_helper import array_scale
 from pyscf.lib import einsum, logger, temporary_env
-from pyscf.pbc import df
+from pyscf.pbc import df, tools
 from pyscf.pbc.gw import krgw_ac as _pyscf_krgw_ac
 from pyscf.pbc.mp.kmp2 import get_frozen_mask
 
@@ -616,7 +616,17 @@ def kernel(gw):
     if gw.fc:
         gaussian = _compute_gw_gaussian_coefficients(gw)
         gw.gaussian_coefficients = gaussian
-        vk_corr = -2.0 / np.pi * gaussian.sigma
+        if gw.exchange_correction == "gaussian":
+            vk_corr = -2.0 / np.pi * gaussian.sigma
+        elif gw.exchange_correction == "madelung":
+            vk_corr = -tools.madelung(gw.mol, gw.kpts)
+        elif gw.exchange_correction is None:
+            vk_corr = 0.0
+        else:
+            raise ValueError(
+                "exchange_correction must be 'gaussian', 'madelung', or None"
+            )
+        gw.exchange_correction_value = float(vk_corr)
         for k in range(nkpts):
             for i in range(nocc):
                 vk[k][i, i] += vk_corr
@@ -712,7 +722,9 @@ class G0W0SS(KRGWAC):
     ``sigma=(6*pi**2/(cell.vol*nkpts))**(1/3)``.  The
     integral-minus-quadrature coefficients use all nonzero reciprocal
     supercell vectors within ``8*sigma``, where ``sigma`` is the selected
-    width.  Exchange retains PySCF's Eq. 46.
+    width.  ``exchange_correction='gaussian'`` retains PySCF's Eq. 46 by
+    default.  Set it to ``'madelung'`` to use the Ewald/Madelung occupied
+    exchange shift instead, or to ``None`` to omit an exchange correction.
 
     The width is writable after construction, for example::
 
@@ -730,7 +742,9 @@ class G0W0SS(KRGWAC):
     def __init__(self, mf, frozen=None):
         super().__init__(mf, frozen=frozen)
         self.gaussian_sigma = None
-        self._keys.update(["gaussian_sigma"])
+        self.exchange_correction = "gaussian"
+        self.exchange_correction_value = None
+        self._keys.update(["gaussian_sigma", "exchange_correction"])
 
     def dump_flags(self, verbose=None):
         super().dump_flags(verbose=verbose)
@@ -739,6 +753,7 @@ class G0W0SS(KRGWAC):
             "Gaussian width = %s (inverse Bohr; None selects the geometry-derived width)",
             self.gaussian_sigma,
         )
+        log.info("Exchange correction = %s", self.exchange_correction)
         return
 
     def kernel(self, orbs=None, kptlist=None):

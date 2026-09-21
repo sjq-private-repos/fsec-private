@@ -32,7 +32,9 @@ Standard GW analytic-continuation fitting is retained.
 Frequency-dependent dielectric limits and the
 separate head and wing self-energy additions are available as
 `gw.fc_eps_inv_00`, `gw.fc_eps_inv_p0`, `gw.fc_sigma_head`, and
-`gw.fc_sigma_wing`.  The PySCF exchange finite-size term (Eq. 46) is retained.
+`gw.fc_sigma_wing`.  The PySCF exchange finite-size term (Eq. 46) is retained
+by default; `gw.exchange_correction="madelung"` selects the conventional
+Madelung shift instead.
 Corrected calculations reject metallic or smeared occupations and out-of-core
 self-energy evaluation.  A complete runnable setup is in
 [`examples/h2_g0w0ss.py`](examples/h2_g0w0ss.py).
@@ -42,7 +44,7 @@ self-energy evaluation.  A complete runnable setup is in
 Replace the correlation head and wing corrections in Eqs. 44–45 of the
 Zhu–Chan G0W0 paper with Gaussian integral-minus-quadrature corrections,
 applied before analytic continuation. Retain the exchange correction in
-Eq. 46.
+Eq. 46 by default, with an explicit Madelung alternative.
 
 ### Gaussian coefficients
 
@@ -129,8 +131,12 @@ Reject unsupported corrected calculations explicitly, including metallic or
 smeared occupations, mixed/FFT density fitting, and out-of-core self-energy
 evaluation. Frozen masks must be the same at every k-point.
 
-`fc=True` selects Gaussian correlation corrections plus Eq. 46;
-`fc=False` delegates to PySCF's uncorrected kernel. With `fc=True`,
+`fc=True` selects Gaussian correlation corrections. The default
+`exchange_correction="gaussian"` also applies Eq. 46;
+`exchange_correction="madelung"` instead applies the conventional Ewald
+Madelung shift to occupied exchange matrix elements, without the Gaussian
+exchange correction. Set `exchange_correction=None` to omit an exchange
+correction. `fc=False` delegates to PySCF's uncorrected kernel. With `fc=True`,
 `gaussian_sigma=None` selects the geometry-derived width and a positive finite
 `gaussian_sigma` selects a custom width; only standard analytic-continuation
 fitting remains beyond the Gaussian correction.
@@ -138,6 +144,7 @@ fitting remains beyond the Gaussian correction.
 | Diagnostic | Contents |
 | --- | --- |
 | `gaussian_sigma` | Writable input width in inverse Bohr; `None` selects the geometry-derived default |
+| `exchange_correction` | `"gaussian"` (default), `"madelung"`, or `None` |
 | `gaussian_coefficients` | Width, separate signed integral/quadrature terms, and total head/wing coefficients |
 | `fc_eps_inv_00` | Inverse dielectric head, shape `(nw,)`, on `gw.freqs` |
 | `fc_eps_inv_p0` | Inverse dielectric wing, shape `(nw, naux)`, on `gw.freqs` |
