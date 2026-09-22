@@ -57,7 +57,7 @@ After reviewing Luna’s work, decide whether to:
 START THE LUNA AGENT WITH:
 
 codex exec \
-  -m gpt-5.6-luna \
+  -m gpt-6.0-luna \
   -c 'model_reasoning_effort="max"' \
   --ephemeral \
   -s workspace-write \
