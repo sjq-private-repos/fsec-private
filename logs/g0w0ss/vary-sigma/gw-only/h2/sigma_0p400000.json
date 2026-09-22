@@ -1,0 +1,32 @@
+{
+  "requested_correlation_sigma_inverse_bohr": 0.4,
+  "correlation_sigma_inverse_bohr": 0.4,
+  "exchange_sigma_inverse_bohr": 0.515611287713356,
+  "is_geometry_derived_default": false,
+  "qp_edge_energies_ev": [
+    [
+      -17.356495274734772,
+      13.083729833760914
+    ],
+    [
+      -16.512093483416507,
+      13.716613141437477
+    ]
+  ],
+  "vbm_ev": -16.512093483416507,
+  "vbm_kpoint_index": 1,
+  "cbm_ev": 13.083729833760914,
+  "cbm_kpoint_index": 0,
+  "indirect_gap_ev": 29.59582331717742,
+  "wall_time_seconds": 0.6212686710059643,
+  "correlation_gaussian_coefficients": {
+    "sigma": 0.4,
+    "head_integral": 0.3191538243211462,
+    "head_quadrature": -0.09782724669914357,
+    "head": 0.22132657762200264,
+    "wing_integral": 0.4223009410382838,
+    "wing_quadrature": -0.23078497148229993,
+    "wing": 0.19151596955598388
+  },
+  "log_file": "sigma_0p400000.log"
+}

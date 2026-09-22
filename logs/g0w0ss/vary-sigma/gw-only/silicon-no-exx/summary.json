@@ -1,0 +1,348 @@
+{
+  "system": "all-electron primitive silicon",
+  "source_configuration": "logs/g0w0/si_222_ae_g0w0_results.json",
+  "conventional_lattice_constant_angstrom": 5.43,
+  "basis": "cc-pVTZ",
+  "auxbasis": "cc-pVTZ-RI",
+  "mean_field": "PBE",
+  "kpoint_mesh": [
+    2,
+    2,
+    2
+  ],
+  "sweep_scope": "G0W0SS correlation only; ExxSS disabled",
+  "exchange_sigma_inverse_bohr": 0.0,
+  "geometry_derived_sigma_inverse_bohr": 0.30149142889615854,
+  "requested_correlation_sigmas_inverse_bohr": [
+    0.18089485733769511,
+    0.24119314311692686,
+    null,
+    0.36178971467539023,
+    0.4220880004546219
+  ],
+  "edge_orbitals_zero_based": [
+    13,
+    14
+  ],
+  "mean_field_total_energy_hartree": -578.7221328192087,
+  "mean_field_edge_energies_ev": [
+    [
+      7.807885963426032,
+      10.271235620278363
+    ],
+    [
+      6.546124537477353,
+      9.360478393029362
+    ],
+    [
+      6.546124537477631,
+      9.360478393029677
+    ],
+    [
+      4.841581447723758,
+      8.454190562822616
+    ],
+    [
+      6.546124537477524,
+      9.360478393029966
+    ],
+    [
+      4.841581447723891,
+      8.45419056282263
+    ],
+    [
+      4.841581447723323,
+      8.454190562823554
+    ],
+    [
+      6.546123738961021,
+      9.360411475312738
+    ]
+  ],
+  "nw": 100,
+  "ac_pade_npts": 18,
+  "qpe_linearized": false,
+  "total_sweep_wall_time_seconds": 2343.8845734950155,
+  "results": [
+    {
+      "requested_correlation_sigma_inverse_bohr": 0.18089485733769511,
+      "correlation_sigma_inverse_bohr": 0.18089485733769511,
+      "exchange_sigma_inverse_bohr": 0.0,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          11.429626432113318,
+          11.393872364408962
+        ],
+        [
+          10.074794733546796,
+          10.457848478231409
+        ],
+        [
+          10.074794733514059,
+          10.45784847825977
+        ],
+        [
+          8.436008581008396,
+          9.395823568625039
+        ],
+        [
+          10.074794733383134,
+          10.457848478251826
+        ],
+        [
+          8.436008581008275,
+          9.395823568631162
+        ],
+        [
+          8.436008581007385,
+          9.395823568634299
+        ],
+        [
+          10.074796437673157,
+          10.457896420831888
+        ]
+      ],
+      "vbm_ev": 11.429626432113318,
+      "vbm_kpoint_index": 0,
+      "cbm_ev": 9.395823568625039,
+      "cbm_kpoint_index": 3,
+      "indirect_gap_ev": -2.0338028634882797,
+      "wall_time_seconds": 475.73191024921834,
+      "correlation_gaussian_coefficients": {
+        "sigma": 0.18089485733769511,
+        "head_integral": 0.14433321379838385,
+        "head_quadrature": -0.002555597364085799,
+        "head": 0.14177761643429804,
+        "wing_integral": 0.09658188585321761,
+        "wing_quadrature": -0.006399624485330784,
+        "wing": 0.09018226136788683
+      },
+      "log_file": "sigma_0p180895.log"
+    },
+    {
+      "requested_correlation_sigma_inverse_bohr": 0.24119314311692686,
+      "correlation_sigma_inverse_bohr": 0.24119314311692686,
+      "exchange_sigma_inverse_bohr": 0.0,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          11.726967877563654,
+          11.059162855161906
+        ],
+        [
+          10.27454274770881,
+          10.032240885815506
+        ],
+        [
+          10.27454274789202,
+          10.03224088580681
+        ],
+        [
+          8.733300533608539,
+          9.030366451847849
+        ],
+        [
+          10.274542747215024,
+          10.032240885819343
+        ],
+        [
+          8.733300533608466,
+          9.030366451619862
+        ],
+        [
+          8.73330053360755,
+          9.030366451615189
+        ],
+        [
+          10.274461994705348,
+          10.032250573797196
+        ]
+      ],
+      "vbm_ev": 11.726967877563654,
+      "vbm_kpoint_index": 0,
+      "cbm_ev": 9.030366451615189,
+      "cbm_kpoint_index": 6,
+      "indirect_gap_ev": -2.696601425948465,
+      "wall_time_seconds": 450.02906773099676,
+      "correlation_gaussian_coefficients": {
+        "sigma": 0.24119314311692686,
+        "head_integral": 0.19244428506451183,
+        "head_quadrature": -0.018635218687537567,
+        "head": 0.17380906637697427,
+        "wing_integral": 0.17170113040572027,
+        "wing_quadrature": -0.04750561927683116,
+        "wing": 0.1241955111288891
+      },
+      "log_file": "sigma_0p241193.log"
+    },
+    {
+      "requested_correlation_sigma_inverse_bohr": null,
+      "correlation_sigma_inverse_bohr": 0.30149142889615854,
+      "exchange_sigma_inverse_bohr": 0.0,
+      "is_geometry_derived_default": true,
+      "qp_edge_energies_ev": [
+        [
+          11.88369037271988,
+          10.875641520369857
+        ],
+        [
+          10.76224723941686,
+          9.864613610386568
+        ],
+        [
+          10.76224723983719,
+          9.864613610397264
+        ],
+        [
+          8.894122870094346,
+          8.829190423711081
+        ],
+        [
+          10.762247239462969,
+          9.864613610410393
+        ],
+        [
+          8.894122870094284,
+          8.829190423703553
+        ],
+        [
+          8.894122870093378,
+          8.829190423710484
+        ],
+        [
+          10.762269561361673,
+          9.864624362815348
+        ]
+      ],
+      "vbm_ev": 11.88369037271988,
+      "vbm_kpoint_index": 0,
+      "cbm_ev": 8.829190423703553,
+      "cbm_kpoint_index": 5,
+      "indirect_gap_ev": -3.0544999490163267,
+      "wall_time_seconds": 457.37290636776015,
+      "correlation_gaussian_coefficients": {
+        "sigma": 0.30149142889615854,
+        "head_integral": 0.2405553563306398,
+        "head_quadrature": -0.04912713881074242,
+        "head": 0.19142821751989736,
+        "wing_integral": 0.26828301625893786,
+        "wing_quadrature": -0.12892561197291807,
+        "wing": 0.13935740428601978
+      },
+      "log_file": "sigma_0p301491.log"
+    },
+    {
+      "requested_correlation_sigma_inverse_bohr": 0.36178971467539023,
+      "correlation_sigma_inverse_bohr": 0.36178971467539023,
+      "exchange_sigma_inverse_bohr": 0.0,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          11.96633239994682,
+          10.774373278487165
+        ],
+        [
+          10.842799469957729,
+          9.767709607796577
+        ],
+        [
+          10.842799470480893,
+          9.767709607803834
+        ],
+        [
+          8.982448970279092,
+          8.726356370146846
+        ],
+        [
+          10.842799470275253,
+          9.767709607814789
+        ],
+        [
+          8.982448970279117,
+          8.726356370143177
+        ],
+        [
+          8.982448970278186,
+          8.726356370148299
+        ],
+        [
+          10.842809857082237,
+          9.76771328638406
+        ]
+      ],
+      "vbm_ev": 11.96633239994682,
+      "vbm_kpoint_index": 0,
+      "cbm_ev": 8.726356370143177,
+      "cbm_kpoint_index": 5,
+      "indirect_gap_ev": -3.2399760298036426,
+      "wall_time_seconds": 471.73469805018976,
+      "correlation_gaussian_coefficients": {
+        "sigma": 0.36178971467539023,
+        "head_integral": 0.2886664275967677,
+        "head_quadrature": -0.08747363302952396,
+        "head": 0.20119279456724373,
+        "wing_integral": 0.38632754341287046,
+        "wing_quadrature": -0.23994863721637266,
+        "wing": 0.1463789061964978
+      },
+      "log_file": "sigma_0p361790.log"
+    },
+    {
+      "requested_correlation_sigma_inverse_bohr": 0.4220880004546219,
+      "correlation_sigma_inverse_bohr": 0.4220880004546219,
+      "exchange_sigma_inverse_bohr": 0.0,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          12.014521578219826,
+          10.713436574028377
+        ],
+        [
+          10.891930533670484,
+          9.708371745236514
+        ],
+        [
+          10.891930533487447,
+          9.70837174524222
+        ],
+        [
+          9.035487258011983,
+          8.664232948446635
+        ],
+        [
+          10.891930533513722,
+          9.708371745246602
+        ],
+        [
+          9.035487258011973,
+          8.664232948445575
+        ],
+        [
+          9.035487258011095,
+          8.664232948447694
+        ],
+        [
+          10.891934673697676,
+          9.708372049102069
+        ]
+      ],
+      "vbm_ev": 12.014521578219826,
+      "vbm_kpoint_index": 0,
+      "cbm_ev": 8.664232948445575,
+      "cbm_kpoint_index": 5,
+      "indirect_gap_ev": -3.3502886297742513,
+      "wall_time_seconds": 488.9776569628157,
+      "correlation_gaussian_coefficients": {
+        "sigma": 0.4220880004546219,
+        "head_integral": 0.33677749886289565,
+        "head_quadrature": -0.12969112113017142,
+        "head": 0.20708637773272423,
+        "wing_integral": 0.5258347118675181,
+        "wing_quadrature": -0.3755539089734242,
+        "wing": 0.15028080289409385
+      },
+      "log_file": "sigma_0p422088.log"
+    }
+  ]
+}

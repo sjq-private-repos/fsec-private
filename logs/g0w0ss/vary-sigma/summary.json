@@ -1,0 +1,198 @@
+{
+  "system": "periodic H2",
+  "cell_bohr": [
+    [
+      6.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      6.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      6.0
+    ]
+  ],
+  "atom": "H 0 0 0; H 1.8 0 0",
+  "basis": "gth-szv",
+  "pseudopotential": "gth-hf",
+  "kpoint_mesh": [
+    1,
+    1,
+    2
+  ],
+  "nw": 32,
+  "ac_pade_npts": 10,
+  "geometry_derived_sigma_inverse_bohr": 0.515611287713356,
+  "mean_field_edge_energies_ev": [
+    [
+      -16.327274590207818,
+      12.780956770283693
+    ],
+    [
+      -15.457251818352415,
+      13.411018187459996
+    ]
+  ],
+  "results": [
+    {
+      "requested_sigma_inverse_bohr": 0.3,
+      "sigma_inverse_bohr": 0.3,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          -13.646278286264641,
+          13.087317647230156
+        ],
+        [
+          -12.803675725954072,
+          13.72020126111237
+        ]
+      ],
+      "vbm_ev": -12.803675725954072,
+      "vbm_kpoint_index": 1,
+      "cbm_ev": 13.087317647230156,
+      "cbm_kpoint_index": 0,
+      "indirect_gap_ev": 25.89099337318423,
+      "wall_time_seconds": 3.2774934633634984,
+      "gaussian_coefficients": {
+        "sigma": 0.3,
+        "head_integral": 0.2393653682408596,
+        "head_quadrature": -0.04671335458058308,
+        "head": 0.1926520136602765,
+        "wing_integral": 0.2375442793340346,
+        "wing_quadrature": -0.10241465386182619,
+        "wing": 0.13512962547220841
+      },
+      "log_file": "sigma_0p300000.log"
+    },
+    {
+      "requested_sigma_inverse_bohr": 0.4,
+      "sigma_inverse_bohr": 0.4,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          -15.365092459298145,
+          13.083729833761776
+        ],
+        [
+          -14.521625707370825,
+          13.716613141438001
+        ]
+      ],
+      "vbm_ev": -14.521625707370825,
+      "vbm_kpoint_index": 1,
+      "cbm_ev": 13.083729833761776,
+      "cbm_kpoint_index": 0,
+      "indirect_gap_ev": 27.605355541132603,
+      "wall_time_seconds": 3.2463678061030805,
+      "gaussian_coefficients": {
+        "sigma": 0.4,
+        "head_integral": 0.3191538243211462,
+        "head_quadrature": -0.09782724669914357,
+        "head": 0.22132657762200264,
+        "wing_integral": 0.4223009410382838,
+        "wing_quadrature": -0.23078497148229993,
+        "wing": 0.19151596955598388
+      },
+      "log_file": "sigma_0p400000.log"
+    },
+    {
+      "requested_sigma_inverse_bohr": null,
+      "sigma_inverse_bohr": 0.515611287713356,
+      "is_geometry_derived_default": true,
+      "qp_edge_energies_ev": [
+        [
+          -17.353140093811675,
+          13.08044443380926
+        ],
+        [
+          -16.508737347651934,
+          13.713327461175881
+        ]
+      ],
+      "vbm_ev": -16.508737347651934,
+      "vbm_kpoint_index": 1,
+      "cbm_ev": 13.08044443380926,
+      "cbm_kpoint_index": 0,
+      "indirect_gap_ev": 29.589181781461193,
+      "wall_time_seconds": 3.231963549274951,
+      "gaussian_coefficients": {
+        "sigma": 0.515611287713356,
+        "head_integral": 0.4113982858421709,
+        "head_quadrature": -0.16380899386205391,
+        "head": 0.247589291980117,
+        "wing_integral": 0.7016926042943222,
+        "wing_quadrature": -0.45071451807638485,
+        "wing": 0.2509780862179374
+      },
+      "log_file": "sigma_0p515611.log"
+    },
+    {
+      "requested_sigma_inverse_bohr": 0.6,
+      "sigma_inverse_bohr": 0.6,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          -18.805076566312003,
+          13.0787939380951
+        ],
+        [
+          -17.960029777360706,
+          13.711676824673228
+        ]
+      ],
+      "vbm_ev": -17.960029777360706,
+      "vbm_kpoint_index": 1,
+      "cbm_ev": 13.0787939380951,
+      "cbm_kpoint_index": 0,
+      "indirect_gap_ev": 31.038823715455806,
+      "wall_time_seconds": 3.2295824643224478,
+      "gaussian_coefficients": {
+        "sigma": 0.6,
+        "head_integral": 0.4787307364817192,
+        "head_quadrature": -0.21794592895619253,
+        "head": 0.2607848075255267,
+        "wing_integral": 0.9501771173361384,
+        "wing_quadrature": -0.6719742685284105,
+        "wing": 0.27820284880772794
+      },
+      "log_file": "sigma_0p600000.log"
+    },
+    {
+      "requested_sigma_inverse_bohr": 0.7,
+      "sigma_inverse_bohr": 0.7,
+      "is_geometry_derived_default": false,
+      "qp_edge_energies_ev": [
+        [
+          -20.52632289698287,
+          13.077477686923704
+        ],
+        [
+          -19.680552162647988,
+          13.710360461238926
+        ]
+      ],
+      "vbm_ev": -19.680552162647988,
+      "vbm_kpoint_index": 1,
+      "cbm_ev": 13.077477686923704,
+      "cbm_kpoint_index": 0,
+      "indirect_gap_ev": 32.75802984957169,
+      "wall_time_seconds": 3.2469014758244157,
+      "gaussian_coefficients": {
+        "sigma": 0.7,
+        "head_integral": 0.5585191925620058,
+        "head_quadrature": -0.287210232080518,
+        "head": 0.2713089604814878,
+        "wing_integral": 1.2932966319297436,
+        "wing_quadrature": -0.9963218591577638,
+        "wing": 0.2969747727719798
+      },
+      "log_file": "sigma_0p700000.log"
+    }
+  ]
+}

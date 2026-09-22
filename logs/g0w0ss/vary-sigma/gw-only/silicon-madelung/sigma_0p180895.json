@@ -1,0 +1,58 @@
+{
+  "requested_correlation_sigma_inverse_bohr": 0.18089485733769511,
+  "correlation_sigma_inverse_bohr": 0.18089485733769511,
+  "exchange_sigma_inverse_bohr": null,
+  "exchange_correction": "madelung",
+  "madelung_exchange_correction_hartree": -0.22340741480961618,
+  "is_geometry_derived_default": false,
+  "qp_edge_energies_ev": [
+    [
+      6.5465108206360405,
+      11.393872364409004
+    ],
+    [
+      5.244748953499303,
+      10.45784847823173
+    ],
+    [
+      5.244748953737119,
+      10.457848478258475
+    ],
+    [
+      3.5564659909031104,
+      9.39582356862543
+    ],
+    [
+      5.244748953906037,
+      10.45784847825178
+    ],
+    [
+      3.556465990898727,
+      9.395823568631194
+    ],
+    [
+      3.5564659908984986,
+      9.39582356863428
+    ],
+    [
+      5.2447635678941635,
+      10.457896420829893
+    ]
+  ],
+  "vbm_ev": 6.5465108206360405,
+  "vbm_kpoint_index": 0,
+  "cbm_ev": 9.39582356862543,
+  "cbm_kpoint_index": 3,
+  "indirect_gap_ev": 2.849312747989389,
+  "wall_time_seconds": 567.9063518550247,
+  "correlation_gaussian_coefficients": {
+    "sigma": 0.18089485733769511,
+    "head_integral": 0.14433321379838385,
+    "head_quadrature": -0.002555597364085799,
+    "head": 0.14177761643429804,
+    "wing_integral": 0.09658188585321761,
+    "wing_quadrature": -0.006399624485330784,
+    "wing": 0.09018226136788683
+  },
+  "log_file": "sigma_0p180895.log"
+}
