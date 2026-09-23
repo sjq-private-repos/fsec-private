@@ -7,7 +7,10 @@ import time
 from fsec.singularity_subtraction import model_function
 from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
-from fsec.singularity_subtraction.structure_factor.mp2_smallq import MP2SmallQ
+from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
+    MP2SmallQ,
+    MP2SmallQOptions,
+)
 from fsec.singularity_subtraction.grids import MP2SSGrids
 from fsec.singularity_subtraction import SingularitySubtraction
 from pyscf.pbc import df
@@ -170,13 +173,9 @@ class MP2SSOptions:
         PySCF logging verbosity. ``None`` inherits ``kmp.verbose``. At
         ``pyscf.lib.logger.DEBUG`` the final structure-factor table and other
         debug diagnostics are written to the inherited PySCF output stream.
-    smallq_band_df
-        Density-fitting backend used for the half-shifted non-SCF bands.
-        Supported values are ``"FFTDF"`` and ``"GDF"``. ``None`` disables
-        the small-q fitting point.
-    smallq_band_exxdiv
-        Exchange-divergence treatment used only for the half-shifted bands
-        calculation. GDF supports only ``None`` and ``"ewald"``.
+    smallq
+        Optional :class:`MP2SmallQOptions` that adds one sTC virtual-band
+        point to the direct fit. ``None`` disables the small-q point.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
@@ -216,8 +215,7 @@ class MP2SSOptions:
     pair_density_eval_grid: str = 'becke'
     pair_density_becke_grid_level: int = 0
     verbose: Optional[int] = None
-    smallq_band_df: Optional[str] = None
-    smallq_band_exxdiv: Optional[str] = 'ewald'
+    smallq: Optional[MP2SmallQOptions] = None
     correct_q2_q4_separately: bool = True
 
     def __post_init__(self):
@@ -230,25 +228,11 @@ class MP2SSOptions:
         )
         if pair_density_becke_grid_level < 0:
             raise ValueError("pair_density_becke_grid_level must be non-negative")
-        smallq_band_df = self.smallq_band_df
-        if smallq_band_df is not None:
-            smallq_band_df = str(smallq_band_df).strip().upper()
-            if smallq_band_df not in ('FFTDF', 'GDF'):
-                raise ValueError(
-                    "smallq_band_df must be None, 'FFTDF', or 'GDF'"
-                )
-        smallq_band_exxdiv = self.smallq_band_exxdiv
-        if isinstance(smallq_band_exxdiv, str):
-            smallq_band_exxdiv = smallq_band_exxdiv.strip().lower()
-        if (
-            smallq_band_df == 'GDF'
-            and smallq_band_exxdiv is not None
-            and str(smallq_band_exxdiv).strip().lower() != 'ewald'
-        ):
-            raise ValueError(
-                "GDF bands only support smallq_band_exxdiv=None or 'ewald'; "
-                f"got {smallq_band_exxdiv!r}"
-            )
+        smallq = self.smallq
+        if isinstance(smallq, dict):
+            smallq = MP2SmallQOptions(**smallq)
+        elif smallq is not None and not isinstance(smallq, MP2SmallQOptions):
+            raise TypeError("smallq must be MP2SmallQOptions, dict, or None")
         laplace_direct_tol = float(self.laplace_direct_tol)
         laplace_direct_max_points = int(self.laplace_direct_max_points)
         if not np.isfinite(laplace_direct_tol) or laplace_direct_tol <= 0:
@@ -273,10 +257,7 @@ class MP2SSOptions:
             'pair_density_becke_grid_level',
             pair_density_becke_grid_level,
         )
-        object.__setattr__(self, 'smallq_band_df', smallq_band_df)
-        object.__setattr__(
-            self, 'smallq_band_exxdiv', smallq_band_exxdiv
-        )
+        object.__setattr__(self, 'smallq', smallq)
         object.__setattr__(self, 'laplace_direct_tol', laplace_direct_tol)
         object.__setattr__(
             self, 'laplace_direct_max_points', laplace_direct_max_points)
@@ -1115,8 +1096,7 @@ class MP2SS:
         self.verbose = (
             kmp.verbose if options.verbose is None else options.verbose)
         self.stdout = kmp.stdout
-        self.smallq_band_df = options.smallq_band_df
-        self.smallq_band_exxdiv = options.smallq_band_exxdiv
+        self.smallq = options.smallq
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
@@ -1243,15 +1223,13 @@ class MP2SS:
             convert_t2_to_kikjq_format(mp2_structure_factor.t2, kpts, qGrid, self.cell)
 
         self.smallq_result = None
-        if direct and self.smallq_band_df is not None:
+        if direct and self.smallq is not None:
             smallq = MP2SmallQ(
                 self.kmf,
                 self.kmp,
-                band_df=self.smallq_band_df,
-                band_exxdiv=self.smallq_band_exxdiv,
+                options=self.smallq,
                 N_local=self.N_local,
                 sq_ke_cutoff=self.sq_ke_cutoff,
-                check_trs=self.check_trs,
                 pair_density_eval_grid=self.pair_density_eval_grid,
                 pair_density_becke_grid_level=self.pair_density_becke_grid_level,
                 sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,

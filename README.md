@@ -69,6 +69,57 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## MP2 small-q fitting point
+
+For a converged restricted `kmf` and its ordinary-Coulomb `kmp`, enable one
+additional direct fitting point with:
+
+```python
+from fsec.singularity_subtraction import MP2SS, MP2SSOptions
+from fsec.singularity_subtraction.structure_factor import (
+    MP2SmallQ, MP2SmallQOptions,
+)
+
+smallq = MP2SmallQOptions(relative_shift=(0.0, 0.0, 0.1), eta=4.0, cutoff="ws")
+_, t2 = kmp.kernel(with_t2=True)
+calculation = MP2SS(kmf, kmp, t2=t2, options=MP2SSOptions(smallq=smallq))
+correction = calculation.compute_correction()
+
+# The extra point can also be calculated independently of MP2SS.
+point = MP2SmallQ(kmf, kmp, options=smallq).kernel()
+print(point.qprime, point.sq_direct, point.sq_q4)
+```
+
+See [the runnable H2 example](examples/h2_mp2_smallq.py). The PySCF installation
+must provide `pyscf.pbc.df.rsdf_stc`, as the local `fsec-312` environment does.
+This extension is checked when generating the small-q bands; ordinary MP2SS
+remains usable without it.
+
+The shift is a fraction of the original k-mesh spacing:
+`qprime = cell.get_abs_kpts(relative_shift / nks)`, in inverse Bohr. It must be
+nonzero, with each component in `[-0.5, 0.5]`. The default shift is
+`(0.5, 0.5, 0.5)`. The calculation supports three-dimensional restricted
+systems on complete regular k meshes. `cutoff="ws"` selects Wigner–Seitz
+truncation; `"sph"` selects spherical truncation. The dimensionless smoothing
+parameter defaults to `eta=4.0`; PySCF derives the range-separation parameter
+from `eta` and the cutoff radius of the original SCF mesh.
+
+Only the shifted virtual bands are recomputed, using the original SCF density,
+smoothed truncated Coulomb exchange, and ordinary-Coulomb Hartree. Occupied
+coefficients and energies come from KMP2, including supplied energy shifts.
+These occupied and virtual spaces can therefore come from different Fock
+operators, and their overlap need not vanish as q approaches zero.
+
+The standalone module uses separate ordinary GDF correlation integrals and
+explicit energy denominators. It retains Becke/uniform pair-density quadrature
+and accepts the existing grid controls. MP2SS forwards its grid settings and
+uses the extra point only for fitting. Correlation integral storage uses the
+full ordinary GDF build in this first version; the main MP2SS Laplace and
+amplitude-storage settings do not control the small-q calculation.
+
+`MP2SSOptions.smallq=None` disables the feature. The experimental
+`smallq_band_df` and `smallq_band_exxdiv` options have been replaced by `smallq`.
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,

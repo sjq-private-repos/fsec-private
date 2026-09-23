@@ -1,5 +1,10 @@
 # TRS- and AO-Symmetry-Aware Selective Lov GDF
 
+This is a historical design and benchmark record for the previous small-q
+implementation. The current [standalone RSDF-sTC implementation](README.md#mp2-small-q-fitting-point)
+uses a full ordinary GDF correlation build and explicit denominators; it no
+longer uses the selective builders described below.
+
 ## Summary
 
 PySCF 2.13.1 does not use its fastest symmetry path when a custom
