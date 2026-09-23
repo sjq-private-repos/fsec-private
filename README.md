@@ -91,24 +91,61 @@ print(point.qprime, point.sq_direct, point.sq_q4)
 ```
 
 See [the runnable H2 example](examples/h2_mp2_smallq.py). The PySCF installation
-must provide `pyscf.pbc.df.rsdf_stc`, as the local `fsec-312` environment does.
-This extension is checked when generating the small-q bands; ordinary MP2SS
-remains usable without it.
+must provide `pyscf.pbc.df.rsdf_stc` when the default sTC band backend is
+selected. The extension is imported only for that backend; FFTDF small-q bands
+do not require it.
 
 The shift is a fraction of the original k-mesh spacing:
 `qprime = cell.get_abs_kpts(relative_shift / nks)`, in inverse Bohr. It must be
 nonzero, with each component in `[-0.5, 0.5]`. The default shift is
 `(0.5, 0.5, 0.5)`. The calculation supports three-dimensional restricted
 systems on complete regular k meshes. `cutoff="ws"` selects Wigner–Seitz
-truncation; `"sph"` selects spherical truncation. The dimensionless smoothing
-parameter defaults to `eta=4.0`; PySCF derives the range-separation parameter
-from `eta` and the cutoff radius of the original SCF mesh.
+truncation; `"sph"` selects spherical truncation. The default band backend is
+`band_backend="rsdf_stc"`; its dimensionless smoothing parameter defaults to
+`eta=4.0`, and PySCF derives the range-separation parameter from `eta` and the
+cutoff radius of the original SCF mesh. Set `band_backend="fftdf"` to use
+standard PySCF FFTDF bands; this backend requires `cutoff="sph"` and accepts an
+optional three-integer `fft_mesh`. When omitted, FFTDF receives a copy of
+`cell.mesh`, independently of the source GDF mesh and pair-density quadrature.
+The result reports the selected backend, the effective FFT mesh when used,
+and active virtual energies on the ordered `k+q` and `k-q` grids. Those energy
+tuples omit frozen and padded orbitals, and FFTDF results report `eta=None`.
 
-Only the shifted virtual bands are recomputed, using the original SCF density,
-smoothed truncated Coulomb exchange, and ordinary-Coulomb Hartree. Occupied
-coefficients and energies come from KMP2, including supplied energy shifts.
-These occupied and virtual spaces can therefore come from different Fock
-operators, and their overlap need not vanish as q approaches zero.
+Finite-eta sTC uses a smoothed Coulomb truncation. FFTDF applies sharp
+spherical exchange truncation and changes the numerical core and Hartree
+evaluation through standard FFTDF. Their small-q values are therefore not
+expected to be equal, and increasing `eta` is not guaranteed to improve the
+sTC values monotonically. The optional
+[H2 comparison example](examples/h2_mp2_smallq_compare.py) uses one reference
+SCF/KMP2 calculation and compares sTC `eta=4,8` with FFTDF meshes `25^3`,
+`33^3`, and `49^3` by default:
+
+```bash
+python examples/h2_mp2_smallq_compare.py
+```
+
+The two band treatments can be selected directly:
+
+```python
+stc_options = MP2SmallQOptions(
+    relative_shift=(0.0, 0.0, 0.1), eta=4.0, cutoff="sph"
+)
+fft_options = MP2SmallQOptions(
+    relative_shift=(0.0, 0.0, 0.1),
+    band_backend="fftdf",
+    cutoff="sph",
+    fft_mesh=(33, 33, 33),
+)
+```
+
+The comparison example also accepts `--fft-meshes 17 25 33` and
+`--etas 3 6` overrides.
+
+Only the shifted virtual bands are recomputed, using the original SCF density
+and selected band backend. Occupied coefficients and energies come from KMP2,
+including supplied energy shifts. These occupied and virtual spaces can
+therefore come from different Fock operators, and their overlap need not
+vanish as q approaches zero.
 
 The standalone module uses separate ordinary GDF correlation integrals and
 explicit energy denominators. It retains Becke/uniform pair-density quadrature

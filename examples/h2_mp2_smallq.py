@@ -5,6 +5,7 @@ energies are retained; the extra point uses ordinary GDF correlation ERIs.
 """
 
 import numpy as np
+from pyscf.lib import logger
 from pyscf.pbc import gto, mp, scf
 
 from fsec.singularity_subtraction.structure_factor import (
@@ -21,7 +22,7 @@ cell = gto.M(
     pseudo="gth-hf",
     mesh=np.array([17, 17, 17]),
     precision=1e-8,
-    verbose=0,
+    verbose=logger.DEBUG,
 )
 kpts = cell.make_kpts([1, 1, 2], wrap_around=True)
 kmf = scf.KRHF(cell, kpts, exxdiv="ewald").density_fit()

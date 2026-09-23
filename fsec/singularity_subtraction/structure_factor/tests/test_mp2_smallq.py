@@ -182,6 +182,25 @@ class MP2SmallQOptionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MP2SmallQOptions(cutoff="ewald")
 
+    def test_fft_backend_requires_spherical_cutoff_and_valid_mesh(self):
+        """FFTDF uses spherical truncation and accepts an independent mesh."""
+        with self.assertRaisesRegex(ValueError, "requires cutoff='sph'"):
+            MP2SmallQOptions(band_backend="fftdf")
+        options = MP2SmallQOptions(
+            band_backend="FFTDF", cutoff="SPH", fft_mesh=(13, 15, 17),
+            eta=None,
+        )
+        self.assertEqual(options.band_backend, "fftdf")
+        self.assertEqual(options.fft_mesh, (13, 15, 17))
+        self.assertIsNone(options.eta)
+        for mesh in ((9, 9), (9, 0, 9), (9, 9.5, 9)):
+            with self.subTest(mesh=mesh), self.assertRaises(ValueError):
+                MP2SmallQOptions(
+                    band_backend="fftdf", cutoff="sph", fft_mesh=mesh
+                )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            MP2SmallQOptions(fft_mesh=(9, 9, 9))
+
     def test_mp2ss_smallq_is_opt_in_and_old_backend_options_are_removed(self):
         """The new configuration is optional and replaces backend switches."""
         self.assertIsNone(MP2SSOptions().smallq)
@@ -210,8 +229,9 @@ class MP2SmallQScientificTests(unittest.TestCase):
         cls.kmp.with_df_ints = True
         cls.kmp.kernel(with_t2=False)
 
-    def _compare_to_explicit_driver(self, pair_grid):
-        options = MP2SmallQOptions(relative_shift=(0.0, 0.0, 0.5))
+    def _compare_to_explicit_driver(self, pair_grid, options=None):
+        if options is None:
+            options = MP2SmallQOptions(relative_shift=(0.0, 0.0, 0.5))
         N_local = (7, 7, 7)
         (
             smallq,
@@ -275,8 +295,22 @@ class MP2SmallQScientificTests(unittest.TestCase):
                 rtol=2e-8,
                 atol=2e-11,
             )
-            self.assertEqual(shifted_result.cutoff, "ws")
-            self.assertEqual(shifted_result.eta, 4.0)
+            self.assertEqual(shifted_result.cutoff, options.cutoff)
+            self.assertEqual(shifted_result.band_backend, options.band_backend)
+            self.assertEqual(
+                shifted_result.eta,
+                options.eta
+                if options.band_backend == "rsdf_stc"
+                else None,
+            )
+            self.assertEqual(
+                shifted_result.fft_mesh,
+                options.fft_mesh
+                if options.band_backend == "fftdf"
+                else None,
+            )
+            self.assertTrue(shifted_result.active_virtual_energies_plus)
+            self.assertTrue(shifted_result.active_virtual_energies_minus)
             self.assertEqual(shifted_result.qprime[2] > 0, True)
         finally:
             handle = ordinary_df._cderi_to_save
@@ -290,6 +324,163 @@ class MP2SmallQScientificTests(unittest.TestCase):
     def test_becke_pair_density_matches_explicit_ki_driver(self):
         """Becke quadrature uses the same pair-density and normalization rules."""
         self._compare_to_explicit_driver("becke")
+
+    def test_fft_uniform_pair_density_matches_explicit_ki_driver(self):
+        """FFTDF bands contract with the same explicit MP2 denominators."""
+        options = MP2SmallQOptions(
+            relative_shift=(0.0, 0.0, 0.1),
+            cutoff="sph",
+            band_backend="fftdf",
+            fft_mesh=(11, 13, 15),
+            eta=None,
+        )
+        self._compare_to_explicit_driver("uniform", options)
+
+    def test_fft_becke_pair_density_matches_explicit_ki_driver(self):
+        """FFTDF supports Becke pair-density quadrature as well as uniform."""
+        options = MP2SmallQOptions(
+            relative_shift=(0.0, 0.0, 0.1),
+            cutoff="sph",
+            band_backend="fftdf",
+            fft_mesh=(11, 13, 15),
+        )
+        self._compare_to_explicit_driver("becke", options)
+
+    def test_fft_bands_match_independent_builder_and_mesh_is_independent(self):
+        """FFTDF bands use the original SCF grid and keep its mesh detached."""
+        source_df = self.kmf.with_df
+        original_mesh_value = source_df.mesh
+        original_mesh = (
+            None
+            if original_mesh_value is None
+            else np.asarray(original_mesh_value).copy()
+        )
+        original_cderi = source_df._cderi
+        original_auxcell = source_df.auxcell
+        original_exxdiv = self.kmf.exxdiv
+        original_rsjk = getattr(self.kmf, "rsjk", None)
+        original_eri = self.kmf._eri
+        energy_before = [np.asarray(x).copy() for x in self.kmp.mo_energy]
+        coeff_before = [np.asarray(x).copy() for x in self.kmp.mo_coeff]
+        rsjk_sentinel = object()
+        eri_sentinel = object()
+        source_df.mesh = np.asarray((7, 7, 7))
+        self.kmf.rsjk = rsjk_sentinel
+        self.kmf._eri = eri_sentinel
+        options = MP2SmallQOptions(
+            relative_shift=(0.17, -0.1, 0.23),
+            cutoff="sph",
+            band_backend="fftdf",
+        )
+        calc = MP2SmallQ(self.kmf, self.kmp, options, N_local=(5, 5, 5))
+        grids = calc._build_grids()
+        band_kpts = np.concatenate((grids.plus, grids.minus), axis=0)
+        band_mf, fft_df, j_df = calc._make_band_mean_field(band_kpts)
+        try:
+            expected_mesh = np.asarray(self.cell.mesh).copy()
+            np.testing.assert_array_equal(fft_df.mesh, expected_mesh)
+            self.assertFalse(np.shares_memory(fft_df.mesh, self.cell.mesh))
+            np.testing.assert_array_equal(source_df.mesh, (7, 7, 7))
+            self.assertEqual(band_mf.exxdiv, "vcut_sph")
+            self.assertIsNone(band_mf.rsjk)
+            self.assertIsNone(band_mf._eri)
+            np.testing.assert_array_equal(fft_df.kpts, self.kmf.kpts)
+
+            reference_mf = self.kmf.copy()
+            reference_fft = df.FFTDF(self.cell, self.kmf.kpts)
+            reference_fft.mesh = expected_mesh.copy()
+            reference_fft.build()
+            reference_mf.with_df = reference_fft
+            reference_mf.exxdiv = "vcut_sph"
+            reference_mf.rsjk = None
+            reference_mf._eri = None
+            dm_kpts = self.kmf.make_rdm1()
+            energy, coeff = band_mf.get_bands(
+                band_kpts, dm_kpts=dm_kpts, kpts=self.kmf.kpts
+            )
+            ref_energy, ref_coeff = reference_mf.get_bands(
+                band_kpts, dm_kpts=dm_kpts, kpts=self.kmf.kpts
+            )
+            np.testing.assert_allclose(energy, ref_energy, atol=1e-11)
+            overlap = self.kmf.get_ovlp(kpts=band_kpts)
+            for actual, expected, s1e in zip(coeff, ref_coeff, overlap):
+                mo_overlap = actual.conj().T @ s1e @ expected
+                np.testing.assert_allclose(
+                    np.abs(mo_overlap), np.eye(mo_overlap.shape[0]), atol=1e-7
+                )
+            self.assertIs(self.kmf.with_df, source_df)
+            self.assertEqual(source_df._cderi, original_cderi)
+            self.assertIs(source_df.auxcell, original_auxcell)
+            self.assertEqual(self.kmf.exxdiv, original_exxdiv)
+            self.assertIs(self.kmf.rsjk, rsjk_sentinel)
+            self.assertIs(self.kmf._eri, eri_sentinel)
+            for actual, expected in zip(self.kmp.mo_energy, energy_before):
+                np.testing.assert_array_equal(actual, expected)
+            for actual, expected in zip(self.kmp.mo_coeff, coeff_before):
+                np.testing.assert_array_equal(actual, expected)
+        finally:
+            source_df.mesh = original_mesh_value
+            self.kmf.exxdiv = original_exxdiv
+            self.kmf.rsjk = original_rsjk
+            self.kmf._eri = original_eri
+            for obj in (j_df, fft_df):
+                handle = getattr(obj, "_cderi_to_save", None)
+                if handle is not None and not isinstance(handle, str) and not handle.closed:
+                    handle.close()
+        self.assertIs(self.kmf.with_df, source_df)
+        self.assertEqual(source_df._cderi, original_cderi)
+        self.assertIs(source_df.auxcell, original_auxcell)
+        if original_mesh is None:
+            self.assertIsNone(source_df.mesh)
+        else:
+            np.testing.assert_array_equal(source_df.mesh, original_mesh)
+
+    def test_fft_backend_does_not_import_stc_extension(self):
+        """Selecting FFTDF never imports the optional rsdf_stc extension."""
+        import builtins
+
+        options = MP2SmallQOptions(
+            cutoff="sph", band_backend="fftdf", fft_mesh=(9, 9, 9)
+        )
+        calc = MP2SmallQ(self.kmf, self.kmp, options, N_local=(3, 3, 3))
+        grids = calc._build_grids()
+        real_import = builtins.__import__
+
+        def reject_stc(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "pyscf.pbc.df" and "rsdf_stc" in fromlist:
+                raise AssertionError("FFTDF attempted to import rsdf_stc")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=reject_stc):
+            result = calc.kernel()
+        self.assertEqual(result.band_backend, "fftdf")
+        self.assertIsNone(result.eta)
+
+    def test_fft_band_energies_converge_on_refined_h2_meshes(self):
+        """The H2 FFTDF virtual bands stabilize from 25^3 to 49^3."""
+        shift = (0.0, 0.0, 0.1)
+        sampled_energies = []
+        for mesh_size in (25, 33, 49):
+            options = MP2SmallQOptions(
+                relative_shift=shift,
+                cutoff="sph",
+                band_backend="fftdf",
+                fft_mesh=(mesh_size,) * 3,
+            )
+            calc = MP2SmallQ(self.kmf, self.kmp, options, N_local=(5, 5, 5))
+            grids = calc._build_grids()
+            (energy_plus, _), (energy_minus, _) = calc._get_shifted_bands(grids)
+            virtual = [
+                np.asarray(energy)[self.kmp.nocc:]
+                for energy in energy_plus + energy_minus
+            ]
+            sampled_energies.append(np.concatenate(virtual))
+
+        coarse_error = np.linalg.norm(sampled_energies[0] - sampled_energies[-1])
+        fine_error = np.linalg.norm(sampled_energies[1] - sampled_energies[-1])
+        self.assertTrue(np.all(np.isfinite(sampled_energies)))
+        self.assertLess(fine_error, coarse_error)
+        self.assertLess(fine_error, 1e-5)  # Hartree
 
     def test_stc_virtual_bands_match_independent_pyscf_builder(self):
         """Stored sTC bands use the original SCF k-mesh cutoff anchor."""
@@ -531,6 +722,83 @@ class MP2SmallQUnwrappedKPointTests(unittest.TestCase):
 
         self.assertTrue(np.isfinite(result.sq_direct))
         self.assertTrue(np.isfinite(result.sq_q4))
+
+    def test_unwrapped_fft_smallq_preserves_frozen_virtual_mask(self):
+        """FFTDF explicit contractions omit the frozen shifted virtual slot."""
+        cell = make_h2_cell()
+        kpts = cell.make_kpts(
+            (1, 1, 2), wrap_around=False, with_gamma_point=True
+        )
+        kmf = scf.KRHF(cell, kpts, exxdiv="ewald")
+        kmf.with_df = df.GDF(cell, kpts).build()
+        kmf.conv_tol = 1e-9
+        kmf.kernel()
+        kmp = mp.KMP2(kmf, frozen=[[], [1]])
+        kmp.with_df_ints = True
+        kmp.kernel(with_t2=False)
+        _, active_virtual = kmp2.padding_k_idx(kmp, kind="split")
+        self.assertEqual(len(active_virtual[0]), 1)
+        self.assertEqual(len(active_virtual[1]), 0)
+
+        options = MP2SmallQOptions(
+            relative_shift=(0.0, 0.0, 0.25),
+            cutoff="sph",
+            band_backend="fftdf",
+            fft_mesh=(11, 11, 11),
+        )
+        N_local = (5, 5, 5)
+        (
+            smallq,
+            grids,
+            reference_grids,
+            structure_factor,
+            kmp_ref,
+            ordinary_df,
+            coeff_occ,
+            energy_occ,
+            coeff_plus,
+            energy_plus,
+            coeff_minus,
+            energy_minus,
+        ) = make_reference_pair(kmf, kmp, options, N_local, "uniform")
+        try:
+            reference = evaluate_explicit_reference(
+                structure_factor,
+                grids,
+                reference_grids,
+                kmp_ref,
+                coeff_occ,
+                energy_occ,
+                coeff_plus,
+                energy_plus,
+                coeff_minus,
+                energy_minus,
+            )
+            result = smallq.kernel()
+            np.testing.assert_allclose(
+                result.sq_direct,
+                reference["SqG_full_direct"][0],
+                rtol=2e-8,
+                atol=2e-11,
+            )
+            np.testing.assert_allclose(
+                result.sq_q4,
+                reference["SqG_full_q4"][0],
+                rtol=2e-8,
+                atol=2e-11,
+            )
+            self.assertEqual(
+                tuple(len(energies) for energies in result.active_virtual_energies_plus),
+                tuple(len(active) for active in active_virtual),
+            )
+            self.assertEqual(
+                tuple(len(energies) for energies in result.active_virtual_energies_minus),
+                tuple(len(active) for active in active_virtual),
+            )
+        finally:
+            handle = ordinary_df._cderi_to_save
+            if not isinstance(handle, str) and not handle.closed:
+                handle.close()
 
 
 class MP2SSSmallQFitIntegrationTests(unittest.TestCase):

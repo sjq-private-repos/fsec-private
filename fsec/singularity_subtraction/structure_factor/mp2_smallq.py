@@ -18,16 +18,20 @@ from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts
 
 @dataclass(frozen=True)
 class MP2SmallQOptions:
-    """sTC settings for the non-self-consistent small-q virtual bands.
+    """Settings for non-self-consistent small-q virtual bands.
 
     ``relative_shift`` is in units of the original Monkhorst-Pack mesh and
-    must be a nonzero vector in ``[-0.5, 0.5]^3``. ``cutoff`` selects the
-    Wigner-Seitz or spherical sTC cutoff.
+    must be a nonzero vector in ``[-0.5, 0.5]^3``. ``band_backend`` selects
+    either smoothed truncated Coulomb exchange (``"rsdf_stc"``) or PySCF's
+    standard FFT density fitting (``"fftdf"``). FFTDF requires
+    ``cutoff="sph"``; its mesh defaults to a copy of ``cell.mesh``.
     """
 
     relative_shift: Tuple[float, float, float] = (0.5, 0.5, 0.5)
-    eta: float = 4.0
+    eta: Optional[float] = 4.0
     cutoff: str = "ws"
+    band_backend: str = "rsdf_stc"
+    fft_mesh: Optional[Tuple[int, int, int]] = None
 
     def __post_init__(self):
         shift = np.asarray(self.relative_shift, dtype=float)
@@ -37,27 +41,66 @@ class MP2SmallQOptions:
             raise ValueError("relative_shift must be nonzero")
         if np.any(np.abs(shift) > 0.5):
             raise ValueError("relative_shift components must lie in [-0.5, 0.5]")
-        eta = float(self.eta)
-        if not np.isfinite(eta) or eta <= 0:
-            raise ValueError("eta must be finite and positive")
         cutoff = str(self.cutoff).strip().lower()
         if cutoff not in ("ws", "sph"):
             raise ValueError("cutoff must be 'ws' or 'sph'")
+        backend = str(self.band_backend).strip().lower()
+        if backend not in ("rsdf_stc", "fftdf"):
+            raise ValueError("band_backend must be 'rsdf_stc' or 'fftdf'")
+        if backend == "rsdf_stc":
+            try:
+                eta = float(self.eta)
+            except (TypeError, ValueError) as err:
+                raise ValueError("eta must be finite and positive for rsdf_stc") from err
+            if not np.isfinite(eta) or eta <= 0:
+                raise ValueError("eta must be finite and positive for rsdf_stc")
+        else:
+            eta = self.eta
+            if cutoff != "sph":
+                raise ValueError("band_backend='fftdf' requires cutoff='sph'")
+
+        fft_mesh = self.fft_mesh
+        if backend == "rsdf_stc" and fft_mesh is not None:
+            raise ValueError("fft_mesh applies only when band_backend='fftdf'")
+        if fft_mesh is not None:
+            try:
+                raw_mesh = np.asarray(fft_mesh, dtype=float)
+            except (TypeError, ValueError) as err:
+                raise ValueError("fft_mesh must contain three positive integers") from err
+            if (
+                raw_mesh.shape != (3,)
+                or not np.all(np.isfinite(raw_mesh))
+                or np.any(raw_mesh < 1)
+                or np.any(raw_mesh != np.floor(raw_mesh))
+            ):
+                raise ValueError("fft_mesh must contain three positive integers")
+            fft_mesh = tuple(raw_mesh.astype(int).tolist())
         object.__setattr__(self, "relative_shift", tuple(shift.tolist()))
         object.__setattr__(self, "eta", eta)
         object.__setattr__(self, "cutoff", cutoff)
+        object.__setattr__(self, "band_backend", backend)
+        object.__setattr__(self, "fft_mesh", fft_mesh)
 
 
 @dataclass(frozen=True)
 class MP2SmallQResult:
-    """Direct structure factors at ``qprime`` and their sTC band settings."""
+    """Direct structure factors and band data at ``qprime``.
+
+    The active virtual energies are in Hartree and follow the original k-point
+    ordering on the ``k+q`` and ``k-q`` grids. Frozen and padded slots are
+    omitted. ``fft_mesh`` is the effective real-space mesh for FFTDF results.
+    """
 
     qprime: np.ndarray
     sq_direct: float
     sq_q4: float
     relative_shift: Tuple[float, float, float]
-    eta: float
+    eta: Optional[float]
     cutoff: str
+    band_backend: str = "rsdf_stc"
+    fft_mesh: Optional[Tuple[int, int, int]] = None
+    active_virtual_energies_plus: Tuple[np.ndarray, ...] = ()
+    active_virtual_energies_minus: Tuple[np.ndarray, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -111,10 +154,10 @@ class MP2SmallQ:
 
     Occupied orbitals and energies always come from ``kmp`` (including any
     KMP2 energy shifts). Only virtual orbitals are recomputed on the shifted
-    grids with smoothed truncated Coulomb exchange. Pair densities are
-    integrated over the configured Becke or uniform real-space grid. Here
-    ``qprime`` is a Cartesian vector in inverse Bohr; ``sq_q4`` is the
-    fourth-order direct contribution from the same pair densities.
+    grids with the selected band backend. Pair densities are integrated over
+    the configured Becke or uniform real-space grid. Here ``qprime`` is a
+    Cartesian vector in inverse Bohr; ``sq_q4`` is the fourth-order direct
+    contribution from the same pair densities.
     """
 
     def __init__(
@@ -219,6 +262,13 @@ class MP2SmallQ:
         )
 
     def _make_band_mean_field(self, band_kpts):
+        """Build a fresh selected band backend on the original SCF k points."""
+        if self.options.band_backend == "fftdf":
+            return self._make_fft_band_mean_field()
+
+        return self._make_stc_band_mean_field(band_kpts)
+
+    def _make_stc_band_mean_field(self, band_kpts):
         """Build a fresh sTC exchange backend and its ordinary-GDF J partner."""
         try:
             from pyscf.pbc.df import rsdf_stc
@@ -258,6 +308,31 @@ class MP2SmallQ:
             _close_temporary_gdf(stc_df)
             raise
 
+    def _make_fft_band_mean_field(self):
+        """Build standard FFTDF bands with a spherical Coulomb cutoff."""
+        fft_df = df.FFTDF(self.cell, self.kmf.kpts)
+        mesh = (
+            self.cell.mesh
+            if self.options.fft_mesh is None
+            else self.options.fft_mesh
+        )
+        # FFTDF initially aliases cell.mesh. Keep its band mesh independent of
+        # both the cell and the source SCF/GDF settings.
+        fft_df.mesh = np.asarray(mesh, dtype=int).copy()
+        fft_df.max_memory = getattr(
+            self.kmf.with_df, "max_memory", self.kmf.max_memory
+        )
+        fft_df.stdout = getattr(self.kmf.with_df, "stdout", self.kmf.stdout)
+        fft_df.verbose = getattr(self.kmf.with_df, "verbose", self.kmf.verbose)
+        fft_df.build()
+
+        band_mf = self.kmf.copy()
+        band_mf.with_df = fft_df
+        band_mf.exxdiv = "vcut_sph"
+        band_mf.rsjk = None
+        band_mf._eri = None
+        return band_mf, fft_df, None
+
     def _get_shifted_bands(self, grids):
         """Evaluate shifted virtual bands using the original SCF density."""
         if grids.minus_from_plus is None:
@@ -265,7 +340,7 @@ class MP2SmallQ:
         else:
             band_kpts = grids.plus
 
-        band_mf, stc_df, j_df = self._make_band_mean_field(band_kpts)
+        band_mf, band_df, j_df = self._make_band_mean_field(band_kpts)
         try:
             dm_kpts = self.kmf.make_rdm1()
             energies, coeffs = band_mf.get_bands(
@@ -290,7 +365,7 @@ class MP2SmallQ:
             return (plus_energy, plus_coeff), (minus_energy, minus_coeff)
         finally:
             _close_temporary_gdf(j_df)
-            _close_temporary_gdf(stc_df)
+            _close_temporary_gdf(band_df)
 
     def _pair_density_grid(self, mesh=None):
         if self.pair_density_eval_grid == "becke":
@@ -480,20 +555,64 @@ class MP2SmallQ:
         finally:
             _close_temporary_gdf(correlation_df)
 
+        _, active_virtual = kmp2.padding_k_idx(self.kmp, kind="split")
+        active_energies_plus = tuple(
+            np.asarray(energy_plus[k])[
+                self.kmp.nocc + np.asarray(active, dtype=int)
+            ].copy()
+            for k, active in enumerate(active_virtual)
+        )
+        active_energies_minus = tuple(
+            np.asarray(energy_minus[k])[
+                self.kmp.nocc + np.asarray(active, dtype=int)
+            ].copy()
+            for k, active in enumerate(active_virtual)
+        )
+        effective_fft_mesh = None
+        if self.options.band_backend == "fftdf":
+            mesh = (
+                self.options.fft_mesh
+                if self.options.fft_mesh is not None
+                else np.asarray(self.cell.mesh, dtype=int)
+            )
+            effective_fft_mesh = tuple(np.asarray(mesh, dtype=int).tolist())
+
         self.result = MP2SmallQResult(
             qprime=grids.qprime.copy(),
             sq_direct=sq_direct,
             sq_q4=sq_q4,
             relative_shift=self.options.relative_shift,
-            eta=self.options.eta,
+            eta=(
+                self.options.eta
+                if self.options.band_backend == "rsdf_stc"
+                else None
+            ),
             cutoff=self.options.cutoff,
+            band_backend=self.options.band_backend,
+            fft_mesh=effective_fft_mesh,
+            active_virtual_energies_plus=active_energies_plus,
+            active_virtual_energies_minus=active_energies_minus,
         )
-        log.note(
-            "MP2 small-q: q=%s, direct=% .9e, q4=% .9e (sTC eta=%g, cutoff=%s)",
-            self.result.qprime,
-            self.result.sq_direct,
-            self.result.sq_q4,
-            self.result.eta,
-            self.result.cutoff,
-        )
+        if self.result.band_backend == "rsdf_stc":
+            log.note(
+                "MP2 small-q: q=%s, direct=% .9e, q4=% .9e "
+                "(backend=%s, eta=%g, cutoff=%s)",
+                self.result.qprime,
+                self.result.sq_direct,
+                self.result.sq_q4,
+                self.result.band_backend,
+                self.result.eta,
+                self.result.cutoff,
+            )
+        else:
+            log.note(
+                "MP2 small-q: q=%s, direct=% .9e, q4=% .9e "
+                "(backend=%s, FFT mesh=%s, cutoff=%s)",
+                self.result.qprime,
+                self.result.sq_direct,
+                self.result.sq_q4,
+                self.result.band_backend,
+                self.result.fft_mesh,
+                self.result.cutoff,
+            )
         return self.result
