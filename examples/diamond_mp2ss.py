@@ -93,10 +93,10 @@ print("MP2SS corrected total energy (hartree)    =", mp2ss.emp2ss)
 print("q2 integral term (hartree)   =", mp2ss.direct_integral_term_q2)
 print("q2 quadrature term (hartree) =", mp2ss.direct_quadrature_term_q2)
 print("q2 correction (hartree)      =", mp2ss.direct_total_correction_q2)
-print("q4 integral term (hartree)   =", mp2ss.direct_integral_term_dG0)
-print("q4 quadrature term (hartree) =", mp2ss.direct_quadrature_term_dG0)
-print("q4 correction (hartree)      =", mp2ss.direct_total_correction_dG0)
+print("q4 integral term (hartree)   =", mp2ss.direct_integral_term_q4)
+print("q4 quadrature term (hartree) =", mp2ss.direct_quadrature_term_q4)
+print("q4 correction (hartree)      =", mp2ss.direct_total_correction_q4)
 print(
     "q2 + q4 direct correction (hartree) =",
-    mp2ss.direct_total_correction_q2_dG0,
+    mp2ss.direct_total_correction_q2_q4,
 )
