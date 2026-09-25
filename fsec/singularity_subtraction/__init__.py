@@ -56,3 +56,9 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2ExchangeSS,
 )
 from fsec.singularity_subtraction.analysis import OriginDiagnostics
+from fsec.singularity_subtraction.bands_ss import (
+    BandsSS,
+    DEFAULT_Q_ZERO_TOL,
+    fourier_exchange_matrices,
+    orbital_resolved_structure_factor,
+)

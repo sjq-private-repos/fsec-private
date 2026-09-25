@@ -69,6 +69,30 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## Orbital-resolved band correction
+
+`BandsSS` applies an independent Gaussian singularity subtraction to each
+occupied band orbital. It generates masked-exchange bands at arbitrary k-points
+or accepts a matching pair of supplied energy and coefficient arrays. Supplied
+bare energies must use the same `q_zero_tol` exclusion as the SS correction.
+Virtual bands receive zero correction, and the returned coefficients remain
+the bare band orbitals. A concise PySCF workflow with on-mesh, off-mesh, and
+near-mesh points is in [`examples/bands_ss.py`](examples/bands_ss.py).
+
+```python
+from fsec.singularity_subtraction import BandsSS
+
+bands_ss = BandsSS(kmf, kpts_band, q_zero_tol=1e-4)
+correction = bands_ss.compute_correction()
+energies_ss, coefficients = bands_ss.get_bands()
+```
+
+The unscaled occupied corrections are in `bands_ss.xi`; fitted widths,
+quadrature and integral terms, diagnostics, and baseline energies are also
+available as attributes. Generated Fourier exchange uses `cell.mesh` by
+default; pass `exchange_mesh` to `BandsSS` when converging that reciprocal
+integration independently.
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,
