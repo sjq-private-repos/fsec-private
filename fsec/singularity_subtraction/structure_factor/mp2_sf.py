@@ -32,7 +32,6 @@ class MP2StructureFactor(StructureFactor):
         self.kGrid2 = kwargs.get('kGrid2', None)
         self.min_points = kwargs.get('min_points', 6)
         self.check_trs = kwargs.get('check_trs', True)
-
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
         
@@ -743,9 +742,10 @@ class MP2StructureFactor(StructureFactor):
                     else:
                         orbo_i = mo_coeff[ki][:,:nocc]
                         orbo_j = mo_coeff[kj][:,:nocc]
-                        orbv_a = mo_coeff[ka][:,nocc:]
-                        orbv_b = mo_coeff[kb][:,nocc:]
-                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
+                        # The coefficient tuple must follow the k-point tuple.
+                        orbv_1 = mo_coeff[kvirt][:,nocc:]
+                        orbv_2 = mo_coeff[kvirt2][:,nocc:]
+                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_1,orbo_j,orbv_2),
                                             (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
                                             compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
                 for ka in range(nkpts):
