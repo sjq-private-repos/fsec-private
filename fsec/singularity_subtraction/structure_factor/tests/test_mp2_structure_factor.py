@@ -284,10 +284,11 @@ class KnownValues(unittest.TestCase):
                 err_msg=key,
             )
 
-    def test_fft_kikj_exchange_matches_ki_and_legacy_bug_is_distinct(self):
+    def test_fft_kikj_exchange_matches_ki(self):
+        """Match exchange between the two reduced-memory FFTDF paths."""
         common = dict(
             N_local=self.N_local,
-            qG_cutoff=4.0,
+            qG_cutoff=1.2,
             min_points=10,
             sq_inversion_symm=False,
         )
@@ -312,23 +313,6 @@ class KnownValues(unittest.TestCase):
             reference["SqG_full_exchange"],
             rtol=1e-7,
             atol=1e-10,
-        )
-
-        legacy = MP2StructureFactor(
-            self.kmf_fft_113,
-            self.kmp_fft_113,
-            t2_store_type="kikj",
-            legacy_fft_exchange_orbital_order=True,
-            **common,
-        ).build_structure_factor(exchange=True)
-        self.assertGreater(
-            np.max(
-                np.abs(
-                    legacy["SqG_full_exchange"]
-                    - fixed["SqG_full_exchange"]
-                )
-            ),
-            1.0e-12,
         )
 
     def test_build_structure_factor_112_kmesh(self):

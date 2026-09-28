@@ -121,11 +121,6 @@ class MP2SSOptions:
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
-    legacy_fft_exchange_orbital_order
-        Reproduce the historical FFTDF exchange coefficient/k-point mismatch
-        for diagnostic comparisons. The default, ``False``, uses matching
-        virtual coefficients and k-point labels. Legacy reproduction is
-        restricted to FFTDF with ``t2_store_type="kikj"``.
 
     Notes
     -----
@@ -149,7 +144,6 @@ class MP2SSOptions:
     line_sampling: bool = False
     t2_store_type: str = 'kikjka'
     correct_q2_q4_separately: bool = True
-    legacy_fft_exchange_orbital_order: bool = False
 
 
 @dataclass(frozen=True)
@@ -909,9 +903,6 @@ class MP2SS:
         self.fit_with_coul_q2 = options.fit_with_coul_q2
         self.line_sampling = options.line_sampling
         self.t2_store_type = options.t2_store_type # 'kikjka', 'kikj', or 'ki'
-        self.legacy_fft_exchange_orbital_order = (
-            options.legacy_fft_exchange_orbital_order
-        )
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
@@ -1001,9 +992,6 @@ class MP2SS:
             sq_inversion_symm=self.sq_inversion_symm,
             check_trs=self.check_trs,
             t2_store_type=self.t2_store_type,
-            legacy_fft_exchange_orbital_order=(
-                self.legacy_fft_exchange_orbital_order
-            ),
         )
         mp2_structure_factor.set_grids(min_fit_points=self.min_points)
 

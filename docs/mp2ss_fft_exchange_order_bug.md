@@ -14,12 +14,13 @@ structure factor and MP2SS exchange correction on multi-k-point meshes; the
 direct term is unaffected.
 
 The corrected path supplies matching coefficients and labels,
-\((C_i,C_b,C_j,C_a)\) with \((k_i,k_b,k_j,k_a)\). This is now the default.
-`legacy_fft_exchange_orbital_order=True` deliberately reproduces the old
-mismatch for FFTDF/`kikj` comparisons. A regression test checks that corrected
-`kikj` exchange agrees with the independent `ki` implementation on a
-\(1\times1\times3\) mesh (`rtol=1e-7`, `atol=1e-10`) and that the legacy result
-is distinct.
+\((C_i,C_b,C_j,C_a)\) with \((k_i,k_b,k_j,k_a)\). This ordering is always used;
+the temporary diagnostic option for reproducing the old mismatch has been
+removed. Regression tests check that corrected `kikj` exchange agrees with
+the independent `ki` implementation and full FFTDF `kikjka` amplitudes on a
+\(1\times1\times3\) mesh (`rtol=1e-7`, `atol=1e-10`). Before removing the
+diagnostic option, enabling it was verified to fail the full-amplitude
+comparison on exchange while the direct term passed.
 
 ## Diamond DZ validation
 
