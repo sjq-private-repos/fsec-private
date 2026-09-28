@@ -63,7 +63,7 @@ class KnownValues(unittest.TestCase):
     def setUpClass(cls):
         cls.kmf, cls.kmp, cls.t2 = cls._build_system((1, 1, 1))
         cls.kmf_112, cls.kmp_112, cls.t2_112 = cls._build_system((1, 1, 2))
-        cls.kmf_fft_113, cls.kmp_fft_113, _ = cls._build_system(
+        cls.kmf_fft_113, cls.kmp_fft_113, cls.t2_fft_113 = cls._build_system(
             (1, 1, 3), backend="fft_ws"
         )
         cls.sq_ke_cutoff = 100.0
@@ -75,11 +75,12 @@ class KnownValues(unittest.TestCase):
         qG_norm = np.linalg.norm(qG, axis=1)
         return np.lexsort((qG[:, 2], qG[:, 1], qG[:, 0], qG_norm))[:10]
 
-    def test_build_structure_factor_10_closest_qg_points(self):
+    def _check_structure_factor_10_closest_qg_points(self, kmf, kmp, t2, references):
+        """Check the three structure-factor terms against backend references."""
         mp2_sf = MP2StructureFactor(
-            self.kmf,
-            self.kmp,
-            t2=self.t2,
+            kmf,
+            kmp,
+            t2=t2,
             N_local=self.N_local,
             qG_cutoff=self.qG_cutoff,
             min_points=10,
@@ -87,33 +88,24 @@ class KnownValues(unittest.TestCase):
         result = mp2_sf.build_structure_factor(direct=True, exchange=True, dG0=True)
 
         qG = result["qG_full"]
-        SqG_full_direct = result["SqG_full_direct"]
-        SqG_full_q4 = result["SqG_full_q4"]
-        SqG_full_exchange = result["SqG_full_exchange"]
-
-        self.assertEqual(len(SqG_full_direct), len(qG))
-        self.assertEqual(len(SqG_full_q4), len(qG))
-        self.assertEqual(len(SqG_full_exchange), len(qG))
-
-        self.assertTrue(np.all(np.isfinite(SqG_full_direct)))
-        self.assertTrue(np.all(np.isfinite(SqG_full_q4)))
-        self.assertTrue(np.all(np.isfinite(SqG_full_exchange)))
-        self.assertTrue(np.isrealobj(SqG_full_direct))
-        self.assertTrue(np.isrealobj(SqG_full_q4))
-        self.assertTrue(np.isrealobj(SqG_full_exchange))
-
         idx10 = self._closest_10_indices(qG)
         qG_10 = qG[idx10]
-        SqG_direct_10 = SqG_full_direct[idx10]
-        SqG_q4_10 = SqG_full_q4[idx10]
-        SqG_exchange_10 = SqG_full_exchange[idx10]
-
         self.assertEqual(len(qG_10), 10)
-        self.assertEqual(len(SqG_direct_10), 10)
-        self.assertEqual(len(SqG_q4_10), 10)
-        self.assertEqual(len(SqG_exchange_10), 10)
         self.assertTrue(np.any(np.linalg.norm(qG_10, axis=1) <= 1e-8))
 
+        for key, reference in references.items():
+            with self.subTest(term=key):
+                actual = result[key]
+                self.assertEqual(len(actual), len(qG))
+                self.assertTrue(np.all(np.isfinite(actual)))
+                self.assertTrue(np.isrealobj(actual))
+                np.testing.assert_allclose(
+                    actual[idx10], reference, rtol=0, atol=5e-9,
+                    err_msg=key,
+                )
+
+    def test_build_structure_factor_10_closest_qg_points(self):
+        """Preserve the Gamma-point GDF structure-factor reference values."""
         reference_SqG_direct_10 = [
             -1.0893511193700196e-21,
             -1.054426172919673e-21,
@@ -151,12 +143,61 @@ class KnownValues(unittest.TestCase):
             5.701011896764773e-05,
         ]
 
-        for actual, reference in zip(SqG_direct_10, reference_SqG_direct_10):
-            self.assertAlmostEqual(actual, reference, places=8)
-        for actual, reference in zip(SqG_q4_10, reference_SqG_q4_10):
-            self.assertAlmostEqual(actual, reference, places=8)
-        for actual, reference in zip(SqG_exchange_10, reference_SqG_exchange_10):
-            self.assertAlmostEqual(actual, reference, places=8)
+        self._check_structure_factor_10_closest_qg_points(
+            self.kmf, self.kmp, self.t2,
+            {
+                "SqG_full_direct": reference_SqG_direct_10,
+                "SqG_full_q4": reference_SqG_q4_10,
+                "SqG_full_exchange": reference_SqG_exchange_10,
+            },
+        )
+
+    def test_build_structure_factor_10_closest_qg_points_fftdf(self):
+        """Check Gamma-point FFTDF direct, exchange, and dG0 reference values."""
+        kmf, kmp, t2 = self._build_system((1, 1, 1), backend="fft_ws")
+        # PySCF 2.14.0, WS-truncated HF, full FFTDF KMP2 amplitudes,
+        # and a 100-Ha cutoff (29^3 mesh); sorted by _closest_10_indices.
+        references = {
+            "SqG_full_direct": [
+                -1.172058899966748e-21,
+                -7.906080127100997e-17,
+                -7.906079309717075e-17,
+                -0.00028254532096928315,
+                -0.00028254532096928315,
+                -7.906079309717075e-17,
+                -7.906080127100997e-17,
+                -1.21281663965706e-16,
+                -0.0001226727777199658,
+                -0.00012267277771995896,
+            ],
+            "SqG_full_q4": [
+                -8.303279465169691e-41,
+                -3.778097873770974e-31,
+                -3.778097092560502e-31,
+                -4.825330009799675e-06,
+                -4.825330009799675e-06,
+                -3.778097092560502e-31,
+                -3.778097873770974e-31,
+                -8.890804790723498e-31,
+                -9.09593147291765e-07,
+                -9.095931472916641e-07,
+            ],
+            "SqG_full_exchange": [
+                5.86029449983374e-22,
+                3.9530400635504984e-17,
+                3.9530396548585376e-17,
+                0.00014127266048464157,
+                0.00014127266048464157,
+                3.9530396548585376e-17,
+                3.9530400635504984e-17,
+                6.0640831982853e-17,
+                6.13363888599829e-05,
+                6.133638885997948e-05,
+            ],
+        }
+        self._check_structure_factor_10_closest_qg_points(
+            kmf, kmp, t2, references,
+        )
 
     def test_ki_t2_store_type_matches_kikjka(self):
         reference_sf = MP2StructureFactor(
@@ -199,6 +240,49 @@ class KnownValues(unittest.TestCase):
             rtol=1e-7,
             atol=1e-10,
         )
+
+    def test_fft_kikj_matches_full_kikjka(self):
+        """Match direct and exchange against full FFTDF amplitudes off Gamma."""
+        from fsec.singularity_subtraction.mp2ss import convert_t2_to_kikjq_format
+
+        common = dict(
+            N_local=self.N_local,
+            qG_cutoff=1.2,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        reference_sf = MP2StructureFactor(
+            self.kmf_fft_113,
+            self.kmp_fft_113,
+            t2_store_type="kikjka",
+            **common,
+        )
+        reference_sf.set_grids(min_fit_points=common["min_points"])
+        # The full structure-factor path consumes q-indexed amplitudes;
+        # convert a copy of PySCF's ka-indexed tensor to preserve the fixture.
+        t2 = self.t2_fft_113.copy()
+        convert_t2_to_kikjq_format(
+            t2, self.kmp_fft_113.kpts, reference_sf.grids.qGrid,
+            self.kmf_fft_113.cell,
+        )
+        reference = reference_sf.build_structure_factor(
+            direct=True, exchange=True, t2=t2, grids=reference_sf.grids,
+        )
+        actual = MP2StructureFactor(
+            self.kmf_fft_113,
+            self.kmp_fft_113,
+            t2_store_type="kikj",
+            **common,
+        ).build_structure_factor(direct=True, exchange=True)
+
+        np.testing.assert_allclose(
+            actual["qG_full"], reference["qG_full"], atol=1e-12,
+        )
+        for key in ("SqG_full_direct", "SqG_full_exchange"):
+            np.testing.assert_allclose(
+                actual[key], reference[key], rtol=1e-7, atol=1e-10,
+                err_msg=key,
+            )
 
     def test_fft_kikj_exchange_matches_ki_and_legacy_bug_is_distinct(self):
         common = dict(
