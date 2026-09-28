@@ -1517,3 +1517,162 @@ class MP2StructureFactor(StructureFactor):
         self.last_build_timings = profile.summary(total_t0)
         profile.log_summary(log, self.last_build_timings)
         return result_dict
+                
+            
+    
+
+    def compute_t2_amplitudes(self, kmp, mo_energy, mo_coeff, qGrid, qGrid_sample=None, skip_if_no_qpt=False, mode='direct',Lov=None, verbose=logger.DEBUG):
+        
+        """Computes k-point RMP2 energy. Ripped off from KMP2.kernel(). lol.
+
+        Args:
+            mp (KMP2): an instance of KMP2
+            mo_energy (list): a list of numpy.ndarray. Each array contains MO energies of
+                            shape (Nmo,) for one kpt. If frozen orbitals or per-k ragged
+                            shapes are present, they are canonicalized via
+                            kmp2._add_padding so the body of this function can safely
+                            use kmp.nocc / kmp.nmo and kmp2.padding_k_idx.
+            mo_coeff (list): a list of numpy.ndarray. Each array contains MO coefficients
+                            of shape (Nao, Nmo) for one kpt. Padded analogously.
+            verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
+            with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
+            mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct' 
+            
+
+        Returns:
+            KMP2 energy and t2 amplitudes (=None if with_t2 is False)
+        """
+        if mode not in ['direct', 'exchange']:
+            raise ValueError(f"Mode {mode} not recognized. Must be 'direct' or 'exchange'.")
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        log = logger.new_logger(kmp, verbose)
+
+        kmp.dump_flags()
+        cell = kmp._scf.cell
+        mo_coeff, mo_energy = kmp2._add_padding(kmp, mo_coeff, mo_energy)
+        nmo = kmp.nmo
+        nocc = kmp.nocc
+        nvir = nmo - nocc
+        nkpts = kmp.nkpts
+        # qGrid = kmp.kpts if qGrid is None else qGrid
+        nka = np.array(qGrid_sample.shape[0]) if qGrid_sample is not None else nkpts
+
+
+        with_df_ints = kmp.with_df_ints and isinstance(kmp._scf.with_df, df.GDF)
+
+        mem_avail = kmp.max_memory - lib.current_memory()[0]
+        mem_usage = (nkpts * (nocc * nvir)**2) * 16 / 1e6
+        if with_df_ints:
+            mydf = kmp._scf.with_df
+            if mydf.auxcell is None:
+                # Calculate naux based on precomputed GDF integrals
+                naux = mydf.get_naoaux()
+            else:
+                naux = mydf.auxcell.nao_nr()
+
+            mem_usage += (nkpts**2 * naux * nocc * nvir) * 16 / 1e6
+        mem_usage += (nkpts**2 * nka * (nocc * nvir)**2) * 16 / 1e6
+        if mem_usage > mem_avail:
+            raise MemoryError('Insufficient memory! MP2 memory usage %d MB (currently available %d MB)'
+                            % (mem_usage, mem_avail))
+
+        eia = np.zeros((nocc,nvir))
+        eijab = np.zeros((nocc,nocc,nvir,nvir))
+
+        fao2mo = kmp._scf.with_df.ao2mo
+        kconserv = kmp.khelper.kconserv
+        oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff[0].dtype)
+
+        mo_e_o = [mo_energy[k][:nocc] for k in range(nkpts)]
+        mo_e_v = [mo_energy[k][nocc:] for k in range(nkpts)]
+
+        # Get location of non-zero/padded elements in occupied and virtual space
+        nonzero_opadding, nonzero_vpadding = kmp2.padding_k_idx(kmp, kind="split")
+
+        if qGrid_sample is not None:
+            nka = np.array(qGrid_sample.shape[0]) if qGrid_sample is not None else nkpts
+            skip_if_no_qpt = True
+
+
+        t2 = np.zeros((nkpts, nkpts, nka, nocc, nocc, nvir, nvir), dtype=complex)
+        # Build 3-index DF tensor Lov
+        if with_df_ints and Lov is None:
+            Lov = kmp2._init_mp_df_eris(kmp)
+
+ 
+        q_tree = scipy.spatial.KDTree(qGrid)
+        num_skipped_qpts_oovv = 0
+        num_skipped_qpts_t2 = 0
+
+        
+        qpts = kmp.kpts[:,None,:] - kmp.kpts[None,:,:]
+        qpts = minimum_image(cell, qpts.reshape(-1,3))
+        _, qi_map = q_tree.query(qpts, distance_upper_bound=1e-8)
+        qi_map = qi_map.reshape(nkpts,nkpts)
+
+
+        # Find qpt
+        if qGrid_sample is not None:
+            qGrid_sample = minimum_image(cell, qGrid_sample.reshape(-1,3))
+            qsample_tree = scipy.spatial.KDTree(qGrid_sample)
+            _, qi_map_sample = qsample_tree.query(qpts, distance_upper_bound=1e-8)
+            qi_map_sample = qi_map_sample.reshape(nkpts,nkpts)
+        
+        for ki in range(nkpts):
+            for kj in range(nkpts):
+                # kref = ki if mode == 'direct' else kj
+                for ka in range(nkpts):
+                    if qi_map_sample[ka,ki] == len(qGrid_sample):
+                        num_skipped_qpts_oovv += 1
+                        if skip_if_no_qpt:
+                            continue
+                        else:
+                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                    
+                    kb = kconserv[ki,ka,kj]
+                    # (ia|jb)
+                    kvirt = ka if mode == 'direct' else kb
+                    kvirt2 = kb if mode == 'direct' else ka
+                    if with_df_ints:
+                        oovv_ij[kvirt] = (1./nkpts) * einsum("Lia,Ljb->iajb", Lov[ki, kvirt], Lov[kj, kvirt2]).transpose(0,2,1,3)
+                    else:
+                        orbo_i = mo_coeff[ki][:,:nocc]
+                        orbo_j = mo_coeff[kj][:,:nocc]
+                        # The coefficient tuple must follow the k-point tuple.
+                        orbv_1 = mo_coeff[kvirt][:,nocc:]
+                        orbv_2 = mo_coeff[kvirt2][:,nocc:]
+                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_1,orbo_j,orbv_2),
+                                            (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
+                                            compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
+                for ka in range(nkpts):
+                    if qi_map_sample[ka,ki] == len(qGrid_sample):
+                        num_skipped_qpts_t2 += 1
+                        if skip_if_no_qpt:
+                            continue
+                        else:
+                            raise ValueError(f"Cannot locate qpt for (k+q) in the qmesh.")
+                    
+                    kb = kconserv[ki,ka,kj]
+                    kvirt = ka if mode == 'direct' else kb
+                    kvirt2 = kb if mode == 'direct' else ka
+                    qi = qi_map[ka,ki] if qGrid_sample is None else qi_map_sample[ka,ki]
+
+                    # Remove zero/padded elements from denominator
+                    eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
+                    n0_ovp_ia = np.ix_(nonzero_opadding[ki], nonzero_vpadding[kvirt])
+                    eia[n0_ovp_ia] = (mo_e_o[ki][:,None] - mo_e_v[kvirt])[n0_ovp_ia]
+
+                    ejb = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
+                    n0_ovp_jb = np.ix_(nonzero_opadding[kj], nonzero_vpadding[kvirt2])
+                    ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kvirt2])[n0_ovp_jb]
+
+                    eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
+                    t2_ijab = np.conj(oovv_ij[kvirt]/eijab)
+                    t2[ki, kj, qi] = t2_ijab
+
+
+        log.timer("KMP2", *cput0)
+        print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
+        print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
+
+        return t2
