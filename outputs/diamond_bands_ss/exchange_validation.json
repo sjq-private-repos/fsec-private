@@ -1,0 +1,17 @@
+{
+  "target": "W",
+  "target_bohr_inverse": [
+    [
+      0.46606650887426476,
+      0.9321330177485295,
+      -2.7755575615628914e-17
+    ]
+  ],
+  "max_exchange_matrix_difference_hartree": 1.4570844530972553e-10,
+  "mesh": [
+    37,
+    37,
+    37
+  ],
+  "elapsed_seconds": 591.4806237057783
+}

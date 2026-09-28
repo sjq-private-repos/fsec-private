@@ -1,0 +1,25 @@
+{
+  "method": "KRHF; fixed source density; orbital-resolved BandsSS",
+  "basis": "gth-szv",
+  "pseudopotential": "gth-pbe",
+  "source_mesh": [
+    2,
+    2,
+    2
+  ],
+  "source_exxdiv": "ewald",
+  "density_fitting": "FFTDF on 37x37x37 grid; supplied bare bands",
+  "band_exchange": "bare Coulomb with common near-zero exclusion",
+  "q_zero_tol_bohr_inverse": 0.0001,
+  "exchange_mesh": [
+    37,
+    37,
+    37
+  ],
+  "nominal_plane_wave_cutoff_hartree": 100,
+  "path": "L-Gamma-X-W-K-Gamma",
+  "number_of_points": 81,
+  "energy_zero_hartree": 0.37125358441059597,
+  "sampled_path_gap_eV": 16.92918124362697,
+  "note": "Energy zero is the maximum corrected occupied energy on this path. The sampled path gap is not a full-Brillouin-zone gap. Virtual SS shifts are zero; orbitals are not rediagonalized."
+}

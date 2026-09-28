@@ -1,0 +1,22 @@
+{
+  "method": "KRHF, FFTDF, exxdiv='vcut_sph' in both SCF and bands",
+  "source_mesh": [
+    2,
+    2,
+    2
+  ],
+  "fft_mesh": [
+    37,
+    37,
+    37
+  ],
+  "number_of_band_points": 81,
+  "source_energy_hartree": -10.81425917721401,
+  "energy_zero_hartree": 0.37125358441059597,
+  "energy_alignment": "Common SS valence maximum; no independent shifts",
+  "sampled_path_gap_eV": 16.62884723222931,
+  "repeated_gamma_max_difference_hartree": 6.861178292183467e-14,
+  "scf_seconds": 68.67893088422716,
+  "band_seconds": 155.05442416714504,
+  "source_density_change_norm": 0.044175506906647836
+}
