@@ -19,7 +19,7 @@ except ImportError:
 @unittest.skipUnless(HAS_PYSCF and HAS_MP2_IMPORT, "PySCF and fsec structure_factor deps are required")
 class KnownValues(unittest.TestCase):
     @classmethod
-    def _build_system(cls, kmesh):
+    def _build_system(cls, kmesh, backend="gdf"):
         cell = gto.Cell()
         cell.unit = "Bohr"
         cell.atom = """
@@ -37,9 +37,15 @@ class KnownValues(unittest.TestCase):
         cell.build()
 
         kpts = cell.make_kpts(kmesh, wrap_around=True, with_gamma_point=True)
-        kmf = scf.KRHF(cell, kpts)
-        kmf.exxdiv = "ewald"
-        kmf.with_df = df.GDF(cell, kpts).build()
+        if backend == "gdf":
+            kmf = scf.KRHF(cell, kpts, exxdiv="ewald")
+            kmf.with_df = df.GDF(cell, kpts).build()
+        elif backend == "fft_ws":
+            kmf = scf.KRHF(cell, kpts, exxdiv="vcut_ws")
+            kmf.with_df = df.FFTDF(cell, kpts)
+            kmf.with_df.mesh = list(cell.mesh)
+        else:
+            raise ValueError("unknown test backend: {}".format(backend))
         kmf.conv_tol = 1e-10
         kmf.kernel()
         if not kmf.converged:
@@ -57,6 +63,9 @@ class KnownValues(unittest.TestCase):
     def setUpClass(cls):
         cls.kmf, cls.kmp, cls.t2 = cls._build_system((1, 1, 1))
         cls.kmf_112, cls.kmp_112, cls.t2_112 = cls._build_system((1, 1, 2))
+        cls.kmf_fft_113, cls.kmp_fft_113, _ = cls._build_system(
+            (1, 1, 3), backend="fft_ws"
+        )
         cls.sq_ke_cutoff = 100.0
         cls.qG_cutoff = 8.0
         cls.N_local = cls.kmf.cell.cutoff_to_mesh(cls.sq_ke_cutoff)
@@ -189,6 +198,53 @@ class KnownValues(unittest.TestCase):
             reference["SqG_full_q4"],
             rtol=1e-7,
             atol=1e-10,
+        )
+
+    def test_fft_kikj_exchange_matches_ki_and_legacy_bug_is_distinct(self):
+        common = dict(
+            N_local=self.N_local,
+            qG_cutoff=4.0,
+            min_points=10,
+            sq_inversion_symm=False,
+        )
+        reference = MP2StructureFactor(
+            self.kmf_fft_113,
+            self.kmp_fft_113,
+            t2_store_type="ki",
+            **common,
+        ).build_structure_factor(exchange=True)
+
+        fixed = MP2StructureFactor(
+            self.kmf_fft_113,
+            self.kmp_fft_113,
+            t2_store_type="kikj",
+            **common,
+        ).build_structure_factor(exchange=True)
+        np.testing.assert_allclose(
+            fixed["qG_full"], reference["qG_full"], atol=1e-12
+        )
+        np.testing.assert_allclose(
+            fixed["SqG_full_exchange"],
+            reference["SqG_full_exchange"],
+            rtol=1e-7,
+            atol=1e-10,
+        )
+
+        legacy = MP2StructureFactor(
+            self.kmf_fft_113,
+            self.kmp_fft_113,
+            t2_store_type="kikj",
+            legacy_fft_exchange_orbital_order=True,
+            **common,
+        ).build_structure_factor(exchange=True)
+        self.assertGreater(
+            np.max(
+                np.abs(
+                    legacy["SqG_full_exchange"]
+                    - fixed["SqG_full_exchange"]
+                )
+            ),
+            1.0e-12,
         )
 
     def test_build_structure_factor_112_kmesh(self):

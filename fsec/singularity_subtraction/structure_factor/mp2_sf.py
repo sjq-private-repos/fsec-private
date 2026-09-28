@@ -32,6 +32,9 @@ class MP2StructureFactor(StructureFactor):
         self.kGrid2 = kwargs.get('kGrid2', None)
         self.min_points = kwargs.get('min_points', 6)
         self.check_trs = kwargs.get('check_trs', True)
+        self.legacy_fft_exchange_orbital_order = bool(
+            kwargs.get('legacy_fft_exchange_orbital_order', False)
+        )
 
         self.t2_store_type = kwargs.get('t2_store_type', 'kikjka') # 'kikjka' or 'kikj'
         super().__init__(self.kmf.cell, N_local, sq_ke_cutoff, qG_cutoff, **kwargs)
@@ -175,6 +178,16 @@ class MP2StructureFactor(StructureFactor):
         t2_given = t2 is not None
         
         with_df_ints = self.kmp.with_df_ints and isinstance(self.kmp._scf.with_df, df.GDF)
+        if exchange and self.legacy_fft_exchange_orbital_order:
+            if not isinstance(kmp._scf.with_df, df.FFTDF):
+                raise ValueError(
+                    "the legacy exchange bug can be reproduced only with FFTDF"
+                )
+            if t2_store_type != 'kikj':
+                raise ValueError(
+                    "the legacy FFT exchange bug can be reproduced only with "
+                    "t2_store_type='kikj'"
+                )
         if not direct and not exchange:
             # Only dG0 term. No need to compute t2.
             print("Only dG0 term. No need to compute or use t2.")
@@ -743,9 +756,21 @@ class MP2StructureFactor(StructureFactor):
                     else:
                         orbo_i = mo_coeff[ki][:,:nocc]
                         orbo_j = mo_coeff[kj][:,:nocc]
-                        orbv_a = mo_coeff[ka][:,nocc:]
-                        orbv_b = mo_coeff[kb][:,nocc:]
-                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
+                        # The coefficient tuple must follow the k-point tuple.
+                        # Historically, exchange used labels (kb,ka) with
+                        # coefficients (C_ka,C_kb), corrupting every block for
+                        # which ka != kb.  Keep that mismatch only behind an
+                        # explicit diagnostic option.
+                        if (
+                            mode == 'exchange'
+                            and self.legacy_fft_exchange_orbital_order
+                        ):
+                            orbv_1 = mo_coeff[ka][:,nocc:]
+                            orbv_2 = mo_coeff[kb][:,nocc:]
+                        else:
+                            orbv_1 = mo_coeff[kvirt][:,nocc:]
+                            orbv_2 = mo_coeff[kvirt2][:,nocc:]
+                        oovv_ij[kvirt] = fao2mo((orbo_i,orbv_1,orbo_j,orbv_2),
                                             (kmp.kpts[ki],kmp.kpts[kvirt],kmp.kpts[kj],kmp.kpts[kvirt2]),
                                             compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
                 for ka in range(nkpts):

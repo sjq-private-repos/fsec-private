@@ -69,6 +69,12 @@ print("Corrected exact exchange (hartree):", exxss.Ek_ss)
 
 `compute_correction()` fits an auxiliary function to the exchange structure factor near the Coulomb singularity and stores the uncorrected exchange energy, correction, and corrected exchange energy in `Ek_uncorr`, `correction`, and `Ek_ss`, respectively.
 
+## MP2SS FFTDF exchange ordering
+
+The corrected FFTDF exchange path matches each virtual-orbital coefficient
+matrix to its k-point label. See the concise
+[bug description and diamond DZ validation](docs/mp2ss_fft_exchange_order_bug.md).
+
 ## References
 
 - S. J. Quiton, J. D. F. Pottecher, X. Xing, M. Head-Gordon, and L. Lin,

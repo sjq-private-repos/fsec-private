@@ -207,6 +207,7 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(mp2ss.options.correct_q2_q4_separately)
         self.assertTrue(mp2ss.options.check_trs)
         self.assertEqual(mp2ss.options.t2_store_type, "kikjka")
+        self.assertFalse(mp2ss.options.legacy_fft_exchange_orbital_order)
         correction = mp2ss.compute_correction(direct=True, exchange=True)
 
         self._assert_matches_references(mp2ss, correction)
