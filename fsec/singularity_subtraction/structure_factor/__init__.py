@@ -11,7 +11,7 @@ from pyscf.pbc import df, dft, scf
 from pyscf.lib import logger, einsum
 from pyscf.pbc.mp import kmp2
 import numpy as np
-from fsec.singularity_subtraction.structure_factor.helpers_sf import build_uKpts as _build_uKpts
+from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts as _build_uKpts
 from scipy.spatial import KDTree
 from pyscf.lib.numpy_helper import einsum as pyscf_einsum
 
@@ -88,3 +88,7 @@ class StructureFactor(ABC):
 
 from fsec.singularity_subtraction.structure_factor.exx_sf import ExxStructureFactor
 from fsec.singularity_subtraction.structure_factor.mp2_sf import MP2StructureFactor
+from fsec.singularity_subtraction.structure_factor.mp2_smallq import (
+    MP2SmallQ,
+    MP2SmallQResult,
+)

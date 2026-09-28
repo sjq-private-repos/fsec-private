@@ -12,28 +12,28 @@ class KnownValues(unittest.TestCase):
     TOL = 1e-6
     REFERENCES = {
         "pbe0_contracted_gaussian": {
-            "Ek_ss": -0.5260391467546657,
-            "correction": -0.25938972319027775,
-            "integral_term": -0.4703482793474786,
-            "quadrature_term": 0.21095855615720083,
+            "Ek_ss": -0.5291272996690393,
+            "correction": -0.26247787610465045,
+            "integral_term": -0.489449527737625,
+            "quadrature_term": 0.22697165163297459,
         },
         "hf_contracted_gaussian": {
-            "Ek_ss": -0.5260391467530449,
-            "correction": -0.25938972319001474,
-            "integral_term": -0.47034827934593426,
-            "quadrature_term": 0.21095855615591952,
+            "Ek_ss": -0.5291272967126897,
+            "correction": -0.26247787314965876,
+            "integral_term": -0.4894495084688119,
+            "quadrature_term": 0.22697163531915313,
         },
         "pbe0_quartic_exponential": {
-            "Ek_ss": -0.525063933771805,
-            "correction": -0.2584145102074171,
-            "integral_term": -0.5391775947159534,
-            "quadrature_term": 0.28076308450853626,
+            "Ek_ss": -0.5283008162655474,
+            "correction": -0.26165139270115867,
+            "integral_term": -0.5435525114152486,
+            "quadrature_term": 0.28190111871408996,
         },
         "hf_quartic_exponential": {
-            "Ek_ss": -0.5250639337242369,
-            "correction": -0.2584145101612068,
-            "integral_term": -0.539177573428092,
-            "quadrature_term": 0.2807630632668852,
+            "Ek_ss": -0.5283008133413027,
+            "correction": -0.2616513897782719,
+            "integral_term": -0.5435524885236986,
+            "quadrature_term": 0.28190109874542674,
         },
     }
 
@@ -107,6 +107,29 @@ class KnownValues(unittest.TestCase):
                 delta=self.TOL,
                 msg=f"{label} {quantity}",
             )
+
+    def test_pair_density_eval_grid_option(self):
+        exxss = ExxSS(
+            self.hf_mf,
+            pair_density_eval_grid=" Becke ",
+            pair_density_becke_grid_level="1",
+        )
+        self.assertEqual(exxss.pair_density_eval_grid, "becke")
+        self.assertEqual(exxss.pair_density_becke_grid_level, 1)
+
+        default_level = ExxSS(
+            self.hf_mf,
+            pair_density_becke_grid_level=None,
+        )
+        self.assertEqual(default_level.pair_density_eval_grid, "becke")
+        self.assertEqual(default_level.pair_density_becke_grid_level, 0)
+
+        with self.assertRaisesRegex(
+                ValueError, "pair_density_eval_grid"):
+            ExxSS(self.hf_mf, pair_density_eval_grid="atom")
+        with self.assertRaisesRegex(
+                ValueError, "pair_density_becke_grid_level"):
+            ExxSS(self.hf_mf, pair_density_becke_grid_level=-1)
 
     def test_pbe0_exxss_contracted_gaussian(self):
         self._assert_exxss_reference(

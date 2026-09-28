@@ -1,10 +1,15 @@
 from pyscf.pbc.tools import get_monkhorst_pack_size, madelung
+from pyscf.pbc import df
 import time
 from fsec.singularity_subtraction import model_function
 # import traceback
 from fsec.singularity_subtraction.function_fitting import ExxScipyMinimize, ExxScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import ExxStructureFactor
-from fsec.singularity_subtraction.structure_factor.helpers_sf import build_uKpts as _build_uKpts
+from fsec.singularity_subtraction.structure_factor.exx_sf import (
+    normalize_pair_density_becke_grid_level,
+    normalize_pair_density_eval_grid,
+)
+from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts as _build_uKpts
 from fsec.singularity_subtraction import SingularitySubtraction
 
 import numpy as np
@@ -52,6 +57,11 @@ class ExxSS(SingularitySubtraction):
             sq_ke_cutoff (float or None): kecutoff to control real space grid for the structure factor calculation. 
             sq_inversion_symm (bool): Whether to enforce inversion symmetry in the structure factor. Default is True.
             line_sampling (bool): Whether to sample q+G along reciprocal-lattice directions only. Default is False.
+            pair_density_eval_grid (str): Real-space quadrature grid used for
+                pair-density overlaps. Supported values are "uniform" and
+                "becke". Default is "becke".
+            pair_density_becke_grid_level (int): PySCF periodic Becke grid
+                level. Default is 0.
         """
 
 
@@ -90,6 +100,14 @@ class ExxSS(SingularitySubtraction):
         self.sq_ke_cutoff = kwargs.get('sq_ke_cutoff', None) 
         self.sq_inversion_symm = kwargs.get('sq_inversion_symm', True)
         self.line_sampling = kwargs.get('line_sampling', False)
+        self.pair_density_eval_grid = normalize_pair_density_eval_grid(
+            kwargs.get('pair_density_eval_grid', 'becke')
+        )
+        self.pair_density_becke_grid_level = (
+            normalize_pair_density_becke_grid_level(
+                kwargs.get('pair_density_becke_grid_level', 0)
+            )
+        )
 
         if self.sq_ke_cutoff is not None:
             print("sq_ke_cutoff provided to ExxSS, overriding N_local")
@@ -120,7 +138,9 @@ class ExxSS(SingularitySubtraction):
                                                             line_sampling=(
                                                                 self.line_sampling
                                                                 and self.qG_norm_cutoff is not None
-                                                            ))
+                                                            ),
+                                                            pair_density_eval_grid=self.pair_density_eval_grid,
+                                                            pair_density_becke_grid_level=self.pair_density_becke_grid_level)
 
         self.SqG = self.structure_factor.build_structure_factor()
 
@@ -138,7 +158,26 @@ class ExxSS(SingularitySubtraction):
 
 
             mf.exxdiv = None  # so that standard energy is computed without madelung
-            J, K = mf.get_jk(cell=mf.cell, dm_kpts=dm_kpts, kpts=kpts, kpts_band=kpts, with_j=False, exxdiv=None)
+            jk_kwargs = {
+                "cell": mf.cell,
+                "dm_kpts": dm_kpts,
+                "kpts": kpts,
+                # RSJK caches the combined J/K result from SCF.  Requesting
+                # only K here can make its incremental cache shapes
+                # incompatible (one output versus two), so retain the SCF
+                # J/K call shape and discard J below.
+                "with_j": True,
+                "exxdiv": None,
+            }
+            # Direct RSDF does not implement the band-k-point interface.  This
+            # calculation evaluates K on the SCF mesh itself, so kpts_band=kpts
+            # is redundant and can be omitted for that backend.
+            if not (
+                isinstance(mf.with_df, df.RSDF)
+                and bool(getattr(mf.with_df, "direct", False))
+            ):
+                jk_kwargs["kpts_band"] = kpts
+            J, K = mf.get_jk(**jk_kwargs)
             mf.exxdiv = 'ewald'
 
             Ek_uncorr = -1. / nk * np.einsum('kij,kji', dm_kpts, K) * 0.5
@@ -267,7 +306,9 @@ class ExxSS(SingularitySubtraction):
         temp_structure_factor = ExxStructureFactor(self.kmf, self.N_local,self.sq_ke_cutoff,
                                                             self.qG_norm_cutoff,
                                                             min_points=self.min_points,
-                                                            sq_inversion_symm=self.sq_inversion_symm)
+                                                            sq_inversion_symm=self.sq_inversion_symm,
+                                                            pair_density_eval_grid=self.pair_density_eval_grid,
+                                                            pair_density_becke_grid_level=self.pair_density_becke_grid_level)
         temp_SqG = temp_structure_factor.build_structure_factor()
         temp_qG_grid = temp_structure_factor.grids.qG_grid_truncated
 
@@ -353,7 +394,9 @@ class ExxSSQuarticExponential(ExxSS):
             temp_structure_factor = ExxStructureFactor(self.kmf, self.N_local,self.sq_ke_cutoff,
                                                                 self.qG_norm_cutoff,
                                                                 min_points=self.min_points,
-                                                                sq_inversion_symm=self.sq_inversion_symm)
+                                                                sq_inversion_symm=self.sq_inversion_symm,
+                                                                pair_density_eval_grid=self.pair_density_eval_grid,
+                                                                pair_density_becke_grid_level=self.pair_density_becke_grid_level)
             temp_SqG = temp_structure_factor.build_structure_factor()
             temp_qG_grid = temp_structure_factor.grids.qG_grid_truncated
 
