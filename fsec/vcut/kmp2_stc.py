@@ -17,11 +17,11 @@
 # The CDERI-to-MO transformation and padding conventions below are adapted
 # from pyscf.pbc.mp.kmp2 by the PySCF Developers.
 
-"""Exchange-only k-point MP2 using stored smoothed-truncated-Coulomb factors.
+"""Periodic MP2 with stored sTC and hybrid Coulomb interactions.
 
-This module requires the custom ``pyscf.pbc.df.rsdf_stc`` module.  The class
-keeps the reference SCF orbitals and its density-fitting object unchanged; its
-own ``with_df`` builder stores the sTC factors used by the exchange contraction.
+This module requires the custom ``pyscf.pbc.df.rsdf_stc`` module. Both classes
+keep the reference SCF orbitals and density-fitting object unchanged. Each
+owns a ``with_df`` builder for sTC; the hybrid also owns a bare direct builder.
 """
 
 import copy
@@ -31,7 +31,7 @@ import numpy as np
 from pyscf import lib
 from pyscf.lib import einsum, logger
 from pyscf.lib.parameters import LARGE_DENOM
-from pyscf.pbc.df import df
+from pyscf.pbc.df import df, rsdf
 from pyscf.pbc.lib import kpts as libkpts
 from pyscf.pbc.lib import kpts_helper
 from pyscf.pbc.mp import kmp2 as pyscf_kmp2
@@ -91,11 +91,13 @@ def _validate_reference(mf, mo_occ=None):
 
 
 class KMP2_STC(lib.StreamObject):
-    """Compute only the exchange part of periodic MP2 with sTC interactions.
+    """Compute periodic MP2 exchange, optionally with the sTC direct term.
 
-    The sTC interaction is used in both ERI factors of the exchange term.  The
-    returned energy is in Hartree per unit cell; no total, same-spin, or
-    opposite-spin energy is defined by this class.  Its independent
+    By default, the returned energy is exchange-only. With ``with_direct=True``
+    the sTC interaction is also used in both factors of the direct term. The
+    latest returned energy is stored in ``e_corr``; ``e_corr_exchange`` always
+    stores exchange, while ``e_corr_direct`` is ``None`` when the direct term
+    was not requested. Energies are in Hartree per unit cell. The independent
     ``with_df`` builder can be configured before its first build.
 
     Args:
@@ -112,8 +114,8 @@ class KMP2_STC(lib.StreamObject):
 
     _keys = {
         "mol", "cell", "_scf", "frozen", "mo_coeff", "mo_occ", "mo_energy",
-        "kpts", "nkpts", "khelper", "with_df", "e_corr_exchange", "t2",
-        "_nocc", "_nmo", "max_memory",
+        "kpts", "nkpts", "khelper", "with_df", "e_corr", "e_corr_direct",
+        "e_corr_exchange", "t2", "_nocc", "_nmo", "max_memory",
     }
 
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None, auxbasis=None,
@@ -150,6 +152,8 @@ class KMP2_STC(lib.StreamObject):
 
         self._nocc = None
         self._nmo = None
+        self.e_corr = None
+        self.e_corr_direct = None
         self.e_corr_exchange = None
         self.t2 = None
 
@@ -182,6 +186,8 @@ class KMP2_STC(lib.StreamObject):
         logger.info(self, "sTC cutoff = %s, rc_type = %s",
                     self.with_df.exxdiv, self.with_df.rc_type)
         logger.info(self, "sTC eta = %.15g", self.with_df.eta)
+        if hasattr(self, "with_df_direct"):
+            logger.info(self, "bare direct builder = %s", self.with_df_direct)
         logger.info(
             self,
             "max_memory %d MB (current use %d MB)",
@@ -190,138 +196,283 @@ class KMP2_STC(lib.StreamObject):
         )
         return self
 
-    def kernel(self, mo_energy=None, mo_coeff=None, with_t2=False):
-        """Return ``(exchange_energy, t2)`` for the supplied orbitals.
+    def kernel(self, mo_energy=None, mo_coeff=None, with_t2=False,
+               with_direct=False):
+        """Return exchange energy, or sTC direct plus exchange when requested.
 
-        The exchange contribution uses the sTC interaction in both ERI factors
-        and is returned in Hartree per unit cell.  With ``with_t2=True``, the
-        optional complex amplitudes have padded shape
-        ``(nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir)``; otherwise the second
-        return value is ``None``.
+        Each contribution uses its interaction in both ERI factors, including
+        the amplitude numerator. Energies are in Hartree per unit cell. The
+        optional amplitudes retain the padded shape
+        ``(nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir)``. ``e_corr_direct`` is
+        ``None`` when ``with_direct`` is false; ``e_corr`` matches the returned
+        energy.
         """
         cput0 = (logger.process_clock(), logger.perf_counter())
-        if mo_energy is None:
-            mo_energy = self.mo_energy
-        if mo_coeff is None:
-            mo_coeff = self.mo_coeff
-        if mo_energy is None or mo_coeff is None:
-            raise RuntimeError("mo_coeff and mo_energy must be initialized")
-
-        context = copy.copy(self)
-        context.mo_energy = mo_energy
-        coeffs = list(mo_coeff)
-        coeff_dtype = np.result_type(*(np.asarray(coeff).dtype for coeff in coeffs))
-        coeffs = [np.asarray(coeff, dtype=coeff_dtype) for coeff in coeffs]
-        mo_coeff, mo_energy = pyscf_kmp2._add_padding(context, coeffs, mo_energy)
-        mo_coeff = np.asarray(mo_coeff, dtype=coeff_dtype)
-        context.mo_coeff = mo_coeff
-
-        nocc = context.get_nocc()
-        nmo = context.get_nmo()
-        nvir = nmo - nocc
-        dtype = (np.double if kpts_helper.gamma_point(self.kpts)
-                 else np.complex128)
-        eri_dtype = np.result_type(dtype, mo_coeff.dtype)
-        energy_dtype = np.result_type(*(np.asarray(e).dtype for e in mo_energy))
-        nonzero_opadding, nonzero_vpadding = pyscf_kmp2.padding_k_idx(
-            context, kind="split"
+        context, orbitals = _prepare_orbitals(
+            self, mo_energy=mo_energy, mo_coeff=mo_coeff
         )
-
         context.dump_flags()
-        if getattr(self.with_df, "direct", False) or getattr(
-            self.with_df, "semidirect", False
-        ):
-            raise NotImplementedError(
-                "KMP2_STC requires stored CDERIs; direct and semidirect STC are unsupported"
-            )
-        if self.with_df._cderi is None:
-            self.with_df.build()
-
-        if self.with_df.auxcell is not None:
-            naux = self.with_df.auxcell.nao_nr()
-        else:
-            naux = self.with_df.get_naoaux()
-        mem_avail = self.max_memory - lib.current_memory()[0]
-        block_size = nocc * nocc * nvir * nvir
-        itemsize = np.dtype(eri_dtype).itemsize
-        nao = self.cell.nao_nr()
-        mem_usage = (
-            self.nkpts**2 * naux * nocc * nvir * 16
-            + (self.nkpts + 3) * itemsize * block_size
-            + np.dtype(energy_dtype).itemsize * block_size
-            + 3 * naux * nao**2 * 16
-        ) / 1e6
-        if with_t2:
-            mem_usage += self.nkpts**3 * (nocc * nvir) ** 2 * 16 / 1e6
-        if mem_usage > mem_avail:
-            raise MemoryError(
-                "Insufficient memory for STC-MP2 exchange: estimated %.0f MB "
-                "(currently available %.0f MB)" % (mem_usage, mem_avail)
-            )
-
-        Lov = _init_mp_df_eris(context, mo_coeff)
-        t2_dtype = np.result_type(eri_dtype, np.complex128)
-        if with_t2:
-            t2 = np.zeros(
-                (self.nkpts, self.nkpts, self.nkpts,
-                 nocc, nocc, nvir, nvir),
-                dtype=t2_dtype,
-            )
-        else:
-            t2 = None
-
-        mo_e_o = [np.asarray(mo_energy[k][:nocc]) for k in range(self.nkpts)]
-        mo_e_v = [np.asarray(mo_energy[k][nocc:]) for k in range(self.nkpts)]
-        exchange_energy = 0.0
-        oovv = np.empty(
-            (self.nkpts, nocc, nocc, nvir, nvir), dtype=eri_dtype
+        builder = self.with_df
+        _ensure_stored_builder(builder)
+        _check_memory(self, orbitals, [builder], retained_t2=int(with_t2))
+        direct, exchange, t2 = _contract_components(
+            self, context, orbitals, builder, with_t2=with_t2,
+            do_direct=with_direct, do_exchange=True,
         )
-        for ki in range(self.nkpts):
-            for kj in range(self.nkpts):
-                # Keep only the occupied-pair ERIs for this (ki, kj) pair.
-                for ka in range(self.nkpts):
-                    kb = self.khelper.kconserv[ki, ka, kj]
-                    oovv[ka] = einsum(
-                        "Lia,Ljb->iajb", Lov[ki, ka], Lov[kj, kb]
-                    ).transpose(0, 2, 1, 3)
-                    oovv[ka] /= self.nkpts
 
-                for ka in range(self.nkpts):
-                    kb = self.khelper.kconserv[ki, ka, kj]
-                    eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=energy_dtype)
-                    idx = np.ix_(nonzero_opadding[ki], nonzero_vpadding[ka])
-                    eia[idx] = (mo_e_o[ki][:, None] - mo_e_v[ka])[idx]
-                    ejb = LARGE_DENOM * np.ones((nocc, nvir), dtype=energy_dtype)
-                    idx = np.ix_(nonzero_opadding[kj], nonzero_vpadding[kb])
-                    ejb[idx] = (mo_e_o[kj][:, None] - mo_e_v[kb])[idx]
-                    denominator = lib.direct_sum("ia,jb->ijab", eia, ejb)
-                    t2_ijab = np.conj(oovv[ka] / denominator)
-                    if with_t2:
-                        t2[ki, kj, ka] = t2_ijab
-                    exchange_energy -= einsum(
-                        "ijab,ijba", t2_ijab, oovv[kb]
-                    ).real
-
-        logger.new_logger(self).timer("KMP2_STC exchange", *cput0)
-        self.e_corr_exchange = float(exchange_energy / self.nkpts)
+        self.e_corr_direct = float(direct / self.nkpts) if with_direct else None
+        self.e_corr_exchange = float(exchange / self.nkpts)
+        self.e_corr = self.e_corr_exchange + (self.e_corr_direct or 0.0)
         self.t2 = t2
+        logger.new_logger(self).timer("KMP2_STC", *cput0)
+        if with_direct:
+            logger.new_logger(self).info(
+                "sTC MP2 direct energy = %.15g Hartree per unit cell",
+                self.e_corr_direct,
+            )
         logger.new_logger(self).info(
             "sTC MP2 exchange energy = %.15g Hartree per unit cell",
             self.e_corr_exchange,
         )
-        return self.e_corr_exchange, t2
+        return self.e_corr, t2
 
 
-def _init_mp_df_eris(mp, mo_coeff):
-    """Transform this object's stored sTC CDERIs to the supplied padded MOs."""
+class KMP2_HYBRID(KMP2_STC):
+    """Bare direct plus sTC exchange periodic MP2 on fixed KRHF orbitals.
+
+    A separate ordinary RSDF builder supplies the bare direct interaction;
+    the inherited ``with_df`` builder supplies the sTC exchange interaction.
+    Both builders are independent and may be configured before first use. The
+    energy is in Hartree per unit cell and uses the same orbitals and energy
+    denominators for both terms.
+    """
+
+    _keys = KMP2_STC._keys | {"with_df_direct"}
+
+    def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None, auxbasis=None,
+                 eta=4.0, exxdiv="vcut_ws", rc_type="ws"):
+        super().__init__(
+            mf, frozen=frozen, mo_coeff=mo_coeff, mo_occ=mo_occ,
+            auxbasis=auxbasis, eta=eta, exxdiv=exxdiv, rc_type=rc_type,
+        )
+        self.with_df_direct = rsdf.RSGDF(self.cell, self.kpts)
+        self.with_df_direct.auxbasis = self.with_df.auxbasis
+        self.with_df_direct.max_memory = self.max_memory
+        self.with_df_direct.verbose = self.verbose
+        self.with_df_direct.stdout = self.stdout
+
+    def kernel(self, mo_energy=None, mo_coeff=None, with_t2=False):
+        """Return bare direct plus sTC exchange and optional amplitudes.
+
+        When ``with_t2=True``, the second return value and ``self.t2`` are a
+        dictionary with ``direct`` and ``exchange`` padded amplitude arrays.
+        Otherwise both are ``None``. Component energies are available in
+        ``e_corr_direct`` and ``e_corr_exchange``; ``e_corr`` matches the
+        returned sum. Energies are in Hartree per unit cell.
+        """
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        context, orbitals = _prepare_orbitals(
+            self, mo_energy=mo_energy, mo_coeff=mo_coeff
+        )
+        context.dump_flags()
+        _ensure_stored_builder(self.with_df_direct)
+        _ensure_stored_builder(self.with_df)
+        _check_memory(
+            self, orbitals, [self.with_df_direct, self.with_df],
+            retained_t2=2 if with_t2 else 0,
+        )
+
+        # Each pass owns its transformed factors and work arrays. Only its
+        # requested amplitudes survive into the next pass.
+        direct_raw, _, t2_direct = _contract_components(
+            self, context, orbitals, self.with_df_direct, with_t2=with_t2,
+            do_direct=True, do_exchange=False,
+        )
+        _, exchange_raw, t2_exchange = _contract_components(
+            self, context, orbitals, self.with_df, with_t2=with_t2,
+            do_direct=False, do_exchange=True,
+        )
+
+        self.e_corr_direct = float(direct_raw / self.nkpts)
+        self.e_corr_exchange = float(exchange_raw / self.nkpts)
+        self.e_corr = self.e_corr_direct + self.e_corr_exchange
+        if with_t2:
+            self.t2 = {"direct": t2_direct, "exchange": t2_exchange}
+        else:
+            self.t2 = None
+        logger.new_logger(self).timer("KMP2_HYBRID", *cput0)
+        logger.new_logger(self).info(
+            "Hybrid MP2 bare direct energy = %.15g Hartree per unit cell",
+            self.e_corr_direct,
+        )
+        logger.new_logger(self).info(
+            "Hybrid MP2 sTC exchange energy = %.15g Hartree per unit cell",
+            self.e_corr_exchange,
+        )
+        return self.e_corr, self.t2
+
+
+def _prepare_orbitals(mp, mo_energy=None, mo_coeff=None):
+    """Pad the selected orbitals once and collect contraction dimensions."""
+    if mo_energy is None:
+        mo_energy = mp.mo_energy
+    if mo_coeff is None:
+        mo_coeff = mp.mo_coeff
+    if mo_energy is None or mo_coeff is None:
+        raise RuntimeError("mo_coeff and mo_energy must be initialized")
+
+    context = copy.copy(mp)
+    context.mo_energy = mo_energy
+    coeffs = list(mo_coeff)
+    coeff_dtype = np.result_type(*(np.asarray(coeff).dtype for coeff in coeffs))
+    coeffs = [np.asarray(coeff, dtype=coeff_dtype) for coeff in coeffs]
+    coeffs, mo_energy = pyscf_kmp2._add_padding(context, coeffs, mo_energy)
+    coeffs = np.asarray(coeffs, dtype=coeff_dtype)
+    context.mo_coeff = coeffs
+
+    nocc = context.get_nocc()
+    nmo = context.get_nmo()
+    nvir = nmo - nocc
+    dtype = (np.double if kpts_helper.gamma_point(mp.kpts)
+             else np.complex128)
+    eri_dtype = np.result_type(dtype, coeffs.dtype)
+    energy_dtype = np.result_type(*(np.asarray(e).dtype for e in mo_energy))
+    opadding, vpadding = pyscf_kmp2.padding_k_idx(context, kind="split")
+    return context, {
+        "mo_coeff": coeffs,
+        "mo_energy": mo_energy,
+        "nocc": nocc,
+        "nmo": nmo,
+        "nvir": nvir,
+        "eri_dtype": eri_dtype,
+        "energy_dtype": energy_dtype,
+        "opadding": opadding,
+        "vpadding": vpadding,
+    }
+
+
+def _ensure_stored_builder(mydf):
+    """Build a selected density-fitting object and require stored CDERIs."""
+    if getattr(mydf, "direct", False) or getattr(mydf, "semidirect", False):
+        raise NotImplementedError(
+            "KMP2_STC requires stored CDERIs; direct and semidirect DF are unsupported"
+        )
+    if mydf._cderi is None:
+        mydf.build()
+
+
+def _check_memory(mp, orbitals, builders, retained_t2):
+    """Preflight each selected pass and all amplitudes retained across passes."""
+    nocc = orbitals["nocc"]
+    nvir = orbitals["nvir"]
+    nkpts = mp.nkpts
+    block_size = nocc * nocc * nvir * nvir
+    itemsize = np.dtype(orbitals["eri_dtype"]).itemsize
+    energy_itemsize = np.dtype(orbitals["energy_dtype"]).itemsize
+    nao = mp.cell.nao_nr()
+    pass_estimates = []
+    for builder in builders:
+        if builder.auxcell is not None:
+            naux = builder.auxcell.nao_nr()
+        else:
+            naux = builder.get_naoaux()
+        pass_estimates.append(
+            nkpts**2 * naux * nocc * nvir * 16
+            + (nkpts + 3) * itemsize * block_size
+            + energy_itemsize * block_size
+            + 3 * naux * nao**2 * 16
+        )
+
+    t2_itemsize = np.dtype(
+        np.result_type(orbitals["eri_dtype"], np.complex128)
+    ).itemsize
+    retained_bytes = retained_t2 * nkpts**3 * (nocc * nvir) ** 2 * t2_itemsize
+    mem_usage = (max(pass_estimates, default=0) + retained_bytes) / 1e6
+    mem_avail = mp.max_memory - lib.current_memory()[0]
+    if mem_usage > mem_avail:
+        raise MemoryError(
+            "Insufficient memory for %s: estimated %.0f MB "
+            "(currently available %.0f MB)"
+            % (mp.__class__.__name__, mem_usage, mem_avail)
+        )
+
+
+def _contract_components(mp, context, orbitals, builder, with_t2,
+                         do_direct, do_exchange):
+    """Contract selected direct and exchange terms using one DF interaction."""
+    nocc = orbitals["nocc"]
+    nvir = orbitals["nvir"]
+    mo_coeff = orbitals["mo_coeff"]
+    mo_energy = orbitals["mo_energy"]
+    eri_dtype = orbitals["eri_dtype"]
+    energy_dtype = orbitals["energy_dtype"]
+    opadding = orbitals["opadding"]
+    vpadding = orbitals["vpadding"]
+
+    Lov = _init_mp_df_eris(context, mo_coeff, with_df=builder)
+    t2_dtype = np.result_type(eri_dtype, np.complex128)
+    if with_t2:
+        t2 = np.zeros(
+            (mp.nkpts, mp.nkpts, mp.nkpts,
+             nocc, nocc, nvir, nvir), dtype=t2_dtype,
+        )
+    else:
+        t2 = None
+
+    mo_e_o = [np.asarray(mo_energy[k][:nocc]) for k in range(mp.nkpts)]
+    mo_e_v = [np.asarray(mo_energy[k][nocc:]) for k in range(mp.nkpts)]
+    direct_energy = 0.0
+    exchange_energy = 0.0
+    oovv = np.empty(
+        (mp.nkpts, nocc, nocc, nvir, nvir), dtype=eri_dtype
+    )
+    for ki in range(mp.nkpts):
+        for kj in range(mp.nkpts):
+            for ka in range(mp.nkpts):
+                kb = mp.khelper.kconserv[ki, ka, kj]
+                oovv[ka] = einsum(
+                    "Lia,Ljb->iajb", Lov[ki, ka], Lov[kj, kb]
+                ).transpose(0, 2, 1, 3)
+                oovv[ka] /= mp.nkpts
+
+            for ka in range(mp.nkpts):
+                kb = mp.khelper.kconserv[ki, ka, kj]
+                eia = LARGE_DENOM * np.ones(
+                    (nocc, nvir), dtype=energy_dtype
+                )
+                idx = np.ix_(opadding[ki], vpadding[ka])
+                eia[idx] = (mo_e_o[ki][:, None] - mo_e_v[ka])[idx]
+                ejb = LARGE_DENOM * np.ones(
+                    (nocc, nvir), dtype=energy_dtype
+                )
+                idx = np.ix_(opadding[kj], vpadding[kb])
+                ejb[idx] = (mo_e_o[kj][:, None] - mo_e_v[kb])[idx]
+                denominator = lib.direct_sum("ia,jb->ijab", eia, ejb)
+                t2_ijab = np.conj(oovv[ka] / denominator)
+                if with_t2:
+                    t2[ki, kj, ka] = t2_ijab
+                if do_direct:
+                    direct_energy += 2.0 * einsum(
+                        "ijab,ijab", t2_ijab, oovv[ka]
+                    ).real
+                if do_exchange:
+                    exchange_energy -= einsum(
+                        "ijab,ijba", t2_ijab, oovv[kb]
+                    ).real
+
+    return direct_energy, exchange_energy, t2
+
+
+def _init_mp_df_eris(mp, mo_coeff, with_df=None):
+    """Transform a selected stored DF builder's CDERIs to the padded MOs."""
     from pyscf.ao2mo import _ao2mo
 
-    mydf = mp.with_df
+    mydf = mp.with_df if with_df is None else with_df
     if mydf._cderi is None:
         mydf.build()
     if getattr(mydf, "direct", False) or getattr(mydf, "semidirect", False):
         raise NotImplementedError(
-            "KMP2_STC requires stored CDERIs; direct and semidirect STC are unsupported"
+            "KMP2_STC requires stored CDERIs; direct and semidirect DF are unsupported"
         )
 
     nocc = mp.nocc
