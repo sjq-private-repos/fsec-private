@@ -1,4 +1,5 @@
 import unittest
+from io import StringIO
 from unittest.mock import patch
 from types import SimpleNamespace
 import gc
@@ -6,6 +7,7 @@ import importlib.util
 import weakref
 
 import numpy as np
+from pyscf.lib import logger
 from pyscf.pbc import df, mp
 from pyscf.pbc.mp import kmp2
 from pyscf.pbc import gto, scf
@@ -1305,6 +1307,9 @@ class KnownValues(unittest.TestCase):
             atol=1e-10,
         )
     def test_kikj_on_the_fly_matches_kikjka_with_repeated_qi(self):
+        """Cached amplitudes preserve values and use the SF logging context."""
+        quiet_output = StringIO()
+        detailed_output = StringIO()
         reciprocal = self.kmf.cell.reciprocal_vectors()
         qG_full = np.array([
             [0.0, 0.0, 0.0],
@@ -1323,6 +1328,8 @@ class KnownValues(unittest.TestCase):
             check_trs=False,
             t2_store_type="kikjka",
             pair_density_eval_grid="uniform",
+            verbose=logger.DEBUG1,
+            stdout=quiet_output,
         )
         reference = reference_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -1336,6 +1343,8 @@ class KnownValues(unittest.TestCase):
             sq_inversion_symm=False,
             t2_store_type="kikj",
             pair_density_eval_grid="uniform",
+            verbose=logger.DEBUG2,
+            stdout=detailed_output,
         )
         actual = kikj_sf.build_structure_factor(
             qG_full=qG_full, direct=True, exchange=True, dG0=True)
@@ -1361,6 +1370,11 @@ class KnownValues(unittest.TestCase):
         )
         self.assertIn("direct t2 cache hit", kikj_sf.last_build_timings)
         self.assertIn("exchange t2 cache hit", kikj_sf.last_build_timings)
+        self.assertNotIn("CPU", quiet_output.getvalue())
+        output = detailed_output.getvalue()
+        self.assertEqual(output.count("build_structure_factor CPU"), 1)
+        self.assertEqual(output.count("compute_t2 CPU"), 2)
+        self.assertIn("MP2 structure-factor progress", output)
 
     def test_kikj_lov_matches_kikjka_without_t2_materialization(self):
         reciprocal = self.kmf.cell.reciprocal_vectors()
