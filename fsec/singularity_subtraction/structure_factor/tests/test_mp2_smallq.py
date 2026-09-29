@@ -2,11 +2,13 @@
 
 import copy
 import unittest
+from io import StringIO
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 
+from pyscf.lib import logger
 from pyscf.pbc import df, gto, mp, scf
 from pyscf.pbc.mp import kmp2
 from pyscf.pbc.tools import get_monkhorst_pack_size
@@ -29,7 +31,7 @@ def make_h2_cell():
     cell.a = np.eye(3) * 6.0
     cell.basis = "gth-szv"
     cell.pseudo = "gth-hf"
-    cell.mesh = [9, 9, 9]
+    cell.mesh = np.asarray([9, 9, 9])
     cell.precision = 1e-7
     cell.verbose = 0
     cell.build()
@@ -249,6 +251,9 @@ class MP2SmallQScientificTests(unittest.TestCase):
         ) = make_reference_pair(
             self.kmf, self.kmp, options, N_local, pair_grid
         )
+        output = StringIO()
+        level = logger.DEBUG2 if pair_grid == "becke" else logger.DEBUG1
+        smallq.verbose = logger.Logger(output, level)
         try:
             # Preserve a supplied occupied-energy shift and verify its effect
             # through an independent explicit-denominator contraction.
@@ -312,6 +317,26 @@ class MP2SmallQScientificTests(unittest.TestCase):
             self.assertTrue(shifted_result.active_virtual_energies_plus)
             self.assertTrue(shifted_result.active_virtual_energies_minus)
             self.assertEqual(shifted_result.qprime[2] > 0, True)
+
+            # Both band backends keep timings available at every verbosity,
+            # while detailed output goes only to the selected DEBUG2 logger.
+            self.assertEqual(
+                output.getvalue().count("MP2 small-q kernel CPU"),
+                int(level == logger.DEBUG2),
+            )
+            for phase in (
+                "shifted-band DF construction",
+                "shifted-band Fock diagonalization",
+                "MO padding",
+                "pair-density construction",
+                "correlation GDF construction",
+                "single-point structure factor",
+                "total",
+            ):
+                for clock in ("cpu", "wall"):
+                    self.assertGreaterEqual(
+                        smallq.last_kernel_timings[phase][clock], 0.0
+                    )
         finally:
             handle = ordinary_df._cderi_to_save
             if not isinstance(handle, str) and not handle.closed:
@@ -345,6 +370,34 @@ class MP2SmallQScientificTests(unittest.TestCase):
             fft_mesh=(11, 13, 15),
         )
         self._compare_to_explicit_driver("becke", options)
+
+    def test_mp2ss_forwards_smallq_options_and_timing_logger(self):
+        """MP2SS retains the shifted-band options and shares its timing stream."""
+        options = MP2SmallQOptions(
+            relative_shift=(0.0, 0.0, 0.1),
+            band_backend="fftdf", cutoff="sph", fft_mesh=(9, 9, 9),
+        )
+        calculation = MP2SS(
+            self.kmf, self.kmp,
+            options=MP2SSOptions(
+                smallq=options, N_local=(3, 3, 3), qG_norm_cutoff=2.0,
+                min_points=1, t2_store_type="ki",
+                pair_density_eval_grid="uniform", verbose=logger.DEBUG2,
+            ),
+        )
+        calculation.stdout = StringIO()
+        structure_factor = calculation.set_structure_factor(
+            direct=True, exchange=False, dG0=True,
+        )
+        result = calculation.smallq_result
+        self.assertIs(structure_factor.smallq_result, result)
+        self.assertEqual(result.relative_shift, options.relative_shift)
+        self.assertEqual(result.band_backend, options.band_backend)
+        self.assertEqual(result.fft_mesh, options.fft_mesh)
+        self.assertIs(structure_factor.stdout, calculation.stdout)
+        output = calculation.stdout.getvalue()
+        self.assertEqual(output.count("MP2 small-q kernel CPU"), 1)
+        self.assertEqual(output.count("build_structure_factor CPU"), 1)
 
     def test_fft_bands_match_independent_builder_and_mesh_is_independent(self):
         """FFTDF bands use the original SCF grid and keep its mesh detached."""
@@ -805,6 +858,8 @@ class MP2SSSmallQFitIntegrationTests(unittest.TestCase):
     @staticmethod
     def _bare_mp2ss(separate):
         mp2ss = MP2SS.__new__(MP2SS)
+        mp2ss.verbose = logger.DEBUG2
+        mp2ss.stdout = StringIO()
         mp2ss.correct_q2_q4_separately = separate
         mp2ss.dG0 = True
         mp2ss.grids = object()
@@ -895,6 +950,9 @@ class MP2SSSmallQFitIntegrationTests(unittest.TestCase):
         self.assertEqual(len(observed["q4"]["qG_full"]), 3)
         self.assertAlmostEqual(observed["q4"]["SqG_full_q4"][-1], 0.03)
         self.assertTrue(observed["q4"]["q4_fit_mask"][-1])
+        output = mp2ss.stdout.getvalue()
+        self.assertEqual(output.count("MP2SS direct q2 correction CPU"), 1)
+        self.assertEqual(output.count("MP2SS direct q4 correction CPU"), 1)
 
 
 if __name__ == "__main__":

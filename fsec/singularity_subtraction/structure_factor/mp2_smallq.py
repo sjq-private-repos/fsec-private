@@ -13,7 +13,10 @@ from pyscf.pbc.tools import get_monkhorst_pack_size
 from pyscf.pbc.tools.pbc import cutoff_to_mesh, mesh_to_cutoff
 
 from fsec.singularity_subtraction.grids import minimum_image
-from fsec.singularity_subtraction.structure_factor.helpers import build_uKpts
+from fsec.singularity_subtraction.structure_factor.helpers import (
+    TimingProfile,
+    build_uKpts,
+)
 
 
 @dataclass(frozen=True)
@@ -157,7 +160,9 @@ class MP2SmallQ:
     grids with the selected band backend. Pair densities are integrated over
     the configured Becke or uniform real-space grid. Here ``qprime`` is a
     Cartesian vector in inverse Bohr; ``sq_q4`` is the fourth-order direct
-    contribution from the same pair densities.
+    contribution from the same pair densities. CPU and wall times are saved
+    in ``last_kernel_timings`` after each kernel call and logged at ``DEBUG2``
+    using the selected PySCF verbosity or logger.
     """
 
     def __init__(
@@ -333,21 +338,27 @@ class MP2SmallQ:
         band_mf._eri = None
         return band_mf, fft_df, None
 
-    def _get_shifted_bands(self, grids):
+    def _get_shifted_bands(self, grids, profile=None):
         """Evaluate shifted virtual bands using the original SCF density."""
         if grids.minus_from_plus is None:
             band_kpts = np.concatenate((grids.plus, grids.minus), axis=0)
         else:
             band_kpts = grids.plus
 
+        phase_t0 = profile.start() if profile is not None else None
         band_mf, band_df, j_df = self._make_band_mean_field(band_kpts)
         try:
+            if profile is not None:
+                profile.stop("shifted-band DF construction", phase_t0)
+                phase_t0 = profile.start()
             dm_kpts = self.kmf.make_rdm1()
             energies, coeffs = band_mf.get_bands(
                 band_kpts,
                 dm_kpts=dm_kpts,
                 kpts=self.kmf.kpts,
             )
+            if profile is not None:
+                profile.stop("shifted-band Fock diagonalization", phase_t0)
             energies = list(np.asarray(energies))
             coeffs = list(np.asarray(coeffs))
             nkpts = len(grids.occupied)
@@ -517,13 +528,17 @@ class MP2SmallQ:
     def kernel(self):
         """Build the q-point result and release all temporary GDF files."""
         log = logger.new_logger(self.kmp, self.verbose)
+        profile = TimingProfile()
+        total_t0 = profile.start()
+
         grids = self._build_grids()
         (energy_plus, coeff_plus), (energy_minus, coeff_minus) = (
-            self._get_shifted_bands(grids)
+            self._get_shifted_bands(grids, profile=profile)
         )
 
         # Keep the exact KMP2 occupied data, including user-supplied energy
         # shifts, while applying KMP2's frozen and padding conventions.
+        phase_t0 = profile.start()
         coeff_occ, energy_occ = kmp2._add_padding(
             self.kmp, self.kmp.mo_coeff, self.kmp.mo_energy
         )
@@ -533,13 +548,20 @@ class MP2SmallQ:
         coeff_minus, energy_minus = kmp2._add_padding(
             self.kmp, coeff_minus, energy_minus
         )
+        profile.stop("MO padding", phase_t0)
+
+        phase_t0 = profile.start()
         rho_ia, rho_jb = self._build_pair_densities(
             grids, coeff_occ, coeff_plus, coeff_minus
         )
+        profile.stop("pair-density construction", phase_t0)
 
         band_kpts = np.concatenate((grids.plus, grids.minus), axis=0)
+        phase_t0 = profile.start()
         correlation_df = self._make_correlation_gdf(grids.occupied, band_kpts)
         try:
+            profile.stop("correlation GDF construction", phase_t0)
+            phase_t0 = profile.start()
             sq_direct, sq_q4 = self._contract(
                 grids,
                 coeff_occ,
@@ -552,6 +574,7 @@ class MP2SmallQ:
                 rho_jb,
                 correlation_df,
             )
+            profile.stop("single-point structure factor", phase_t0)
         finally:
             _close_temporary_gdf(correlation_df)
 
@@ -615,4 +638,9 @@ class MP2SmallQ:
                 self.result.fft_mesh,
                 self.result.cutoff,
             )
+        self.last_kernel_timings = profile.summary(total_t0)
+        profile.log_summary(
+            log, self.last_kernel_timings,
+            title="MP2 small-q kernel", level=logger.DEBUG2,
+        )
         return self.result

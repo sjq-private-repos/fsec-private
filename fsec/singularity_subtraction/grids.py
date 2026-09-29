@@ -231,8 +231,6 @@ class ExxSSGrids(SSGrids):
         min_fitting_pts = self.min_points
 
         print("Computing only necessary SqG")
-        import time
-        temp_time = time.time()
         qG_full = np.einsum('ij,kj->ikj', qGrid, np.ones_like(GptGrid3D)).reshape(-1, 3) \
             + np.tile(GptGrid3D, (qGrid.shape[0], 1))
 
@@ -258,8 +256,6 @@ class ExxSSGrids(SSGrids):
         if max(np.linalg.norm(cell.reciprocal_vectors() * N_local, axis=1)) < qG_norm_cutoff:
             print("NOTE: qG_norm_cutoff is outside the longest dimension of the NlocalBZs")
 
-        temp_time2 = time.time()
-        print("Time to compute qG_full", temp_time2 - temp_time)
         self.qG_grid_truncated = qG_full[qG_norm < qG_norm_cutoff]
         print("Number of fitting points: ", self.qG_grid_truncated.shape[0])
         return self.qG_grid_truncated
@@ -320,8 +316,6 @@ class MP2SSGrids(ExxSSGrids):
         min_fitting_pts = self.min_points
 
         print("Computing only necessary SqG")
-        import time
-        temp_time = time.time()
         qG_full = np.einsum('ij,kj->ikj', qGrid, np.ones_like(GptGrid3D)).reshape(-1, 3) + np.tile(GptGrid3D, (qGrid.shape[0], 1))
 
         qG_norm = np.linalg.norm(qG_full, axis=1)
@@ -346,8 +340,6 @@ class MP2SSGrids(ExxSSGrids):
         if max(np.linalg.norm(cell.reciprocal_vectors() * N_local, axis=1)) < qG_norm_cutoff:
             print("NOTE: qG_norm_cutoff is outside the longest dimension of the NlocalBZs")
 
-        temp_time2 = time.time()
-        print("Time to compute qG_full", temp_time2 - temp_time)
         self.qG_grid_truncated = qG_full[qG_norm < qG_norm_cutoff]
         print("Number of fitting points: ", self.qG_grid_truncated.shape[0])
         return self.qG_grid_truncated
@@ -357,4 +349,7 @@ class MP2SSGrids(ExxSSGrids):
         Build all grids
         """
         super().build_grids()
-        self.build_truncated_qG_grid()
+        # ExxSSGrids.build_grids builds the truncated grid when a cutoff is
+        # known. Select it here only when the cutoff must be inferred.
+        if self.qG_norm_cutoff is None:
+            self.build_truncated_qG_grid()

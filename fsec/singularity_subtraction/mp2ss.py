@@ -3,7 +3,7 @@ from typing import Optional
 import warnings
 
 from pyscf.pbc.tools import get_monkhorst_pack_size
-import time
+from pyscf.lib import logger
 from fsec.singularity_subtraction import model_function
 from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
@@ -17,6 +17,16 @@ from pyscf.pbc import df
 from pyscf import lib
 import numpy as np
 from numpy.typing import ArrayLike
+
+
+def _log_timing(log, method, title, start):
+    """Log CPU and wall time measured with PySCF's clock helpers."""
+    getattr(log, method)(
+        "%s CPU %.2f sec, wall %.2f sec",
+        title,
+        logger.process_clock() - start[0],
+        logger.perf_counter() - start[1],
+    )
 
 
 def convert_t2_to_kikjq_format(t2,kGrid1,qGrid,cell,kGrid2=None):
@@ -171,11 +181,15 @@ class MP2SSOptions:
         Lower values use fewer atom-centered grid points. The default is 0.
     verbose
         PySCF logging verbosity. ``None`` inherits ``kmp.verbose``. At
-        ``pyscf.lib.logger.DEBUG`` the final structure-factor table and other
-        debug diagnostics are written to the inherited PySCF output stream.
+        ``pyscf.lib.logger.NOTE`` MP2SS reports its total CPU and wall time;
+        ``DEBUG`` also reports the enabled direct and exchange correction
+        work totals; shared structure-factor work is included in the overall
+        total and shown separately at ``DEBUG2``. ``DEBUG2`` also adds
+        amplitude, small-q, and separate q2/q4 timing details. Messages use
+        the inherited PySCF output stream.
     smallq
-        Optional :class:`MP2SmallQOptions` that adds one sTC virtual-band
-        point to the direct fit. ``None`` disables the small-q point.
+        Optional :class:`MP2SmallQOptions` that adds one shifted virtual-band
+        point to the direct fit using sTC or FFTDF. ``None`` disables it.
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
@@ -755,7 +769,6 @@ class MP2DirectFullSS(SingularitySubtraction):
                            grids=None, nks=None,
                            fit_SqG_full_direct=None, fit_qG_full=None):
         print("MP2SS: Computing direct correction...")
-        ss_start = time.time()
         if SqG_full_direct is None:
             raise ValueError("SqG_full_direct must be provided explicitly")
         if qG_full is None:
@@ -803,8 +816,6 @@ class MP2DirectFullSS(SingularitySubtraction):
             direct_integral_term=integral_term,
             direct_quadrature_term=quadrature_term,
         )
-
-        print(f"MP2SS: Direct correction computed in %.2f seconds" % (time.time() - ss_start))
 
         return result
 
@@ -909,7 +920,6 @@ class MP2ExchangeSS(SingularitySubtraction):
 
     def compute_correction(self, *, SqG_full_exchange=None, qG_full=None, grids=None, nks=None):
         print("MP2SS: Computing exchange correction...")
-        ss_start = time.time()
         if SqG_full_exchange is None:
             raise ValueError("SqG_full_exchange must be provided explicitly")
         if qG_full is None:
@@ -944,8 +954,6 @@ class MP2ExchangeSS(SingularitySubtraction):
         self.integral_term = integral_term
         self.correction = total_exchange_correction
 
-        ss_end = time.time()
-        print(f"MP2SS: Exchange correction computed in %.2f seconds" % (ss_end - ss_start))
         return ExchangeCorrectionResult(
             total_exchange_correction=total_exchange_correction,
             exchange_integral_term=integral_term,
@@ -1181,6 +1189,7 @@ class MP2SS:
 
     def set_structure_factor(self, direct=True, exchange=True, dG0=False,
                              line_sampling=False):
+        log = logger.new_logger(self)
         mp2_structure_factor = MP2StructureFactor(
             self.kmf, self.kmp, t2=self.t2, N_local=self.N_local,
             sq_ke_cutoff=self.sq_ke_cutoff, qG_cutoff=self.qG_norm_cutoff,
@@ -1217,6 +1226,7 @@ class MP2SS:
             line_sampling_decay_consecutive_below=self.line_sampling_decay_consecutive_below,
             line_sampling_decay_components=self.line_sampling_decay_components if line_sampling else (),
             qG_line_sampling_segments=getattr(mp2_structure_factor.grids, "qG_line_sampling_segments", None),
+            verbose=log,
         )
 
         if self.t2_store_type == 'kikjka':
@@ -1234,7 +1244,7 @@ class MP2SS:
                 pair_density_becke_grid_level=self.pair_density_becke_grid_level,
                 sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
                 outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
-                verbose=self.verbose,
+                verbose=log,
             )
             self.smallq_result = smallq.kernel()
         mp2_structure_factor.smallq_result = self.smallq_result
@@ -1243,7 +1253,9 @@ class MP2SS:
         return self.mp2_structure_factor
     
 
-    def compute_direct_correction(self,SqG_full_direct=None,qG_full=None):
+    def compute_direct_correction(self, SqG_full_direct=None, qG_full=None,
+                                  log=None):
+        log = logger.new_logger(self) if log is None else log
         if SqG_full_direct is None:
             SqG_full_direct = self.mp2_structure_factor.SqG_full_direct
         if qG_full is None:
@@ -1319,13 +1331,16 @@ class MP2SS:
             full_config = self._build_direct_full_correction_config()
 
             self.direct_second_order_correction = MP2DirectSecondOrderSS(second_order_config)
+            q2_t0 = logger.process_clock(), logger.perf_counter()
             q2_result = self.direct_second_order_correction.compute_correction(
                 SqG_full_q2_part=q2_SqG_fit,
                 qG_full=q2_qG_fit,
                 grids=self.grids,
                 nks=self.nks,
             )
+            _log_timing(log, "debug2", "MP2SS direct q2 correction", q2_t0)
             self.direct_fourth_order_correction = MP2DirectFourthOrderSS(fourth_order_config)
+            q4_t0 = logger.process_clock(), logger.perf_counter()
             q4_result = self.direct_fourth_order_correction.compute_correction(
                 SqG_full_q4=q4_SqG_fit,
                 qG_full=q4_qG_fit,
@@ -1333,6 +1348,7 @@ class MP2SS:
                 nks=self.nks,
                 q4_fit_mask=q4_fit_mask,
             )
+            _log_timing(log, "debug2", "MP2SS direct q4 correction", q4_t0)
             if q2_result is None or q4_result is None:
                 return None
 
@@ -1414,20 +1430,63 @@ class MP2SS:
 
 
 
-    def compute_correction(self,direct=True,exchange=True):
+    def _reset_correction_results(self, direct, exchange):
+        """Clear per-call values so disabled terms cannot expose old results."""
+        self._direct_enabled = direct
+        self._exchange_enabled = exchange
+        for name in (
+            "direct_integral_term", "direct_quadrature_term",
+            "direct_total_correction", "direct_integral_term_q2",
+            "direct_quadrature_term_q2", "direct_total_correction_q2",
+            "direct_integral_term_q4", "direct_quadrature_term_q4",
+            "direct_total_correction_q4", "direct_total_correction_q2_q4",
+            "exchange_integral_term", "exchange_quadrature_term",
+            "mp2ss_total_correction", "mp2ss_direct_correction",
+            "mp2ss_exchange_correction", "edi_uncorr", "exi_uncorr",
+            "emp2_uncorr", "emp2ss_direct", "emp2ss_exchange", "emp2ss",
+        ):
+            setattr(self, name, None)
+
+        for calculator_name in (
+            "direct_correction", "direct_second_order_correction",
+            "direct_fourth_order_correction", "exchange_correction",
+        ):
+            calculator = getattr(self, calculator_name, None)
+            if calculator is None:
+                continue
+            for result_name in ("integral_term", "quadrature_term", "correction"):
+                if hasattr(calculator, result_name):
+                    setattr(calculator, result_name, None)
+
+        self.mp2_structure_factor = None
+        self.smallq_result = None
+
+    def compute_correction(self, direct=True, exchange=True):
         """
         Compute the direct MP2 correction using singularity subtraction.
         This implements the direct correction logic from the MATLAB mp2_ss_direct function.
         """
+        if not direct and not exchange:
+            raise ValueError("At least one of direct or exchange must be requested")
+
+        log = logger.new_logger(self)
+        total_t0 = logger.process_clock(), logger.perf_counter()
+        self._reset_correction_results(direct=direct, exchange=exchange)
+
         print("Computing MP2SS correction...")
-        ss_start = time.time()
 
         # Build grids if not already built
         if self.grids is None:
             self.set_grids()
 
-        self.set_structure_factor(direct=direct, exchange=exchange, dG0=self.dG0,
+        structure_factor_t0 = logger.process_clock(), logger.perf_counter()
+        self.set_structure_factor(direct=direct, exchange=exchange,
+                                  dG0=direct and self.dG0,
                                   line_sampling=self.line_sampling)
+        _log_timing(
+            log, "debug2", "MP2SS structure-factor construction",
+            structure_factor_t0,
+        )
 
         SqG_full_direct = self.mp2_structure_factor.SqG_full_direct if direct else None
         SqG_full_exchange = self.mp2_structure_factor.SqG_full_exchange if exchange else None
@@ -1439,14 +1498,29 @@ class MP2SS:
         self.exi_uncorr = e_corr_ss - e_corr_os
         self.emp2_uncorr = self.kmp.e_corr
 
-        mp2ss_direct_correction = self.compute_direct_correction(
-            SqG_full_direct=SqG_full_direct,
-            qG_full=qG_full,
-        )
-        mp2ss_exchange_correction = self.compute_exchange_correction(
-            SqG_full_exchange=SqG_full_exchange,
-            qG_full=qG_full,
-        )
+        if direct:
+            direct_t0 = logger.process_clock(), logger.perf_counter()
+            mp2ss_direct_correction = self.compute_direct_correction(
+                SqG_full_direct=SqG_full_direct,
+                qG_full=qG_full,
+            )
+            _log_timing(
+                log, "debug", "MP2SS direct correction", direct_t0,
+            )
+        else:
+            mp2ss_direct_correction = 0.0
+
+        if exchange:
+            exchange_t0 = logger.process_clock(), logger.perf_counter()
+            mp2ss_exchange_correction = self.compute_exchange_correction(
+                SqG_full_exchange=SqG_full_exchange,
+                qG_full=qG_full,
+            )
+            _log_timing(
+                log, "debug", "MP2SS exchange correction", exchange_t0,
+            )
+        else:
+            mp2ss_exchange_correction = 0.0
 
         total_correction = mp2ss_direct_correction + mp2ss_exchange_correction
         self.mp2ss_total_correction = total_correction
@@ -1463,7 +1537,7 @@ class MP2SS:
             mp2ss_direct_correction=mp2ss_direct_correction,
             mp2ss_exchange_correction=mp2ss_exchange_correction,
         )
-        print('Total time for MP2SS: %.2f seconds' % (time.time() - ss_start))
+        _log_timing(log, "note", "MP2SS", total_t0)
         return total_correction
     
     def print_results(self):
@@ -1478,13 +1552,13 @@ class MP2SS:
         print(f" MP2 uncorrected total energy (hartree)    = {self.emp2_uncorr}")
         print()
 
-        if self.correct_q2_q4_separately:
-            self.direct_second_order_correction.print_results()
-            self.direct_fourth_order_correction.print_results()
+        if getattr(self, "_direct_enabled", True):
+            if self.correct_q2_q4_separately:
+                self.direct_second_order_correction.print_results()
+                self.direct_fourth_order_correction.print_results()
             self.direct_correction.print_results()
-        else:
-            self.direct_correction.print_results()
-        self.exchange_correction.print_results()
+        if getattr(self, "_exchange_enabled", True):
+            self.exchange_correction.print_results()
 
         print("Final Energies:")
         print(f" MP2SS direct final energy (hartree)        = {self.emp2ss_direct}")

@@ -116,9 +116,7 @@ class ExxStructureFactor(StructureFactor):
             )
         )
 
-        phase_t0 = profile.start()
         self.set_grids(min_fit_points=self.min_points)
-        profile.stop("grid construction", phase_t0)
         qG_full = self.grids.qG_grid_truncated
         kGrid1 = self.grids.kGrid1
         kGrid2 = self.grids.kGrid2
