@@ -144,7 +144,9 @@ class ExxSSGrids(SSGrids):
         """
         qG_norm_cutoff = qG_norm_cutoff if qG_norm_cutoff is not None else self.qG_norm_cutoff
         qG_full = []
+        line_segments = []
         B_over_nk = self.cell.reciprocal_vectors() / self.nks[:, None]
+        next_index = 1
         for i in range(B_over_nk.shape[0]):
             B_i = B_over_nk[i, :]
             B_i_norm = np.linalg.norm(B_i)
@@ -153,8 +155,22 @@ class ExxSSGrids(SSGrids):
             for j in range(npoints):
                 qG_full_i[j, :] = (j + 1) * B_i
             qG_full.append(qG_full_i)
+            indices = np.arange(next_index, next_index + npoints, dtype=int)
+            line_segments.append({
+                "line_index": i,
+                "B_index": i,
+                "step_vector": B_i.copy(),
+                "q_min": qG_full_i[0].copy() if npoints > 0 else None,
+                "indices": indices,
+            })
+            next_index += npoints
         qG_full = np.concatenate(qG_full, axis=0)
         qG_full = np.concatenate([np.zeros((1, 3)), qG_full], axis=0)
+        self.qG_line_sampling_segments = line_segments
+        self.qG_line_sampling_metadata = {
+            "origin_index": 0,
+            "segments": line_segments,
+        }
         return qG_full
 
 
