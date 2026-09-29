@@ -529,9 +529,7 @@ class MP2SmallQ:
         profile = TimingProfile()
         total_t0 = profile.start()
 
-        phase_t0 = profile.start()
         qprime, grids = self._build_grids()
-        profile.stop("small-q grid construction", phase_t0)
 
         shifted_energy, shifted_coeff = self._get_shifted_bands(
             grids.kGrid2,
@@ -589,6 +587,8 @@ class MP2SmallQ:
             pair_density_becke_grid_level=self.pair_density_becke_grid_level,
             sq_ke_cutoff_switch_radius=self.sq_ke_cutoff_switch_radius,
             outer_sq_ke_cutoff_scale=self.outer_sq_ke_cutoff_scale,
+            verbose=log.verbose,
+            stdout=log.stdout,
         )
         profile.stop("structure-factor setup", phase_t0)
 
@@ -612,7 +612,7 @@ class MP2SmallQ:
             Lov=lov,
             Lov_b=lov_b,
             kmp=self.kmp,
-            verbose=self.verbose,
+            verbose=log,
         )
         profile.stop("single-point structure factor", phase_t0)
 
@@ -631,5 +631,6 @@ class MP2SmallQ:
             log,
             self.last_kernel_timings,
             title="MP2 small-q kernel",
+            level=logger.DEBUG2,
         )
         return self.result

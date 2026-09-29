@@ -56,7 +56,8 @@ def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=Non
                         use kmp.nocc / kmp.nmo and kmp2.padding_k_idx.
         mo_coeff (list): a list of numpy.ndarray. Each array contains MO coefficients
                         of shape (Nao, Nmo) for one kpt. Padded analogously.
-        verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
+        verbose (int or Logger, optional): PySCF logging level or logger.
+            Defaults to logger.DEBUG; per-region amplitude timings are at DEBUG2.
         with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
         mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct'
         return_eijab_recip (bool, optional): whether to also return reciprocal
@@ -237,25 +238,12 @@ def compute_t2_amplitudes(kmp, mo_energy, mo_coeff, qGrid=None, qGrid_sample=Non
                     profile.stop("compute_t2 amplitude store", region_t0)
     profile.stop("compute_t2 main loops", loop_t0)
 
-    log.timer("KMP2", *cput0)
     print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
     print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
     timings = profile.summary(cput0)
-    total = timings["total"]
-    log.debug(
-        "compute_t2 CPU %.2f sec, wall %.2f sec",
-        total["cpu"], total["wall"],
+    profile.log_summary(
+        log, timings, title="compute_t2", level=logger.DEBUG2,
     )
-    for label, values in sorted(
-            ((key, value) for key, value in timings.items() if key != "total"),
-            key=lambda item: item[1]["wall"], reverse=True):
-        cpu_fraction = 100.0 * values["cpu"] / total["cpu"] if total["cpu"] else 0.0
-        wall_fraction = 100.0 * values["wall"] / total["wall"] if total["wall"] else 0.0
-        log.debug(
-            "  %-36s CPU %9.2f sec (%5.1f%%), wall %9.2f sec (%5.1f%%)",
-            label, values["cpu"], cpu_fraction,
-            values["wall"], wall_fraction,
-        )
 
     if return_eijab_recip:
         return t2, eijab_recip
@@ -340,7 +328,7 @@ class MP2StructureFactor(StructureFactor):
         return [e[mask] for e, mask in zip(mmp.mo_energy, moidx)]
     
 
-    def set_grids(self,min_fit_points=6):
+    def set_grids(self, min_fit_points=6):
         self.min_points = min_fit_points
         self.grids = MP2SSGrids(self.kmf.cell,
                                 self.kGrid1,
@@ -348,7 +336,6 @@ class MP2StructureFactor(StructureFactor):
                                 qG_norm_cutoff=self.qG_cutoff,
                                 min_points=self.min_points)
         self.grids.build_grids()
-        self.grids.build_truncated_qG_grid()
 
 
     @staticmethod
@@ -437,9 +424,10 @@ class MP2StructureFactor(StructureFactor):
             The grids object to use for the structure factor calculation.
             If None, uses the grids constructed from the class grid setup.
         verbose : int or pyscf.lib.logger.Logger, optional
-            PySCF verbosity level or logger used for the timing summary. If
+            PySCF verbosity level or logger used for output. If
             omitted, use the construction-time verbosity, which inherits from
-            kmp by default. The structure-factor table is logged at DEBUG.
+            kmp by default. The structure-factor table is logged at DEBUG;
+            detailed timing summaries are logged at DEBUG2.
         pair_density_eval_grid : {"uniform", "becke"}, optional
             Real-space quadrature grid used to evaluate pair-density overlaps.
             ``"uniform"`` uses the existing equally weighted mesh. ``"becke"``
@@ -481,10 +469,8 @@ class MP2StructureFactor(StructureFactor):
         profile.stop("MO padding", phase_t0)
 
         if grids is None:
-            phase_t0 = profile.start()
             self.set_grids(min_fit_points=self.min_points)
             grids = self.grids
-            profile.stop("grid construction", phase_t0)
 
         if qG_full is None:
             qG_full = grids.qG_grid_local
@@ -613,7 +599,10 @@ class MP2StructureFactor(StructureFactor):
                 # NOTE: t2 MUST be in the kikjq format
                 if self.t2 is None:
                     phase_t0 = profile.start()
-                    t2 = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff) # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
+                    t2 = compute_t2_amplitudes(
+                        self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff,
+                        verbose=log,
+                    )  # nkpts, nkpts, nkpts, nocc, nocc, nvir, nvir
                     profile.stop("full t2 construction", phase_t0)
                 else:
                     t2 = self.t2
@@ -934,8 +923,11 @@ class MP2StructureFactor(StructureFactor):
             qG_loop_indices = ()
         for qG in qG_loop_indices:
             if qG % interval == 0:
-                print(f"Progress: {qG/nqG_full*100:.2f}%")
-                print(f"Wall time: {logger.perf_counter()-total_t0[1]:.2f}s")
+                log.debug2(
+                    "MP2 structure-factor progress %.2f%%, wall %.2f sec",
+                    qG / nqG_full * 100,
+                    logger.perf_counter() - total_t0[1],
+                )
                 
             # First, see if S(-qG) has already been computed
             # precompute all idx_kpta and idx_kptb for all kpts
@@ -1196,9 +1188,14 @@ class MP2StructureFactor(StructureFactor):
                         else:
                             region_t0 = profile.start()
                             return_eijab_recip = compute_q4
-                            t2_result = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                    skip_if_no_qpt=True, mode='direct', Lov=Lov, verbose=logger.NOTE,
-                                                                    return_eijab_recip=return_eijab_recip)
+                            t2_result = compute_t2_amplitudes(
+                                self.kmp, self.kmp.mo_energy,
+                                self.kmp.mo_coeff, qGrid,
+                                qGrid_sample=qpt.reshape(1, 3),
+                                skip_if_no_qpt=True, mode='direct', Lov=Lov,
+                                verbose=log,
+                                return_eijab_recip=return_eijab_recip,
+                            )
                             if return_eijab_recip:
                                 t2_qi, eijab = t2_result
                                 eijab = eijab.transpose(2,0,1,3,4,5,6)
@@ -1226,8 +1223,13 @@ class MP2StructureFactor(StructureFactor):
                             profile.stop("exchange t2 cache hit", region_t0)
                         else:
                             region_t0 = profile.start()
-                            t2_qpi = compute_t2_amplitudes(self.kmp, self.kmp.mo_energy, self.kmp.mo_coeff, qGrid, qGrid_sample=qpt.reshape(1,3),
-                                                                skip_if_no_qpt=True, mode='exchange', Lov=Lov, verbose=logger.NOTE)
+                            t2_qpi = compute_t2_amplitudes(
+                                self.kmp, self.kmp.mo_energy,
+                                self.kmp.mo_coeff, qGrid,
+                                qGrid_sample=qpt.reshape(1, 3),
+                                skip_if_no_qpt=True, mode='exchange', Lov=Lov,
+                                verbose=log,
+                            )
                             t2_qpi = t2_qpi.transpose(2,0,1,3,4,5,6) # qpi, ki, kj, i, j, a, b
                             t2_qpi = t2_qpi[0]
                             if int(qi) in repeated_qis:
@@ -1260,7 +1262,7 @@ class MP2StructureFactor(StructureFactor):
                                     skip_if_no_qpt=True,
                                     mode='direct',
                                     Lov=Lov,
-                                    verbose=logger.NOTE,
+                                    verbose=log,
                                     with_t2=False,
                                     return_eijab_recip=True,
                                 )
@@ -1515,7 +1517,9 @@ class MP2StructureFactor(StructureFactor):
             ),
         }
         self.last_build_timings = profile.summary(total_t0)
-        profile.log_summary(log, self.last_build_timings)
+        profile.log_summary(
+            log, self.last_build_timings, level=logger.DEBUG2,
+        )
         return result_dict
                 
             
@@ -1534,7 +1538,8 @@ class MP2StructureFactor(StructureFactor):
                             use kmp.nocc / kmp.nmo and kmp2.padding_k_idx.
             mo_coeff (list): a list of numpy.ndarray. Each array contains MO coefficients
                             of shape (Nao, Nmo) for one kpt. Padded analogously.
-            verbose (int, optional): level of verbosity. Defaults to logger.NOTE (=3).
+            verbose (int or Logger, optional): PySCF logging level or logger.
+                Defaults to logger.DEBUG; amplitude timings are at DEBUG2.
             with_t2 (bool, optional): whether to compute t2 amplitudes. Defaults to WITH_T2 (=True).
             mode (str, optional): 'direct' means ka = ki + q. 'exchange' means ka = kj - q. Default is 'direct' 
             
@@ -1671,7 +1676,11 @@ class MP2StructureFactor(StructureFactor):
                     t2[ki, kj, qi] = t2_ijab
 
 
-        log.timer("KMP2", *cput0)
+        log.debug2(
+            "KMP2 CPU %.2f sec, wall %.2f sec",
+            logger.process_clock() - cput0[0],
+            logger.perf_counter() - cput0[1],
+        )
         print(f"Number of skipped qpts for oovv: {num_skipped_qpts_oovv}")
         print(f"Number of skipped qpts for t2: {num_skipped_qpts_t2}")
 

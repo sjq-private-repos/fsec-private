@@ -35,9 +35,22 @@ class TimingProfile:
         return summary
 
     @staticmethod
-    def log_summary(log, summary, title="build_structure_factor"):
+    def log_summary(log, summary, title="build_structure_factor",
+                    level=logger.NOTE):
+        """Log a timing summary at the requested PySCF verbosity level.
+
+        The default preserves the existing EXX timing summary behavior.
+        """
+        if log.verbose < level:
+            return
+        log_method = {
+            logger.NOTE: log.note,
+            logger.DEBUG: log.debug,
+            logger.DEBUG1: log.debug1,
+            logger.DEBUG2: log.debug2,
+        }.get(level, log.note)
         total = summary["total"]
-        log.note(
+        log_method(
             "%s CPU %.2f sec, wall %.2f sec",
             title, total["cpu"], total["wall"],
         )
@@ -46,7 +59,7 @@ class TimingProfile:
                 key=lambda item: item[1]["wall"], reverse=True):
             cpu_fraction = 100.0 * values["cpu"] / total["cpu"] if total["cpu"] else 0.0
             wall_fraction = 100.0 * values["wall"] / total["wall"] if total["wall"] else 0.0
-            log.note(
+            log_method(
                 "  %-36s CPU %9.2f sec (%5.1f%%), wall %9.2f sec (%5.1f%%)",
                 label, values["cpu"], cpu_fraction,
                 values["wall"], wall_fraction,

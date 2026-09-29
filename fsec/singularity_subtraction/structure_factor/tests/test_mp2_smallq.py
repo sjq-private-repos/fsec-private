@@ -1,9 +1,11 @@
 import unittest
+from io import StringIO
 from unittest import mock
 
 import numpy as np
 
 from pyscf.pbc import df, gto, mp, scf
+from pyscf.lib import logger
 from pyscf.pbc.lib import kpts_helper
 
 from fsec.singularity_subtraction.grids import minimum_image
@@ -99,19 +101,36 @@ class MP2SmallQKnownValues(unittest.TestCase):
         )
 
     def test_fftdf_and_gdf_reference_values(self):
+        """Small-q values and nested profiling respect the selected logger."""
         references = {
             "FFTDF": (-1.5455616988656258e-4, -8.910009779750352e-7),
             "GDF": (-1.439918272607873e-4, -8.302497872716938e-7),
         }
         for backend, (sq_direct, sq_q4) in references.items():
             with self.subTest(backend=backend):
-                result = self._smallq(backend).kernel()
+                output = StringIO()
+                level = logger.NOTE if backend == "FFTDF" else logger.DEBUG2
+                calculation = self._smallq(backend)
+                calculation.verbose = logger.Logger(output, level)
+                result = calculation.kernel()
                 self.assertAlmostEqual(
                     result.sq_direct, sq_direct, delta=1e-10
                 )
                 self.assertAlmostEqual(result.sq_q4, sq_q4, delta=1e-11)
                 self.assertEqual(result.band_df, backend)
                 self.assertEqual(result.band_exxdiv, "ewald")
+                detailed = int(level == logger.DEBUG2)
+                self.assertEqual(
+                    output.getvalue().count("MP2 small-q kernel CPU"), detailed)
+                self.assertEqual(
+                    output.getvalue().count("build_structure_factor CPU"),
+                    detailed)
+                self.assertIs(calculation.smallq_structure_factor.stdout, output)
+                self.assertIn(
+                    "single-point structure factor",
+                    calculation.last_kernel_timings)
+                self.assertIn(
+                    "total", calculation.smallq_structure_factor.last_build_timings)
 
     def test_fftdf_band_exxdiv_is_temporary(self):
         original_df = self.kmf.with_df
