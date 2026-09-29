@@ -13,6 +13,7 @@ from fsec.singularity_subtraction.mp2ss import (
     MP2DirectFullSS,
     MP2DirectSecondOrderSS,
     MP2ExchangeSS,
+    MP2SSOptions,
 )
 
 
@@ -79,6 +80,83 @@ class PrintResultsTests(unittest.TestCase):
         self.assertNotIn("Direct Term:\n", result)
         self.assertIn("Exchange Term:\n", result)
         self.assertIn("Final Energies:", result)
+
+
+class MP2SSOptionsTests(unittest.TestCase):
+    def test_direct_rsdf_occupied_block_option(self):
+        self.assertIsNone(MP2SSOptions().rsdf_occ_block_size)
+        self.assertEqual(
+            MP2SSOptions(rsdf_occ_block_size="3").rsdf_occ_block_size, 3)
+        for invalid in (0, -1):
+            with self.assertRaises(ValueError):
+                MP2SSOptions(rsdf_occ_block_size=invalid)
+
+    def test_laplace_options(self):
+        defaults = MP2SSOptions()
+        self.assertTrue(defaults.laplace)
+        self.assertEqual(defaults.laplace_direct_tol, 1e-8)
+        self.assertEqual(defaults.laplace_direct_max_points, 16)
+        self.assertEqual(defaults.laplace_exchange_tol, 1e-8)
+        self.assertEqual(defaults.laplace_exchange_max_points, 16)
+
+        options = MP2SSOptions(
+            laplace=False,
+            laplace_direct_tol="1e-7",
+            laplace_direct_max_points="12",
+            laplace_exchange_tol="1e-6",
+            laplace_exchange_max_points="10",
+        )
+        self.assertFalse(options.laplace)
+        self.assertEqual(options.laplace_direct_tol, 1e-7)
+        self.assertEqual(options.laplace_direct_max_points, 12)
+        self.assertEqual(options.laplace_exchange_tol, 1e-6)
+        self.assertEqual(options.laplace_exchange_max_points, 10)
+
+        with self.assertRaises(TypeError):
+            MP2SSOptions(laplace_direct=False)
+        with self.assertRaises(TypeError):
+            MP2SSOptions(laplace_exchange=False)
+
+        for tolerance in (0, -1, np.inf, np.nan):
+            with self.assertRaises(ValueError):
+                MP2SSOptions(laplace_direct_tol=tolerance)
+            with self.assertRaises(ValueError):
+                MP2SSOptions(laplace_exchange_tol=tolerance)
+        with self.assertRaises(ValueError):
+            MP2SSOptions(laplace_direct_max_points=0)
+        with self.assertRaises(ValueError):
+            MP2SSOptions(laplace_exchange_max_points=0)
+
+    def test_adaptive_sq_ke_cutoff_options(self):
+        options = MP2SSOptions(
+            sq_ke_cutoff=100.0,
+            sq_ke_cutoff_switch_radius=2.5,
+            outer_sq_ke_cutoff_scale=0.25,
+        )
+
+        self.assertEqual(options.sq_ke_cutoff, 100.0)
+        self.assertEqual(options.sq_ke_cutoff_switch_radius, 2.5)
+        self.assertEqual(options.outer_sq_ke_cutoff_scale, 0.25)
+
+    def test_pair_density_eval_grid_option(self):
+        self.assertEqual(MP2SSOptions().pair_density_eval_grid, "becke")
+        self.assertEqual(MP2SSOptions().pair_density_becke_grid_level, 0)
+        self.assertEqual(
+            MP2SSOptions(pair_density_eval_grid=" Becke ").pair_density_eval_grid,
+            "becke",
+        )
+        self.assertEqual(
+            MP2SSOptions(pair_density_becke_grid_level="1").pair_density_becke_grid_level,
+            1,
+        )
+        self.assertEqual(
+            MP2SSOptions(pair_density_becke_grid_level=None).pair_density_becke_grid_level,
+            0,
+        )
+        with self.assertRaises(ValueError):
+            MP2SSOptions(pair_density_eval_grid="atom")
+        with self.assertRaises(ValueError):
+            MP2SSOptions(pair_density_becke_grid_level=-1)
 
 
 class KnownValues(unittest.TestCase):
@@ -195,6 +273,7 @@ class KnownValues(unittest.TestCase):
             kmf=self.kmf,
             kmp=self.kmp,
             t2=self.t2,
+            pair_density_eval_grid="uniform",
         )
         self.assertEqual(mp2ss.options.auxfunc_direct, "Gauss")
         self.assertEqual(mp2ss.options.auxfunc_direct_q2, "Gauss")
@@ -217,12 +296,35 @@ class KnownValues(unittest.TestCase):
             kmp=self.kmp,
             t2=self.t2,
             check_trs=False,
+            pair_density_eval_grid="uniform",
         )
         self.assertFalse(mp2ss.options.check_trs)
         correction = mp2ss.compute_correction(direct=True, exchange=True)
 
         self.assertFalse(mp2ss.mp2_structure_factor.check_trs)
         self._assert_matches_references(mp2ss, correction)
+
+    def test_direct_rsdf_automatically_selects_blocked_lov_route(self):
+        original_df = self.kmf.with_df
+        direct_df = df.RSDF(self.kmf.cell, self.kmf.kpts)
+        direct_df.direct = True
+        direct_df.semidirect = False
+        direct_df.ksym = "s2"
+        try:
+            self.kmf.with_df = direct_df
+            mp2ss = MP2SS(
+                kmf=self.kmf,
+                kmp=self.kmp,
+                options=MP2SSOptions(rsdf_occ_block_size=1),
+            )
+            self.assertEqual(mp2ss.options.t2_store_type, "kikj_lov")
+            self.assertEqual(mp2ss.t2_store_type, "kikj_lov")
+            self.assertEqual(mp2ss.rsdf_occ_block_size, 1)
+            with self.assertRaisesRegex(
+                    NotImplementedError, "precomputed t2"):
+                MP2SS(kmf=self.kmf, kmp=self.kmp, t2=self.t2)
+        finally:
+            self.kmf.with_df = original_df
 
 
 if __name__ == "__main__":
