@@ -1304,7 +1304,6 @@ class KnownValues(unittest.TestCase):
             rtol=1e-7,
             atol=1e-10,
         )
-
     def test_kikj_on_the_fly_matches_kikjka_with_repeated_qi(self):
         reciprocal = self.kmf.cell.reciprocal_vectors()
         qG_full = np.array([
