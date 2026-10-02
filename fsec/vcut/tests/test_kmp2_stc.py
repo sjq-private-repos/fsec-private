@@ -12,7 +12,9 @@ from pyscf.pbc.df import df_ao2mo
 from pyscf.pbc.lib.kpts import KPoints
 from pyscf.pbc.mp import kmp2 as pyscf_kmp2
 
-from fsec.vcut import KMP2_HYBRID, KMP2_STC
+from fsec.vcut import (
+    KMP2_HYBRID, KMP2_HYBRID_DIRECT, KMP2_STC, KMP2_STC_DIRECT,
+)
 
 
 def _make_reference(kmesh, scaled_center=None, two_he=False):
@@ -49,6 +51,30 @@ def shifted_reference():
     return _make_reference(
         [3, 1, 1], scaled_center=[0.17, 0.0, 0.0], two_he=True
     )
+
+
+@pytest.fixture(scope="module")
+def three_occupied_reference():
+    """Build a small Gamma reference with three occupied orbitals."""
+    cell = gto.Cell()
+    cell.unit = "Angstrom"
+    cell.atom = "He 0.0 0.0 0.0; He 1.7 1.4 1.2; He 3.1 3.2 1.0"
+    cell.a = np.eye(3) * 6.0
+    cell.basis = "gth-dzvp"
+    cell.pseudo = "gth-pade"
+    cell.precision = 1e-7
+    cell.mesh = [13, 13, 13]
+    cell.verbose = 0
+    cell.build()
+    kpts = cell.make_kpts([1, 1, 1])
+    mf = scf.KRHF(cell, kpts)
+    mf.verbose = 0
+    mf.exxdiv = None
+    mf.with_df = df.GDF(cell, kpts)
+    mf.with_df.auxbasis = "weigend"
+    mf.kernel()
+    assert mf.converged
+    return mf
 
 
 def _explicit_components(mp, builder, mo_energy=None, mo_coeff=None):
@@ -374,3 +400,239 @@ def test_reference_validation_rejects_unsupported_methods(gamma_reference):
     low_dim.cell.dimension = 2
     with pytest.raises(NotImplementedError, match="three-dimensional"):
         KMP2_STC(low_dim)
+
+
+@pytest.mark.parametrize("fixture_name,cutoff,rc_type,eta", [
+    ("gamma_reference", "vcut_ws", "ws", 4.0),
+    ("shifted_reference", "vcut_ws", "ws", 4.0),
+    ("shifted_reference", "vcut_ws", "ws", 3.0),
+    ("shifted_reference", "vcut_sph", "sph", 4.0),
+])
+def test_stc_direct_matches_stored_components_and_amplitudes(
+    request, fixture_name, cutoff, rc_type, eta
+):
+    """On-demand sTC factors reproduce stored direct and exchange components."""
+    mf = request.getfixturevalue(fixture_name)
+    stored = KMP2_STC(mf, exxdiv=cutoff, rc_type=rc_type, eta=eta)
+    direct = KMP2_STC_DIRECT(mf, exxdiv=cutoff, rc_type=rc_type, eta=eta)
+    stored_energy, stored_t2 = stored.kernel(with_t2=True, with_direct=True)
+    direct_energy, direct_t2 = direct.kernel(with_t2=True, with_direct=True)
+
+    assert direct.e_corr_direct == pytest.approx(stored.e_corr_direct, abs=1e-7)
+    assert direct.e_corr_exchange == pytest.approx(
+        stored.e_corr_exchange, abs=1e-7
+    )
+    assert direct_energy == pytest.approx(stored_energy, abs=1e-7)
+    np.testing.assert_allclose(direct_t2, stored_t2, atol=1e-7, rtol=0)
+
+
+@pytest.mark.parametrize("fixture_name", ["gamma_reference", "shifted_reference"])
+def test_hybrid_direct_matches_stored_components_and_amplitudes(
+    request, fixture_name
+):
+    """Hybrid direct keeps bare direct and sTC exchange in separate passes."""
+    mf = request.getfixturevalue(fixture_name)
+    stored = KMP2_HYBRID(mf)
+    direct = KMP2_HYBRID_DIRECT(mf)
+    stored_energy, stored_t2 = stored.kernel(with_t2=True)
+    direct_energy, direct_t2 = direct.kernel(with_t2=True)
+
+    assert direct.e_corr_direct == pytest.approx(stored.e_corr_direct, abs=1e-7)
+    assert direct.e_corr_exchange == pytest.approx(
+        stored.e_corr_exchange, abs=1e-7
+    )
+    assert direct_energy == pytest.approx(stored_energy, abs=1e-7)
+    np.testing.assert_allclose(
+        direct_t2["direct"], stored_t2["direct"], atol=1e-7, rtol=0
+    )
+    np.testing.assert_allclose(
+        direct_t2["exchange"], stored_t2["exchange"], atol=1e-7, rtol=0
+    )
+
+
+def test_direct_blocking_handles_final_partial_occupied_block(
+    three_occupied_reference, monkeypatch
+):
+    """An occupied block size of two covers the final one-orbital slice."""
+    import weakref
+
+    import fsec.vcut.kmp2_stc_direct as direct_module
+
+    mf = three_occupied_reference
+    assert KMP2_STC(mf).nocc == 3
+    widths = []
+    tables = []
+    transform_block = direct_module._transform_occupied_block
+
+    def record_width(*args, **kwargs):
+        assert sum(ref() is not None for ref in tables) <= 1
+        i0, i1 = args[-2:]
+        widths.append((i0, i1))
+        table = transform_block(*args, **kwargs)
+        tables.append(weakref.ref(table))
+        return table
+
+    monkeypatch.setattr(direct_module, "_transform_occupied_block", record_width)
+    direct = KMP2_STC_DIRECT(mf, rsdf_occ_block_size=2)
+    energy, amplitudes = direct.kernel(with_t2=True)
+    reference_energy, reference_t2 = KMP2_STC(mf).kernel(with_t2=True)
+
+    assert widths == [(0, 2), (2, 3), (2, 3)]
+    assert all(ref() is None for ref in tables)
+    assert direct.with_df._cderi is None
+    assert energy == pytest.approx(reference_energy, abs=1e-7)
+    np.testing.assert_allclose(amplitudes, reference_t2, atol=1e-7, rtol=0)
+
+
+def test_direct_amplitudes_are_invariant_to_block_size(shifted_reference):
+    """One-orbital and full occupied blocks give the same shifted-mesh result."""
+    one_at_a_time = KMP2_STC_DIRECT(
+        shifted_reference, rsdf_occ_block_size=1
+    )
+    full_block = KMP2_STC_DIRECT(
+        shifted_reference, rsdf_occ_block_size=10
+    )
+    energy_one, t2_one = one_at_a_time.kernel(with_t2=True)
+    energy_full, t2_full = full_block.kernel(with_t2=True)
+
+    assert energy_one == pytest.approx(energy_full, abs=1e-10, rel=0)
+    np.testing.assert_allclose(t2_one, t2_full, atol=1e-10, rtol=0)
+
+
+@pytest.mark.parametrize("frozen", [
+    [[9], [8, 9], [9]],
+    [[0, 9], [8, 9], [0, 9]],
+])
+def test_direct_frozen_padding_and_orbital_overrides(shifted_reference, frozen):
+    """Direct transforms retain frozen ranks and kernel orbital overrides."""
+    coeff_override = np.array(shifted_reference.mo_coeff, dtype=complex, copy=True)
+    coeff_override[:, :, 2] *= np.exp(1j * np.array([0.0, 0.31, -0.23]))[:, None]
+    energy_override = np.array(shifted_reference.mo_energy, copy=True)
+    energy_override[:, 2] += np.array([0.02, 0.04, 0.03])
+    stored = KMP2_STC(shifted_reference, frozen=frozen)
+    direct = KMP2_STC_DIRECT(
+        shifted_reference, frozen=frozen, rsdf_occ_block_size=1
+    )
+    stored_energy, stored_t2 = stored.kernel(
+        mo_energy=energy_override, mo_coeff=coeff_override, with_t2=True
+    )
+    direct_energy, direct_t2 = direct.kernel(
+        mo_energy=energy_override, mo_coeff=coeff_override, with_t2=True
+    )
+
+    assert direct_t2.shape[3:5] == (2, 2)
+    assert direct_energy == pytest.approx(stored_energy, abs=1e-7)
+    np.testing.assert_allclose(direct_t2, stored_t2, atol=1e-7, rtol=0)
+
+
+def test_direct_repeated_calls_clear_amplitudes_and_preserve_reference(
+    gamma_reference
+):
+    """Direct calls replace optional results without changing the KRHF object."""
+    mf = gamma_reference
+    coeff_before = mf.mo_coeff.copy()
+    energy_before = mf.mo_energy.copy()
+    occ_before = mf.mo_occ.copy()
+    original_df = mf.with_df
+    direct = KMP2_STC_DIRECT(mf)
+    # Small grids must not inherit a fictitious 1 GB allocation from the
+    # native metric routine's minimum Fourier block-length setting.
+    direct.max_memory = lib.current_memory()[0] + 256
+    direct.kernel(with_t2=True, with_direct=True)
+    exchange, amplitudes = direct.kernel(with_t2=False)
+
+    assert amplitudes is None
+    assert direct.t2 is None
+    assert direct.e_corr_direct is None
+    assert direct.e_corr == pytest.approx(exchange, abs=1e-12)
+    np.testing.assert_array_equal(mf.mo_coeff, coeff_before)
+    np.testing.assert_array_equal(mf.mo_energy, energy_before)
+    np.testing.assert_array_equal(mf.mo_occ, occ_before)
+    assert mf.with_df is original_df
+    assert direct.with_df._cderi is None
+
+
+def test_occupied_block_memory_selection_and_preflight_errors(monkeypatch):
+    """Automatic blocks shrink to fit and unfit requests fail before work."""
+    from types import SimpleNamespace
+
+    import fsec.vcut.kmp2_stc_direct as direct_module
+
+    mp = SimpleNamespace(max_memory=1000.0, nkpts=1, rsdf_occ_block_size=None)
+    orbitals = {
+        "nocc": 4,
+        "nvir": 1,
+        "eri_dtype": np.dtype(np.complex128),
+        "energy_dtype": np.dtype(np.float64),
+    }
+    monkeypatch.setattr(direct_module.lib, "current_memory", lambda: (0.0, 0.0))
+    monkeypatch.setattr(
+        direct_module, "_memory_costs", lambda *args: (100.0, 250.0, 0.0)
+    )
+    block, estimate, available = direct_module._choose_block_size(
+        mp, orbitals, [object()], retained_t2=0, helper=object()
+    )
+    assert block == 2
+    assert estimate == pytest.approx(600.0)
+    assert available == pytest.approx(1000.0)
+
+    # Each full amplitude tensor now takes 256 MB. A single tensor reduces
+    # the allowed block; retaining both hybrid tensors exceeds the budget.
+    orbitals["nvir"] = 1000
+    block, _, _ = direct_module._choose_block_size(
+        mp, orbitals, [object()], retained_t2=1, helper=object()
+    )
+    assert block == 1
+    with pytest.raises(MemoryError, match="block size 1"):
+        direct_module._choose_block_size(
+            mp, orbitals, [object()], retained_t2=2, helper=object()
+        )
+    orbitals["nvir"] = 1
+
+    mp.rsdf_occ_block_size = 3
+    with pytest.raises(MemoryError, match="Requested rsdf_occ_block_size=3"):
+        direct_module._choose_block_size(
+            mp, orbitals, [object()], retained_t2=0, helper=object()
+        )
+
+    monkeypatch.setattr(
+        direct_module, "_memory_costs", lambda *args: (801.0, 0.0, 0.0)
+    )
+    mp.rsdf_occ_block_size = None
+    with pytest.raises(MemoryError, match="block size 1"):
+        direct_module._choose_block_size(
+            mp, orbitals, [object()], retained_t2=0, helper=object()
+        )
+
+
+def test_direct_rejects_eigendecomposed_or_non_cholesky_metrics(
+    gamma_reference, monkeypatch
+):
+    """Metric limitations are reported before a native factor transform."""
+    import fsec.vcut.kmp2_stc_direct as direct_module
+    from pyscf.pbc.df import rsdf_direct_helper
+
+    called = []
+
+    def record_transform(*args, **kwargs):
+        called.append(True)
+        raise AssertionError("transform must not run before metric preflight")
+
+    monkeypatch.setattr(direct_module, "_transform_occupied_block", record_transform)
+    direct = KMP2_STC_DIRECT(gamma_reference)
+    direct.with_df.j2c_eig_always = True
+    with pytest.raises(NotImplementedError, match="j2c_eig_always=True"):
+        direct.kernel()
+    assert called == []
+
+    direct.with_df.j2c_eig_always = False
+    monkeypatch.setattr(
+        rsdf_direct_helper,
+        "get_j2c",
+        lambda builder, kpts, verbose=0: [
+            np.zeros((builder.auxcell.nao_nr(),) * 2)
+        ],
+    )
+    with pytest.raises(NotImplementedError, match="not positive definite"):
+        direct.kernel()
+    assert called == []

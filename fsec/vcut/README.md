@@ -41,15 +41,62 @@ returns one ndarray, while the hybrid returns a dictionary with `direct` and
 inherited sTC `with_df` builder can be configured independently before their
 first build.
 
+## On-demand direct sTC MP2
+
+For lower memory use, `KMP2_STC_DIRECT` and `KMP2_HYBRID_DIRECT` transform
+occupied orbitals in blocks and generate sTC factors on demand. They use the
+same constructors, kernel options, component energies, and amplitude shapes as
+their stored counterparts. They do not write AO three-center integrals to
+CDERI storage:
+
+```python
+from fsec.vcut import KMP2_HYBRID_DIRECT, KMP2_STC_DIRECT
+
+stc_direct = KMP2_STC_DIRECT(kmf, eta=4.0)
+stc_direct.max_memory = 2000  # MB; used for automatic block selection
+e_exchange, _ = stc_direct.kernel()
+e_full_stc, _ = stc_direct.kernel(with_direct=True)
+
+hybrid_direct = KMP2_HYBRID_DIRECT(
+    kmf, eta=4.0, rsdf_occ_block_size=2
+)
+e_hybrid, _ = hybrid_direct.kernel()
+```
+
+The new module also exposes `KMP2_STC`, `KMP2_HYBRID`, and `KMP2` (the STC
+alias) through `fsec.vcut.kmp2_stc_direct`. Existing package-level imports
+continue to select the stored calculators. The direct route requires the
+custom fork's `pyscf.pbc.mp.kmp2_direct` and direct RSDF helpers.
+
+The `_DIRECT` suffix selects on-demand integral generation. Independently,
+`kernel(with_direct=True)` includes the physical sTC MP2 direct contribution
+in addition to exchange. `KMP2_HYBRID_DIRECT` always combines bare RSDF direct with sTC
+exchange, matching `KMP2_HYBRID`. The optional `rsdf_occ_block_size` sets the
+padded occupied block size and is capped at `nocc`. Its default, `None`, picks
+the largest block estimated to fit within 80% of available memory. An explicit
+block that does not fit, or a calculation for which even block size one does
+not fit, raises `MemoryError`. The estimate includes native transform and
+metric workspaces; it is not a strict process memory limit.
+
+Keep `with_t2=False` to avoid retaining the full padded amplitudes. With
+`with_t2=True`, their storage still scales as
+`nkpts**3 * nocc**2 * nvir**2`; the hybrid retains one array for each
+interaction. Blocking lowers factor and contraction workspace use at the cost
+of repeating transforms for occupied blocks. The direct implementation
+requires Cholesky-decomposable RSDF metrics and does not support eigendecomposed
+metrics or semidirect mode. Set numerical builder options before the first
+kernel call, and create a new calculator after changing those settings.
+
 The default uses Wigner–Seitz truncation. For spherical truncation, set both
 `exxdiv="vcut_sph"` and `rc_type="sph"`. The smoothing parameter is
 `eta = omega_stc * R_in`, with the cutoff length determined by the cell and
 k-point mesh. No extra Ewald correction is added to the STC integrals.
 The reference's existing orbital-energy convention is retained.
 
-Both calculators support 3D closed-shell KRHF references, shifted regular
-meshes, frozen orbitals, and stored RSDF factors. Symmetry-reduced meshes,
-unrestricted references, and integral-direct/semidirect DF modes are unsupported.
+All calculators support 3D closed-shell KRHF references, shifted regular
+meshes, and frozen orbitals. Symmetry-reduced meshes, unrestricted references,
+and semidirect DF are unsupported. The stored calculators require stored
+RSDF factors; the direct calculators require Cholesky-decomposable metrics.
 `auxbasis` defaults to the reference DF basis when available. Numerical
 builder settings such as `stc_mp.with_df.mesh_compact` and `mesh_j2c` may be
 set before the first call to `kernel`. Create a new calculator when changing
