@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import scipy
 from scipy.integrate import quad
@@ -284,25 +286,23 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
     def default_parameters(self):
         return [1.0, 1.0]
 
+    def _summand(self, q, deltaGs, zero_below=None):
+        """Evaluate each inner-sum term for q points and reciprocal shifts."""
+        q_plus_dG = q[:, None, :] + deltaGs[None, :, :]
+        q_plus_dG_norm = np.linalg.norm(q_plus_dG, axis=2)
+        if zero_below is not None:
+            q_plus_dG_norm[q_plus_dG_norm < zero_below] = np.inf
+        return self.decay_func(q_plus_dG_norm)
+
     def compute_sum_g_q_deltaG(self):
         if self.qGrid is None:
             raise ValueError("qGrid must be set on XNGaussStackedSingularityQMesh before evaluation")
         if self.deltaGs is None:
             raise ValueError("deltaGs must be set on XNGaussStackedSingularityQMesh before evaluation")
 
-        deltaGs = self.deltaGs
-        q = self.qGrid
-        q_expanded = q[:, None, :]
-        deltaGs_expanded = deltaGs[None, :, :]
-        q_plus_dG = q_expanded + deltaGs_expanded
-
-        qp_norm = np.linalg.norm(q_plus_dG, axis=2)
-        qp_norm[qp_norm < 1e-8] = np.inf
-        N = qp_norm.shape[0]
-        M = qp_norm.shape[1]
-        g_q_deltaG = self.decay_func(qp_norm.reshape(N * M)).reshape(N, M)
-
-        result = np.sum(g_q_deltaG, axis=1)
+        result = np.sum(
+            self._summand(self.qGrid, self.deltaGs, zero_below=1e-8), axis=1
+        )
 
         zero_idx = self.kdtree_qGrid.query(np.zeros((1, 3)), k=1)[1][0]
         self.g0 = result[zero_idx]
@@ -340,22 +340,111 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
             idxs_coords_FBZ_in_qGrid[cached]
         ]
         if np.any(~cached):
-            q_plus_dG = (
-                coords_FBZ[~cached, None, :] + self.deltaGs[None, :, :]
-            )
             sum_g_q_deltaG[~cached] = np.sum(
-                self.decay_func(np.linalg.norm(q_plus_dG, axis=2)),
-                axis=1,
+                self._summand(coords_FBZ[~cached], self.deltaGs), axis=1
             )
 
         q_norm = np.linalg.norm(coords, axis=1)
         result = -cn_coeffs * q_norm**2 * self.decay_func(q_norm) * sum_g_q_deltaG
 
         if self.remove_deltaG_zero:
-            g_q = self.decay_func(q_norm)
-            g_q[q_norm < 1e-8] = 0
-            result = result + cn_coeffs * q_norm**2 * self.decay_func(q_norm) * g_q
+            zero_summand = self._summand(
+                coords, np.zeros((1, 3)), zero_below=1e-8
+            )[:, 0]
+            result = result + (
+                cn_coeffs * q_norm**2 * self.decay_func(q_norm) * zero_summand
+            )
 
+        return result
+
+
+class XNGaussVcut(XNGaussStackedSingularityQMesh):
+    r"""Gaussian stacked singularity weighted by a PySCF exchange cutoff.
+
+    The parameters are ``[c0, sigma]`` with default ``[1, 1]``; ``sigma``
+    has units Bohr^-1. ``qGrid``, ``deltaGs``, and optional ``kpts`` are
+    Cartesian reciprocal coordinates in Bohr^-1. The cutoff sampling mesh
+    ``kpts`` must be complete and regular. If omitted, ``qGrid`` supplies
+    that mesh and must be complete and regular; with explicit ``kpts``,
+    ``qGrid`` can be any evaluation mesh.
+
+    For each input q, let ``q_FBZ = minimum_image(cell, q)``. The inner sum is
+    ``S(q_FBZ) = sum_deltaG exp(-|q_FBZ+deltaG|^2/(2 sigma^2))``
+    ``* |q_FBZ+deltaG|^2 * vcut(q_FBZ+deltaG)``. The model is
+    ``-c0 * |q|^2 * exp(-|q|^2/(2 sigma^2)) * S(q_FBZ)``: only the inner sum
+    is folded, and the outer factors use the original q. PySCF's full kernel,
+    including ``4*pi``, is used. ``vcut_ws`` truncates to the Wigner-Seitz
+    cell of the mesh's Born-von Karman supercell; ``vcut_sph`` uses a sphere
+    of equal volume. ``coulomb_integral`` remains the inherited untruncated
+    reference formula and is not the integral of this cutoff-weighted model.
+    """
+
+    def __init__(
+        self,
+        qGrid,
+        cell,
+        parameters=None,
+        deltaGs=None,
+        is_contraction=False,
+        remove_deltaG_zero=False,
+        *,
+        vcut_type="vcut_ws",
+        kpts=None,
+    ):
+        from pyscf.pbc.gto import Cell
+
+        if not isinstance(cell, Cell):
+            raise TypeError("cell must be a PySCF periodic Cell")
+        if cell.dimension != 3:
+            raise ValueError("XNGaussVcut requires a three-dimensional cell")
+        if vcut_type not in ("vcut_ws", "vcut_sph"):
+            raise ValueError("vcut_type must be 'vcut_ws' or 'vcut_sph'")
+
+        super().__init__(
+            qGrid=qGrid,
+            cell=cell,
+            parameters=parameters,
+            deltaGs=deltaGs,
+            is_contraction=is_contraction,
+            remove_deltaG_zero=remove_deltaG_zero,
+        )
+        self.vcut_type = vcut_type
+        self.kpts = np.asarray(qGrid if kpts is None else kpts, dtype=float).reshape(
+            -1, 3
+        )
+        # get_coulG stores its expensive Wigner-Seitz setup on mf._ws_exx.
+        # Keep one context so evaluations and parameter updates reuse it.
+        self._vcut_context = SimpleNamespace(kpts=self.kpts, _ws_exx=None)
+
+    def _summand(self, q, deltaGs, zero_below=None):
+        from pyscf.pbc import tools
+
+        q_plus_dG = q[:, None, :] + deltaGs[None, :, :]
+        q_plus_dG_norm = np.linalg.norm(q_plus_dG, axis=2)
+        active = np.ones(q_plus_dG_norm.shape, dtype=bool)
+        if zero_below is not None:
+            active &= q_plus_dG_norm >= zero_below
+
+        decay = self.decay_func(q_plus_dG_norm)
+        norm_squared = q_plus_dG_norm**2
+        result = np.zeros(q_plus_dG_norm.shape, dtype=float)
+        for i, q_i in enumerate(q):
+            coulG = tools.get_coulG(
+                self.cell,
+                k=q_i,
+                Gv=deltaGs,
+                exx=self.vcut_type,
+                mf=self._vcut_context,
+                wrap_around=False,
+                omega=0,
+            )
+            # Avoid 0 * infinity for the exact q + deltaG = 0 contribution.
+            np.multiply(
+                decay[i] * norm_squared[i],
+                coulG,
+                out=result[i],
+                where=active[i] & (norm_squared[i] != 0),
+            )
         return result
 
 

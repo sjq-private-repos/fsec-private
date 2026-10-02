@@ -94,6 +94,7 @@ from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
     XNGauss,
     XNGaussStackedSingularity,
     XNGaussStackedSingularityQMesh,
+    XNGaussVcut,
     XNGeneral,
     XNQuarticExponential,
 )
