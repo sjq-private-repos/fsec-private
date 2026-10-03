@@ -441,7 +441,7 @@ class XNGaussVcut(XNGaussStackedSingularityQMesh):
             # Avoid 0 * infinity for the exact q + deltaG = 0 contribution.
             np.multiply(
                 decay[i] * norm_squared[i],
-                coulG,
+                coulG / (4*np.pi),
                 out=result[i],
                 where=active[i] & (norm_squared[i] != 0),
             )
