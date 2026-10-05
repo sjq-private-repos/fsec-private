@@ -14,6 +14,10 @@ from pyscf.pbc import df
 from pyscf import lib
 import numpy as np
 from numpy.typing import ArrayLike
+from fsec.singularity_subtraction._quadrature_kernel import (
+    _QuadratureCoulombKernel,
+    _validate_kernel_options,
+)
 
 
 def _log_timing(log, method, title, start):
@@ -194,6 +198,14 @@ class MP2SSOptions:
     correct_q2_q4_separately
         Fit and correct the second- and fourth-order direct contributions
         independently. If false, fit the complete direct contribution once.
+    quadrature_coulomb_kernel
+        Coulomb kernel used only in the direct correction quadrature:
+        ``"bare"`` preserves the legacy arithmetic, while ``"vcut_ws"`` and
+        ``"vcut_sph"`` use the corresponding Wigner-Seitz or spherical cutoff.
+    eta
+        Optional positive sTC smoothing parameter for a selected vcut kernel.
+        ``None`` uses the unsmoothed cutoff. A finite eta applies the complete
+        sTC kernel, including its short-range term and finite value at q+G=0.
 
     Notes
     -----
@@ -233,6 +245,8 @@ class MP2SSOptions:
     smallq_band_df: Optional[str] = None
     smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
+    quadrature_coulomb_kernel: str = 'bare'
+    eta: Optional[float] = None
 
     def __post_init__(self):
         pair_density_eval_grid = str(self.pair_density_eval_grid).strip().lower()
@@ -281,6 +295,9 @@ class MP2SSOptions:
             if rsdf_occ_block_size < 1:
                 raise ValueError("rsdf_occ_block_size must be positive or None")
         verbose = None if self.verbose is None else int(self.verbose)
+        quadrature_coulomb_kernel, eta = _validate_kernel_options(
+            self.quadrature_coulomb_kernel, self.eta
+        )
         object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
         object.__setattr__(
             self,
@@ -300,6 +317,9 @@ class MP2SSOptions:
         object.__setattr__(
             self, 'rsdf_occ_block_size', rsdf_occ_block_size)
         object.__setattr__(self, 'verbose', verbose)
+        object.__setattr__(
+            self, 'quadrature_coulomb_kernel', quadrature_coulomb_kernel)
+        object.__setattr__(self, 'eta', eta)
 
 
 @dataclass(frozen=True)
@@ -311,6 +331,9 @@ class DirectFullCorrectionConfig:
     fit_method: str
     fit_with_coul: bool
     qG_norm_cutoff: float
+    kpts: object = None
+    quadrature_coulomb_kernel: str = 'bare'
+    eta: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -322,6 +345,9 @@ class DirectSecondOrderCorrectionConfig:
     fit_method: object
     fit_with_coul_q2: bool
     qG_norm_cutoff: object
+    kpts: object = None
+    quadrature_coulomb_kernel: str = 'bare'
+    eta: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -333,6 +359,9 @@ class DirectFourthOrderCorrectionConfig:
     fit_method: object
     fit_with_coul_q4: bool
     qG_norm_cutoff: object
+    kpts: object = None
+    quadrature_coulomb_kernel: str = 'bare'
+    eta: Optional[float] = None
 
 
 @dataclass
@@ -467,6 +496,10 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
 
     def __init__(self, config: DirectFourthOrderCorrectionConfig):
         self.config = config
+        self._coulomb_kernel = _QuadratureCoulombKernel(
+            config.cell, config.kpts, config.quadrature_coulomb_kernel,
+            config.eta,
+        )
 
     def _create_q4_model(self, name):
         spec = Q4_MODEL_SPECS[name]
@@ -536,10 +569,15 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
         return f_q4, qGlocal_grid_correction, numKpt3D, omega_star
 
     def compute_quadrature_term(self, *, f_q4, qGlocal_grid_correction):
-        prefac_q4 = 4 * np.pi * (4 * np.pi)
-        denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
-        denominator[denominator < 1e-8] = np.inf
-        return prefac_q4 * np.sum(f_q4.eval_model(qGlocal_grid_correction) / denominator ** 2)
+        if self._coulomb_kernel.name == 'bare':
+            prefac_q4 = 4 * np.pi * (4 * np.pi)
+            denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
+            denominator[denominator < 1e-8] = np.inf
+            return prefac_q4 * np.sum(
+                f_q4.eval_model(qGlocal_grid_correction) / denominator ** 2
+            )
+        kernel = self._coulomb_kernel(qGlocal_grid_correction)
+        return np.dot(f_q4.eval_model(qGlocal_grid_correction), kernel ** 2)
 
     def compute_integral_term(self, *, f_q4, numKpt3D, omega_star):
         prefactor_q4 = 4 * np.pi * (4 * np.pi) * numKpt3D / omega_star
@@ -593,6 +631,10 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
 
     def __init__(self, config: DirectSecondOrderCorrectionConfig):
         self.config = config
+        self._coulomb_kernel = _QuadratureCoulombKernel(
+            config.cell, config.kpts, config.quadrature_coulomb_kernel,
+            config.eta,
+        )
 
     def _create_q2_model(self, name, grids):
         if name not in Q2_MODEL_SPECS:
@@ -647,10 +689,15 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
         return f_q2, qGlocal_grid_correction, numKpt3D, omega_star
 
     def compute_quadrature_term(self, *, f_q2, qGlocal_grid_correction):
-        prefac = 4 * np.pi
-        denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
-        denominator[denominator < 1e-8] = np.inf
-        return prefac * np.sum(f_q2.eval_model(qGlocal_grid_correction) / denominator)
+        if self._coulomb_kernel.name == 'bare':
+            prefac = 4 * np.pi
+            denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
+            denominator[denominator < 1e-8] = np.inf
+            return prefac * np.sum(
+                f_q2.eval_model(qGlocal_grid_correction) / denominator
+            )
+        kernel = self._coulomb_kernel(qGlocal_grid_correction)
+        return np.dot(f_q2.eval_model(qGlocal_grid_correction), kernel)
 
     def compute_integral_term(self, *, f_q2, numKpt3D, omega_star):
         prefactor = 4 * np.pi * numKpt3D / omega_star
@@ -703,6 +750,10 @@ class MP2DirectFullSS(SingularitySubtraction):
 
     def __init__(self, config: DirectFullCorrectionConfig):
         self.config = config
+        self._coulomb_kernel = _QuadratureCoulombKernel(
+            config.cell, config.kpts, config.quadrature_coulomb_kernel,
+            config.eta,
+        )
 
     def _create_direct_model(self, name, grids):
         spec = DIRECT_MODEL_SPECS[name]
@@ -775,10 +826,15 @@ class MP2DirectFullSS(SingularitySubtraction):
         return f_gauss, qGlocal_grid_correction, numKpt3D, omega_star
 
     def compute_quadrature_term(self, *, f_gauss, qGlocal_grid_correction):
-        prefac = 4 * np.pi
-        denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
-        denominator[denominator < 1e-8] = np.inf
-        return prefac * np.sum(f_gauss.eval_model(qGlocal_grid_correction) / denominator)
+        if self._coulomb_kernel.name == 'bare':
+            prefac = 4 * np.pi
+            denominator = np.linalg.norm(qGlocal_grid_correction, axis=1) ** 2
+            denominator[denominator < 1e-8] = np.inf
+            return prefac * np.sum(
+                f_gauss.eval_model(qGlocal_grid_correction) / denominator
+            )
+        kernel = self._coulomb_kernel(qGlocal_grid_correction)
+        return np.dot(f_gauss.eval_model(qGlocal_grid_correction), kernel)
 
     def compute_integral_term(self, *, f_gauss, numKpt3D, omega_star):
         prefactor = 4 * np.pi * numKpt3D / omega_star
@@ -1164,6 +1220,9 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul=self.fit_with_coul,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            kpts=self.kmf.kpts,
+            quadrature_coulomb_kernel=self.options.quadrature_coulomb_kernel,
+            eta=self.options.eta,
         )
 
     def _build_direct_second_order_correction_config(self):
@@ -1174,6 +1233,9 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul_q2=self.fit_with_coul_q2,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            kpts=self.kmf.kpts,
+            quadrature_coulomb_kernel=self.options.quadrature_coulomb_kernel,
+            eta=self.options.eta,
         )
 
     def _build_direct_fourth_order_correction_config(self):
@@ -1184,6 +1246,9 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul_q4=self.fit_with_coul_q4,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            kpts=self.kmf.kpts,
+            quadrature_coulomb_kernel=self.options.quadrature_coulomb_kernel,
+            eta=self.options.eta,
         )
 
     def _refresh_direct_correction(self):
@@ -1567,6 +1632,11 @@ class MP2SS:
         print(f"Using with_df_ints: {self.with_df_ints}")
         print(f"Using auxiliary function: {self.auxfunc_direct} for direct correction")
         print(f"Using auxiliary function: {self.auxfunc_exchange} for exchange correction")
+        options = getattr(self, "options", None)
+        kernel = getattr(options, "quadrature_coulomb_kernel", "bare")
+        eta = getattr(options, "eta", None)
+        description = kernel if eta is None else f"{kernel} sTC (eta={eta:g})"
+        print(f"Direct quadrature Coulomb kernel: {description}")
 
         print("Uncorrected MP2 Energies:")
         print(f" MP2 uncorrected direct energy (hartree)   = {self.edi_uncorr}")
