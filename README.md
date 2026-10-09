@@ -5,6 +5,12 @@ calculations. It includes singularity-subtraction methods for exact exchange
 (ExxSS) and MP2 (MP2SS) correlation energies and is designed to work with periodic
 [PySCF](https://pyscf.org/) calculations.
 
+Staggered mesh methods for restricted periodic MP3, CCD, and G0W0 are available
+under `fsec.staggered_mesh.mp`, `fsec.staggered_mesh.cc`, and
+`fsec.staggered_mesh.gw`. See the [staggered mesh guide](docs/staggered_mesh.md)
+for examples, API migration notes, and numerical validation, including the
+unresolved historical H₂ GW reference discrepancy.
+
 ## Installation
 
 FSEC requires Python 3.9 or newer. Clone the repository and install it with
