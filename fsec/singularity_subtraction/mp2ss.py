@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Optional
 import warnings
@@ -5,7 +6,13 @@ import warnings
 from pyscf.pbc.tools import get_monkhorst_pack_size
 from pyscf.lib import logger
 from fsec.singularity_subtraction import model_function
-from fsec.singularity_subtraction.function_fitting import MP2ScipyMinimize, MP2ScipyLeastSquares
+from fsec.singularity_subtraction.function_fitting import (
+    ETBLinearLeastSquares,
+    MP2ScipyLeastSquares,
+    MP2ScipyMinimize,
+    coulomb_residual_weights,
+)
+from fsec.singularity_subtraction.model_function.etb import trim_etb_model_to_data
 from fsec.singularity_subtraction.structure_factor import MP2StructureFactor
 from fsec.singularity_subtraction.structure_factor.mp2_smallq import MP2SmallQ
 from fsec.singularity_subtraction.grids import MP2SSGrids
@@ -74,26 +81,44 @@ class MP2SSOptions:
     ----------
     auxfunc_direct
         Model used when fitting the complete direct contribution. Supported
-        values are ``"Gauss"`` and ``"ExpAbs"``. NOTE: Ignored when
+        values are ``"Gauss"``, ``"ExpAbs"``, and ``"ETB"``. NOTE: Ignored when
         correct_q2_q4_separately is enabled, in which case auxfunc_direct_q2
         and auxfunc_direct_q4 are used instead.
     auxfunc_direct_q2
         Model used for the second-order direct contribution when
         ``correct_q2_q4_separately`` is enabled. A false-like value falls back
-        to ``auxfunc_direct``. Supported values are ``"Gauss"`` and
-        ``"ExpAbs"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
+        to ``auxfunc_direct``. Supported values are ``"Gauss"``,
+        ``"ExpAbs"``, and ``"ETB"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
         in which case auxfunc_direct is used instead.
     auxfunc_direct_q4
         Model used for the fourth-order direct contribution when
         ``correct_q2_q4_separately`` is enabled. A false-like value falls back
         to ``auxfunc_direct``. Supported values are ``"Gauss"``,
-        ``"Exponential"``, ``"QuarticExponential"``, ``"ExpAbs"``, and
-        ``"ExpAbs2"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
+        ``"Exponential"``, ``"QuarticExponential"``, ``"ExpAbs"``,
+        ``"ExpAbs2"``, and ``"ETB"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
         in which case auxfunc_direct is used instead.
     auxfunc_exchange
         Model used when fitting the exchange contribution. Supported values
         are ``"Gauss"``, ``"Exponential"``, ``"QuarticExponential"``,
-        ``"ExpAbs"``, and ``"ExpAbs2"``.
+        ``"ExpAbs"``, ``"ExpAbs2"``, and ``"ETB"``.
+    etb_sigma
+        Expected width of the decay function for ``"ETB"`` (even-tempered
+        Gaussian) auxiliary functions. The fixed exponents are
+        ``alpha_k = ratio**(k - (N-1)/2) / (2 sigma**2)``. Either a float
+        used for every component, or a mapping keyed by ``"direct"``,
+        ``"direct_q2"``, ``"direct_q4"``, and ``"exchange"``; components
+        missing from the mapping use 1.0.
+    etb_num_gaussians
+        Number of even-tempered Gaussians N in ``"ETB"`` auxiliary functions.
+        Reduced automatically, around the Gaussian of width ``etb_sigma``,
+        if the fit data cannot determine all coefficients.
+    etb_ratio
+        Ratio between consecutive ``"ETB"`` exponents.
+    etb_linear_fit
+        Fit ``"ETB"`` models that are linear in their coefficients (q4 and
+        exchange) by direct nonnegative least squares instead of
+        ``fit_method``. The stacked direct and q2 models are quadratic in
+        their coefficients and always use ``fit_method``.
     fit_with_coul
         Include the Coulomb kernel in fits of the complete direct and exchange
         contributions. Ignored for direct if ``correct_q2_q4_separately`` is
@@ -233,6 +258,10 @@ class MP2SSOptions:
     smallq_band_df: Optional[str] = None
     smallq_band_exxdiv: Optional[str] = 'ewald'
     correct_q2_q4_separately: bool = True
+    etb_sigma: object = 1.0
+    etb_num_gaussians: int = 5
+    etb_ratio: float = 2.0
+    etb_linear_fit: bool = True
 
     def __post_init__(self):
         pair_density_eval_grid = str(self.pair_density_eval_grid).strip().lower()
@@ -281,6 +310,25 @@ class MP2SSOptions:
             if rsdf_occ_block_size < 1:
                 raise ValueError("rsdf_occ_block_size must be positive or None")
         verbose = None if self.verbose is None else int(self.verbose)
+        etb_sigma = self.etb_sigma
+        if isinstance(etb_sigma, Mapping):
+            unknown = set(etb_sigma) - set(ETB_COMPONENTS)
+            if unknown:
+                raise ValueError(
+                    f"etb_sigma keys must be in {ETB_COMPONENTS}; got {sorted(unknown)}")
+            etb_sigma = {key: float(value) for key, value in etb_sigma.items()}
+            sigmas = list(etb_sigma.values())
+        else:
+            etb_sigma = float(etb_sigma)
+            sigmas = [etb_sigma]
+        if not all(np.isfinite(sigma) and sigma > 0 for sigma in sigmas):
+            raise ValueError("etb_sigma must be finite and positive")
+        etb_num_gaussians = int(self.etb_num_gaussians)
+        if etb_num_gaussians < 1:
+            raise ValueError("etb_num_gaussians must be positive")
+        etb_ratio = float(self.etb_ratio)
+        if not np.isfinite(etb_ratio) or etb_ratio <= 1:
+            raise ValueError("etb_ratio must be finite and greater than 1")
         object.__setattr__(self, 'pair_density_eval_grid', pair_density_eval_grid)
         object.__setattr__(
             self,
@@ -300,6 +348,9 @@ class MP2SSOptions:
         object.__setattr__(
             self, 'rsdf_occ_block_size', rsdf_occ_block_size)
         object.__setattr__(self, 'verbose', verbose)
+        object.__setattr__(self, 'etb_sigma', etb_sigma)
+        object.__setattr__(self, 'etb_num_gaussians', etb_num_gaussians)
+        object.__setattr__(self, 'etb_ratio', etb_ratio)
 
 
 @dataclass(frozen=True)
@@ -311,6 +362,8 @@ class DirectFullCorrectionConfig:
     fit_method: str
     fit_with_coul: bool
     qG_norm_cutoff: float
+    model_kwargs: object = None
+    etb_linear_fit: bool = True
 
 
 @dataclass(frozen=True)
@@ -322,6 +375,8 @@ class DirectSecondOrderCorrectionConfig:
     fit_method: object
     fit_with_coul_q2: bool
     qG_norm_cutoff: object
+    model_kwargs: object = None
+    etb_linear_fit: bool = True
 
 
 @dataclass(frozen=True)
@@ -333,6 +388,8 @@ class DirectFourthOrderCorrectionConfig:
     fit_method: object
     fit_with_coul_q4: bool
     qG_norm_cutoff: object
+    model_kwargs: object = None
+    etb_linear_fit: bool = True
 
 
 @dataclass
@@ -358,6 +415,8 @@ class ExchangeCorrectionConfig:
     fit_with_coul: bool
     qG_norm_cutoff: object
     fit_multipliers: object = None
+    model_kwargs: object = None
+    etb_linear_fit: bool = True
 
 
 @dataclass
@@ -367,6 +426,8 @@ class ExchangeCorrectionResult:
     exchange_integral_term: float
     exchange_quadrature_term: float
 
+
+ETB_COMPONENTS = ('direct', 'direct_q2', 'direct_q4', 'exchange')
 
 # ---------------------------------------------------------------------------
 # Model spec registries for MP2SS
@@ -378,6 +439,10 @@ class ExchangeCorrectionResult:
 #   'qmesh'   — QMesh variant: Constructed to avoid an (nq * nG)**2 scaling in the evaluation of 
 #                   MP2 direct-type auxiliary functions.
 #   'exchange' — exchange variant: constructed specifically for the exchange term.
+#
+# Specs with 'etb': True are even-tempered Gaussian models. They take the
+# config's model_kwargs, build their initial guess from c0_scale, and are
+# trimmed to the exponents the fit data can determine before fitting.
 # ---------------------------------------------------------------------------
 
 DIRECT_MODEL_SPECS = {
@@ -392,6 +457,12 @@ DIRECT_MODEL_SPECS = {
         'type': 'qmesh',
         'c0_scale': 1.0e-4,
         'fit_multipliers': [1e4, 1.0],
+    },
+    'ETB': {
+        'cls_name': 'XNETBStackedSingularityQMesh',
+        'type': 'qmesh',
+        'etb': True,
+        'c0_scale': 1.0e-4,
     },
 }
 
@@ -421,6 +492,11 @@ Q4_MODEL_SPECS = {
         'initial_params': np.array([1e-4, 1.0, 1.0]),
         'fit_multipliers': [1e4, 1.0, 1.0],
     },
+    'ETB': {
+        'cls_name': 'XNETB',
+        'etb': True,
+        'c0_scale': 1.0e-4,
+    },
 }
 
 Q2_MODEL_SPECS = {
@@ -435,6 +511,12 @@ Q2_MODEL_SPECS = {
         'type': 'qmesh',
         'c0_scale': 1.0e-5,
         'fit_multipliers': [1e4, 1.0],
+    },
+    'ETB': {
+        'cls_name': 'XNETBStackedSingularityQMesh',
+        'type': 'qmesh',
+        'etb': True,
+        'c0_scale': 1.0e-5,
     },
 }
 
@@ -459,7 +541,28 @@ EXCHANGE_MODEL_SPECS = {
         'cls_name': 'XNExpAbs2StackedSingularityExchange',
         'initial_params': np.array([1e-4, 1.0, 1.0]),
     },
+    'ETB': {
+        'cls_name': 'XNETBStackedSingularityExchange',
+        'etb': True,
+        'c0_scale': 1.0e-4,
+    },
 }
+
+
+def _prepare_etb_fit(model, spec, config, fit_coords, *, fit_with_coul, coul_deg, label):
+    """Reduce an ETB model to the exponents the fit data can determine, and pick its fit method.
+
+    Returns the (possibly rebuilt) model, its initial parameters, fit multipliers, and the fit class.
+    """
+    weights = coulomb_residual_weights(fit_coords, False, fit_with_coul, coul_deg)
+    model = trim_etb_model_to_data(model, fit_coords, weights, label=label)
+    initial_params = model.initial_parameters(spec['c0_scale'])
+    model.set_parameters(initial_params)
+    fit_class = config.fit_class
+    if config.etb_linear_fit and hasattr(model, 'linear_design_matrix'):
+        fit_class = ETBLinearLeastSquares
+    print(f"{label} exponents: {model.etb_exponents}")
+    return model, initial_params, None, fit_class
 
 
 class MP2DirectFourthOrderSS(SingularitySubtraction):
@@ -471,9 +574,14 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
     def _create_q4_model(self, name):
         spec = Q4_MODEL_SPECS[name]
         cls = model_function.ModelFunction.get_class(spec['cls_name'])
-        initial_params = spec['initial_params'].copy()
-        m = cls(parameters=initial_params, negative=True,
-                deg=spec.get('deg', 4))
+        if spec.get('etb'):
+            m = cls(negative=True, deg=spec.get('deg', 4), **(self.config.model_kwargs or {}))
+            initial_params = m.initial_parameters(spec['c0_scale'])
+            m.set_parameters(initial_params)
+        else:
+            initial_params = spec['initial_params'].copy()
+            m = cls(parameters=initial_params, negative=True,
+                    deg=spec.get('deg', 4))
         return m, initial_params, spec.get('fit_multipliers')
 
     def optimize_parameters(self, *, SqG_full_q4, qG_full, grids, nks, q4_fit_mask=None):
@@ -494,11 +602,8 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
         force_positive_params = True
         fixed_params = None
         f_q4, initial_params, fit_multipliers = self._create_q4_model(config.auxfunc_direct_q4)
+        coul_deg = 4 if config.fit_with_coul_q4 else None
 
-
-        fit_method_q4 = config.fit_class(f_q4, fit_with_coul=config.fit_with_coul_q4)
-        fit_method_q4.initial_guess = initial_params
-        fit_method_q4.coul_deg = 4 if config.fit_with_coul_q4 else None
         if q4_fit_mask is None:
             q4_fit_mask = np.ones(qGlocal_fit.shape[0], dtype=bool)
         else:
@@ -511,22 +616,29 @@ class MP2DirectFourthOrderSS(SingularitySubtraction):
                 raise ValueError("No q4 fitting points remain after applying q4_fit_mask")
             print(f"Fitting with {len(qGlocal_fit[mask])} points")
             print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
-            SqG_vals = SqG_full_q4[mask]
-            qGlocal_fit_vals = qGlocal_fit[mask]
-
-            fitted_params_q4 = fit_method_q4.fit_model(
-                qGlocal_fit_vals, SqG_vals, fit_multipliers=fit_multipliers,
-                fixed_params=fixed_params, force_positive_params=force_positive_params,
-                jac=jac, x_scale='jac', max_nfev=1000 * f_q4.num_params
-            )
         else:
             if not np.any(q4_fit_mask):
                 raise ValueError("No q4 fitting points remain after applying q4_fit_mask")
-            fitted_params_q4 = fit_method_q4.fit_model(
-                qGlocal_fit[q4_fit_mask], SqG_full_q4[q4_fit_mask], fit_multipliers=fit_multipliers,
-                fixed_params=fixed_params, force_positive_params=force_positive_params,
-                jac=jac, x_scale='jac', max_nfev=1000 * f_q4.num_params
+            mask = q4_fit_mask
+        SqG_vals = SqG_full_q4[mask]
+        qGlocal_fit_vals = qGlocal_fit[mask]
+
+        fit_class = config.fit_class
+        spec = Q4_MODEL_SPECS[config.auxfunc_direct_q4]
+        if spec.get('etb'):
+            f_q4, initial_params, fit_multipliers, fit_class = _prepare_etb_fit(
+                f_q4, spec, config, qGlocal_fit_vals, fit_with_coul=config.fit_with_coul_q4,
+                coul_deg=coul_deg, label="q4 ETB",
             )
+
+        fit_method_q4 = fit_class(f_q4, fit_with_coul=config.fit_with_coul_q4)
+        fit_method_q4.initial_guess = initial_params
+        fit_method_q4.coul_deg = coul_deg
+        fitted_params_q4 = fit_method_q4.fit_model(
+            qGlocal_fit_vals, SqG_vals, fit_multipliers=fit_multipliers,
+            fixed_params=fixed_params, force_positive_params=force_positive_params,
+            jac=jac, x_scale='jac', max_nfev=1000 * f_q4.num_params
+        )
 
         f_q4.set_parameters(fitted_params_q4)
         print("Unnormalized q4 c4_value: ", f_q4.c0)
@@ -601,10 +713,10 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
         cls = model_function.ModelFunction.get_class(spec['cls_name'])
 
         if spec['type'] == 'qmesh':
+            model_kwargs = (self.config.model_kwargs or {}) if spec.get('etb') else {}
             m = cls(qGrid=grids.qGrid, cell=grids.cell,
-                    deltaGs=grids.GptGrid3D, remove_deltaG_zero=True)
-            m.compute_sum_g_q_deltaG()
-            initial_params = np.array([spec['c0_scale'] / m.g0, 1.0])
+                    deltaGs=grids.GptGrid3D, remove_deltaG_zero=True, **model_kwargs)
+            initial_params = m.initial_parameters(spec['c0_scale'])
         else:
             initial_params = spec['initial_params'].copy()
             m = cls(parameters=initial_params, negative=True,
@@ -629,8 +741,6 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
             config.auxfunc_direct_q2, grids
         )
 
-        fit_method = config.fit_class(f_q2, fit_with_coul=config.fit_with_coul_q2)
-        fit_method.initial_guess = initial_params
         fixed_params = None
         if config.qG_norm_cutoff is not None:
             mask = np.linalg.norm(qGlocal_fit, axis=1) <= config.qG_norm_cutoff
@@ -638,6 +748,16 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
             mask = np.ones_like(SqG_full_q2_part, dtype=bool)
         print(f"Fitting with {len(qGlocal_fit[mask])} points")
         print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
+
+        fit_class = config.fit_class
+        spec = Q2_MODEL_SPECS.get(config.auxfunc_direct_q2, Q2_MODEL_SPECS['Gauss'])
+        if spec.get('etb'):
+            f_q2, initial_params, fit_multipliers, fit_class = _prepare_etb_fit(
+                f_q2, spec, config, qGlocal_fit[mask], fit_with_coul=config.fit_with_coul_q2,
+                coul_deg=2, label="q2 ETB",
+            )
+        fit_method = fit_class(f_q2, fit_with_coul=config.fit_with_coul_q2)
+        fit_method.initial_guess = initial_params
         fitted_params_q2 = fit_method.fit_model(
             qGlocal_fit[mask], SqG_full_q2_part[mask], fit_multipliers=fit_multipliers, fixed_params=fixed_params,
             max_nfev=1000 * f_q2.num_params, force_positive_params=True
@@ -709,10 +829,10 @@ class MP2DirectFullSS(SingularitySubtraction):
         cls = model_function.ModelFunction.get_class(spec['cls_name'])
 
         if spec['type'] == 'qmesh':
+            model_kwargs = (self.config.model_kwargs or {}) if spec.get('etb') else {}
             m = cls(qGrid=grids.qGrid, cell=grids.cell,
-                    deltaGs=grids.GptGrid3D)
-            m.compute_sum_g_q_deltaG()
-            initial_params = np.array([spec['c0_scale'] / m.g0, 1.0])
+                    deltaGs=grids.GptGrid3D, **model_kwargs)
+            initial_params = m.initial_parameters(spec['c0_scale'])
         else:
             initial_params = spec['initial_params'].copy()
             m = cls(parameters=initial_params, negative=True,
@@ -749,10 +869,6 @@ class MP2DirectFullSS(SingularitySubtraction):
         )
 
         print("Using direct auxiliary function: ", f_gauss.__class__.__name__)
-        f_gauss.set_parameters(initial_params)
-        print("initial_params: ", initial_params)
-        fit_method = config.fit_class(f_gauss, fit_with_coul=config.fit_with_coul)
-        fit_method.initial_guess = initial_params
 
         fixed_params = None
         if config.qG_norm_cutoff is not None:
@@ -761,6 +877,18 @@ class MP2DirectFullSS(SingularitySubtraction):
             print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
         else:
             mask = np.ones_like(SqGlocal_fit, dtype=bool)
+
+        fit_class = config.fit_class
+        spec = DIRECT_MODEL_SPECS[config.auxfunc_direct]
+        if spec.get('etb'):
+            f_gauss, initial_params, fit_multipliers, fit_class = _prepare_etb_fit(
+                f_gauss, spec, config, qGlocal_fit[mask], fit_with_coul=config.fit_with_coul,
+                coul_deg=2, label="Direct ETB",
+            )
+        f_gauss.set_parameters(initial_params)
+        print("initial_params: ", initial_params)
+        fit_method = fit_class(f_gauss, fit_with_coul=config.fit_with_coul)
+        fit_method.initial_guess = initial_params
 
         fitted_params = fit_method.fit_model(
             qGlocal_fit[mask], SqGlocal_fit[mask],
@@ -866,8 +994,12 @@ class MP2ExchangeSS(SingularitySubtraction):
     def _create_exchange_model(self, name, q2grid, dvol):
         spec = EXCHANGE_MODEL_SPECS[name]
         cls = model_function.ModelFunction.get_class(spec['cls_name'])
-        initial_params = spec['initial_params'].copy()
-        m = cls(parameters=initial_params, q2s=q2grid, dvol=dvol)
+        if spec.get('etb'):
+            m = cls(q2s=q2grid, dvol=dvol, **(self.config.model_kwargs or {}))
+            initial_params = m.initial_parameters(spec['c0_scale'])
+        else:
+            initial_params = spec['initial_params'].copy()
+            m = cls(parameters=initial_params, q2s=q2grid, dvol=dvol)
         return m, initial_params, spec.get('fit_multipliers')
 
     def optimize_parameters(self, *, SqG_full_exchange, qG_full, grids, nks):
@@ -893,34 +1025,38 @@ class MP2ExchangeSS(SingularitySubtraction):
         f_gauss, initial_params, fit_multipliers = self._create_exchange_model(
             config.auxfunc_exchange, q2grid, dvol_x
         )
-        if config.fit_multipliers is not None:
-            fit_multipliers = config.fit_multipliers
-
-        f_gauss.set_parameters(initial_params)
-        print("initial_params: ", initial_params)
-        fit_method = config.fit_class(f_gauss, fit_with_coul=config.fit_with_coul)
-        fit_method.initial_guess = initial_params
-
         fixed_params = None
         if config.qG_norm_cutoff is not None:
             mask = np.linalg.norm(qG_full, axis=1) <= config.qG_norm_cutoff
             print(f"Fitting with {len(qG_full[mask])} points")
             print(f"qG_norm_cutoff: {config.qG_norm_cutoff}")
-            fitted_params = fit_method.fit_model(
-                qG_full[mask], SqG_full_exchange[mask],
-                fit_multipliers=fit_multipliers,
-                fixed_params=fixed_params,
-                force_positive_params=True,
-                max_nfev=1000 * f_gauss.num_params,
-            )
         else:
-            fitted_params = fit_method.fit_model(
-                qG_full, SqG_full_exchange,
-                fit_multipliers=fit_multipliers,
-                fixed_params=fixed_params,
-                force_positive_params=True,
-                max_nfev=1000 * f_gauss.num_params,
+            mask = np.ones(len(qG_full), dtype=bool)
+        qG_fit = qG_full[mask]
+        SqG_fit = SqG_full_exchange[mask]
+
+        fit_class = config.fit_class
+        spec = EXCHANGE_MODEL_SPECS[config.auxfunc_exchange]
+        if spec.get('etb'):
+            f_gauss, initial_params, fit_multipliers, fit_class = _prepare_etb_fit(
+                f_gauss, spec, config, qG_fit, fit_with_coul=config.fit_with_coul,
+                coul_deg=2, label="Exchange ETB",
             )
+        if config.fit_multipliers is not None:
+            fit_multipliers = config.fit_multipliers
+
+        f_gauss.set_parameters(initial_params)
+        print("initial_params: ", initial_params)
+        fit_method = fit_class(f_gauss, fit_with_coul=config.fit_with_coul)
+        fit_method.initial_guess = initial_params
+
+        fitted_params = fit_method.fit_model(
+            qG_fit, SqG_fit,
+            fit_multipliers=fit_multipliers,
+            fixed_params=fixed_params,
+            force_positive_params=True,
+            max_nfev=1000 * f_gauss.num_params,
+        )
 
         f_gauss.set_parameters(fitted_params)
         print(f"Exchange auxiliary function parameters: {fitted_params}")
@@ -1128,6 +1264,10 @@ class MP2SS:
         
         
         self.correct_q2_q4_separately = options.correct_q2_q4_separately
+        self.etb_sigma = options.etb_sigma
+        self.etb_num_gaussians = options.etb_num_gaussians
+        self.etb_ratio = options.etb_ratio
+        self.etb_linear_fit = options.etb_linear_fit
         self.dG0 = self.correct_q2_q4_separately
         self.correct_q2_part = self.correct_q2_q4_separately
         
@@ -1156,6 +1296,19 @@ class MP2SS:
         )
         self.grids.build_grids()
 
+    def _etb_model_kwargs(self, component, auxfunc):
+        """Constructor kwargs for an ETB auxiliary function of the given component, or None."""
+        if auxfunc != 'ETB':
+            return None
+        sigma = self.etb_sigma
+        if isinstance(sigma, Mapping):
+            sigma = sigma.get(component, 1.0)
+        return {
+            'sigma': sigma,
+            'num_gaussians': self.etb_num_gaussians,
+            'ratio': self.etb_ratio,
+        }
+
     def _build_direct_full_correction_config(self):
         return DirectFullCorrectionConfig(
             cell=self.cell,
@@ -1164,6 +1317,8 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul=self.fit_with_coul,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            model_kwargs=self._etb_model_kwargs('direct', self.auxfunc_direct),
+            etb_linear_fit=self.etb_linear_fit,
         )
 
     def _build_direct_second_order_correction_config(self):
@@ -1174,6 +1329,8 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul_q2=self.fit_with_coul_q2,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            model_kwargs=self._etb_model_kwargs('direct_q2', self.auxfunc_direct_q2),
+            etb_linear_fit=self.etb_linear_fit,
         )
 
     def _build_direct_fourth_order_correction_config(self):
@@ -1184,6 +1341,8 @@ class MP2SS:
             fit_method=self.fit_method,
             fit_with_coul_q4=self.fit_with_coul_q4,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            model_kwargs=self._etb_model_kwargs('direct_q4', self.auxfunc_direct_q4),
+            etb_linear_fit=self.etb_linear_fit,
         )
 
     def _refresh_direct_correction(self):
@@ -1205,6 +1364,8 @@ class MP2SS:
             fit_class=self.fit_class,
             fit_with_coul=self.fit_with_coul,
             qG_norm_cutoff=self.qG_norm_cutoff,
+            model_kwargs=self._etb_model_kwargs('exchange', self.auxfunc_exchange),
+            etb_linear_fit=self.etb_linear_fit,
         )
 
     def set_structure_factor(self, direct=True, exchange=True, dG0=False,

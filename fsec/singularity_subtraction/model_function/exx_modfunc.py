@@ -3,6 +3,7 @@ import scipy
 from scipy.integrate import quad
 
 from fsec.singularity_subtraction.model_function import IsotropicModel, ModelFunction
+from fsec.singularity_subtraction.model_function.etb import EvenTemperedMixin, _radii
 
 
 class ContractedGaussianModel(ModelFunction):
@@ -222,3 +223,46 @@ class QuarticExponentialModel(IsotropicModel):
 
     def eval_model_r(self, r):
         return self.quartic_exponential_model_centered_r(self.parameters, r, self.num_primitives)
+
+
+class EvenTemperedGaussianModel(EvenTemperedMixin, IsotropicModel):
+    """Linear combination of even-tempered Gaussians with fixed exponents.
+
+    f(r) = sum_k c_k exp(-alpha_k r^2), alpha_k = alpha_sigma * ratio**(k - (N-1)/2), alpha_sigma = 1/(2 sigma^2)
+
+    Parameter order:
+        [c_0, ..., c_{N-1}] in order of ascending exponent. Fits enforce c_k >= 0 and sum_k c_k = 1, i.e. f(0) = 1.
+
+    A nonnegative combination of Gaussians is log-convex in |q|^2, i.e. its tail is at least as heavy as a
+    Gaussian's. It therefore improves on a single Gaussian for heavier-than-Gaussian S(q), but not for S(q) that
+    decays faster than a Gaussian.
+    """
+
+    linear_sum_constraint = 1.0
+
+    def __init__(self, sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None, parameters=None):
+        self._init_etb(sigma, num_gaussians, ratio, exponents)
+        self._etb_ctor_kwargs = {}
+        self.num_primitives = self.num_gaussians
+        self.num_primitive_params = 1
+        if parameters is not None:
+            parameters = np.asarray(parameters, dtype=float)
+        super().__init__(parameters, num_params=self.num_gaussians, is_contraction=True)
+
+    def default_parameters(self):
+        return self.one_hot_reference()
+
+    def set_parameters(self, parameters):
+        self.parameters = np.asarray(parameters, dtype=float)
+
+    def eval_model_r(self, r):
+        scalar_input = np.isscalar(r)
+        result = self.etb_h(r)
+        return float(result) if scalar_input else result
+
+    def linear_design_matrix(self, coords):
+        return self.gaussian_columns(_radii(coords))
+
+    def coulomb_integral(self, parameters: list = None):
+        parameters = self.parameters if parameters is None else parameters
+        return float(np.sum(np.asarray(parameters, dtype=float) / np.sqrt(np.pi * self.etb_exponents)))

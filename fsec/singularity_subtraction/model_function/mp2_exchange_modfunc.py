@@ -2,6 +2,7 @@ import numpy as np
 from scipy.integrate import quad
 
 from fsec.singularity_subtraction.model_function import ModelFunction
+from fsec.singularity_subtraction.model_function.etb import EvenTemperedMixin
 
 
 class MP2StackedSingularityExchange(ModelFunction):
@@ -199,3 +200,69 @@ class XNQuarticExponentialStackedSingularityExchange(MP2StackedSingularityExchan
         gamma1 = self.beta / self.alpha
         gamma2 = self.kappa / self.alpha
         return np.exp(-self.alpha * (np.sqrt(1 + gamma1 * r**2 + gamma2 * r**4) - 1))
+
+
+class XNETBStackedSingularityExchange(EvenTemperedMixin, MP2StackedSingularityExchange):
+    """Exchange model with an even-tempered Gaussian decay function.
+
+    f(q) = c0 |q|^2 h(q) dvol sum_{q2} h(q2) = |q|^2 sum_k beta_k exp(-alpha_k |q|^2),
+    with h(r) = sum_k w_k exp(-alpha_k r^2) normalized to h(0) = 1.
+
+    Parameter order:
+        [beta_0, ..., beta_{N-1}] in order of ascending exponent, so the model is linear in the parameters.
+        The normalized weights w = beta / sum(beta) and c0 = sum(beta) / (dvol sum_{q2} h(q2)) are derived.
+    """
+
+    def __init__(self, parameters=None, q2s=None, dvol=None, sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None):
+        self._init_etb(sigma, num_gaussians, ratio, exponents)
+        self._etb_ctor_kwargs = {'q2s': q2s, 'dvol': dvol}
+        if parameters is not None:
+            parameters = np.asarray(parameters, dtype=float)
+        super().__init__(parameters=parameters, q2s=q2s, dvol=dvol)
+        self.parameters = np.asarray(self.parameters, dtype=float)
+
+    def default_parameters(self):
+        return self.one_hot_reference()
+
+    def initial_parameters(self, c0_scale):
+        """Reference Gaussian with c0 = c0_scale."""
+        self.set_parameters(self.one_hot_reference())
+        return self.initial_coefficients(c0_scale * self.uncorrected_q2_quad)
+
+    def set_parameters(self, parameters):
+        super().set_parameters(np.asarray(parameters, dtype=float))
+
+    @property
+    def etb_weights(self):
+        total = np.sum(self.parameters)
+        if np.isclose(total, 0):
+            return np.zeros_like(self.parameters)
+        return self.parameters / total
+
+    @property
+    def c0(self):
+        if self.uncorrected_q2_quad is None:
+            return None
+        if np.isclose(np.sum(self.parameters), 0):
+            return 0.0
+        if np.isclose(self.uncorrected_q2_quad, 0):
+            raise ValueError("The q2 quadrature of the ETB decay function vanishes; c0 is undefined")
+        return float(np.sum(self.parameters) / self.uncorrected_q2_quad)
+
+    def decay_func_r(self, r: np.ndarray):
+        return self.etb_h(r, self.etb_weights)
+
+    def eval_model(self, coords: np.ndarray):
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError("coords must be an (N,3) array: [q_x, q_y, q_z]")
+        r = np.linalg.norm(coords, axis=1)
+        return r**2 * self.etb_h(r)
+
+    def linear_design_matrix(self, coords):
+        r = np.linalg.norm(np.asarray(coords, dtype=float), axis=1)
+        return (r**2)[:, None] * self.gaussian_columns(r)
+
+    def coulomb_integral(self):
+        if self.c0 is None:
+            raise ValueError("q2s and dvol must be set on XNETBStackedSingularityExchange before evaluation")
+        return self.c0 * float(np.dot(self.etb_weights, self._volume_moments())) ** 2

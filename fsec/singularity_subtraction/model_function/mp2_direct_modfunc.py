@@ -6,6 +6,7 @@ from scipy.spatial import KDTree
 from fsec.singularity_subtraction.grids import minimum_image
 
 from fsec.singularity_subtraction.model_function import ModelFunction
+from fsec.singularity_subtraction.model_function.etb import EvenTemperedMixin
 
 
 class XNGeneral(ModelFunction):
@@ -214,14 +215,12 @@ class XNGaussStackedSingularity(ModelFunction):
             raise ValueError("deltaGs must be set on XNGaussStackedSingularity before evaluation")
         if self.deltaGs.shape != (len(self.deltaGs), 3):
             raise ValueError("deltaGs must be a (N,3) array")
-        if len(self.parameters) != 2:
-            raise ValueError("parameters must be [c0, sigma]")
-
-        cn_coeffs = self.parameters[0]
 
         return_all_zeros = self.check_parameters()
         if return_all_zeros:
             return np.zeros(coords.shape[0])
+
+        cn_coeffs = self.c0
 
         deltaGs = self.deltaGs
         q = coords
@@ -316,6 +315,13 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
         self.c0 = self.parameters[0]
         self.compute_sum_g_q_deltaG()
 
+    def initial_parameters(self, c0_scale):
+        """Default shape parameters with c0 chosen so that the model is ~c0_scale near q = 0."""
+        self.compute_sum_g_q_deltaG()
+        parameters = np.array(self.default_parameters(), dtype=float)
+        parameters[0] = c0_scale / self.g0
+        return parameters
+
     def eval_model(self, coords: np.ndarray):
         if coords.ndim != 2 or coords.shape[1] != 3:
             raise ValueError("coords must be an (N,3) array: [q_x, q_y, q_z]")
@@ -328,7 +334,7 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
         if return_all_zeros:
             return np.zeros(coords.shape[0])
 
-        cn_coeffs = self.parameters[0]
+        cn_coeffs = self.c0
 
         coords_FBZ = minimum_image(self.cell, coords)
         idxs_coords_FBZ_in_qGrid = self.kdtree_qGrid.query(
@@ -439,6 +445,134 @@ class XNExpAbsStackedSingularityQMesh(XNExpAbsStackedSingularity, XNGaussStacked
         self.alpha = self.parameters[1]
         self.c0 = self.parameters[0]
         self.compute_sum_g_q_deltaG()
+
+
+class XNETB(EvenTemperedMixin, XNGeneral):
+    """f(q) = sign * |q|^deg * sum_k b_k exp(-alpha_k |q|^2) with fixed even-tempered exponents.
+
+    Parameter order:
+        [b_0, ..., b_{N-1}] in order of ascending exponent. c0 = sum_k b_k and decay_func is normalized to 1 at
+        r = 0, so the model is linear in the parameters.
+    """
+
+    def __init__(self, parameters=None, deg=2, is_contraction=False, negative=True,
+                 sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None):
+        self._init_etb(sigma, num_gaussians, ratio, exponents)
+        self._etb_ctor_kwargs = {'deg': deg, 'is_contraction': is_contraction, 'negative': negative}
+        super().__init__(parameters=parameters, deg=deg, is_contraction=is_contraction, negative=negative)
+        self.set_parameters(self.parameters)
+
+    def default_parameters(self):
+        return self.one_hot_reference()
+
+    def initial_parameters(self, c0_scale):
+        return self.initial_coefficients(c0_scale)
+
+    def set_parameters(self, parameters):
+        self.parameters = np.asarray(parameters, dtype=float)
+        self.c0 = float(np.sum(self.parameters))
+        self.num_params = len(self.parameters)
+
+    def decay_func(self, r: np.ndarray):
+        if np.isclose(self.c0, 0):
+            return np.zeros_like(np.asarray(r, dtype=float))
+        return self.etb_h(r) / self.c0
+
+    def eval_model(self, coords: np.ndarray):
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError("coords must be an (N,3) array: [q_x, q_y, q_z]")
+        r = np.linalg.norm(coords, axis=1)
+        return self.sign * r**self.deg * self.etb_h(r)
+
+    def linear_design_matrix(self, coords):
+        r = np.linalg.norm(np.asarray(coords, dtype=float), axis=1)
+        return self.sign * (r**self.deg)[:, None] * self.gaussian_columns(r)
+
+    def coulomb_integral(self, coul_deg=2):
+        moments = self._radial_moments(self.deg + 2 - coul_deg)
+        return self.sign * 4 * np.pi * float(np.dot(self.parameters, moments))
+
+
+class XNETBStackedSingularity(EvenTemperedMixin, XNGaussStackedSingularity):
+    """Stacked singularity model with an even-tempered Gaussian decay function.
+
+    f(q) = -|q|^2 h(q) sum_dG h(q + dG), h(r) = sum_k b_k exp(-alpha_k r^2)
+
+    Parameter order:
+        [b_0, ..., b_{N-1}] in order of ascending exponent. The overall scale is carried by the b_k (c0 = 1), so
+        the model is quadratic in the parameters.
+    """
+
+    def __init__(self, parameters=None, deltaGs=None, is_contraction=False, remove_deltaG_zero=False,
+                 sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None):
+        self._init_etb(sigma, num_gaussians, ratio, exponents)
+        self._etb_ctor_kwargs = {'deltaGs': deltaGs, 'is_contraction': is_contraction,
+                                 'remove_deltaG_zero': remove_deltaG_zero}
+        self.deltaGs = None if deltaGs is None else np.asarray(deltaGs, dtype=float)
+        self.is_contraction = is_contraction
+        self.remove_deltaG_zero = remove_deltaG_zero
+        self.c0 = 1.0
+        self.parameters = np.asarray(self.default_parameters() if parameters is None else parameters, dtype=float)
+        self.num_params = self.num_gaussians
+
+    def default_parameters(self):
+        return self.one_hot_reference()
+
+    def set_parameters(self, parameters):
+        self.parameters = np.asarray(parameters, dtype=float)
+
+    def check_parameters(self):
+        if self.parameters is None or len(self.parameters) != self.num_gaussians:
+            raise ValueError(f"parameters must be the {self.num_gaussians} ETB coefficients")
+        if np.any(np.asarray(self.parameters) < 0):
+            raise ValueError("ETB coefficients must be nonnegative")
+        return bool(np.allclose(self.parameters, 0))
+
+    def decay_func(self, r: np.ndarray):
+        return self.etb_h(r)
+
+    def linear_proxy_design_matrix(self, coords):
+        """Columns -|q|^2 g_k(q) H_ref(q), with the stacked sum H frozen at the reference Gaussian."""
+        saved = np.array(self.parameters, dtype=float)
+        self.set_parameters(self.one_hot_reference())
+        try:
+            reference = self.eval_model(coords)
+        finally:
+            self.set_parameters(saved)
+        columns = self.gaussian_columns(np.linalg.norm(coords, axis=1))
+        return reference[:, None] * columns / columns[:, [self.etb_ref_index]]
+
+    def coulomb_integral(self):
+        norm_deltaGs = np.linalg.norm(self.deltaGs, axis=1)
+        result = self._pair_overlap_sum(self.parameters, norm_deltaGs)
+        if self.remove_deltaG_zero:
+            result -= self._pair_overlap_sum(self.parameters, np.zeros(1))
+        return -self.c0 * result
+
+
+class XNETBStackedSingularityQMesh(XNETBStackedSingularity, XNGaussStackedSingularityQMesh):
+    """q-mesh-only stacked singularity model with an even-tempered Gaussian decay function."""
+
+    def __init__(self, qGrid, cell, parameters=None, deltaGs=None, is_contraction=False, remove_deltaG_zero=False,
+                 sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None):
+        XNETBStackedSingularity.__init__(
+            self, parameters=parameters, deltaGs=deltaGs, is_contraction=is_contraction,
+            remove_deltaG_zero=remove_deltaG_zero, sigma=sigma, num_gaussians=num_gaussians, ratio=ratio,
+            exponents=exponents,
+        )
+        self._etb_ctor_kwargs.update(qGrid=qGrid, cell=cell)
+        self.qGrid = qGrid
+        self.cell = cell
+        self.kdtree_qGrid = KDTree(self.qGrid)
+
+    def set_parameters(self, parameters):
+        XNETBStackedSingularity.set_parameters(self, parameters)
+        self.compute_sum_g_q_deltaG()
+
+    def initial_parameters(self, c0_scale):
+        """Reference Gaussian scaled to match XNGaussStackedSingularityQMesh.initial_parameters."""
+        self.set_parameters(self.one_hot_reference())
+        return self.initial_coefficients(np.sqrt(c0_scale / self.g0))
 
 
 class PolynomialModel(ModelFunction):

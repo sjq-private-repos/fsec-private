@@ -42,7 +42,7 @@ class SingularitySubtraction(ABC):
         print()
 
 
-from fsec.singularity_subtraction.exxss import ExxSS, ExxSSGaussian, ExxSSQuarticExponential
+from fsec.singularity_subtraction.exxss import ExxSS, ExxSSEvenTempered, ExxSSGaussian, ExxSSQuarticExponential
 from fsec.singularity_subtraction.mp2ss import (
     DirectFourthOrderCorrectionConfig,
     DirectFullCorrectionConfig,

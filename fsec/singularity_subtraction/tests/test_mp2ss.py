@@ -158,6 +158,22 @@ class MP2SSOptionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MP2SSOptions(pair_density_becke_grid_level=-1)
 
+    def test_etb_options(self):
+        options = MP2SSOptions(etb_sigma={"exchange": 2}, etb_num_gaussians="3", etb_ratio=3)
+        self.assertEqual(options.etb_sigma, {"exchange": 2.0})
+        self.assertEqual(options.etb_num_gaussians, 3)
+        self.assertEqual(options.etb_ratio, 3.0)
+        self.assertTrue(options.etb_linear_fit)
+        for kwargs in (
+            {"etb_sigma": 0.0},
+            {"etb_sigma": {"direct_q8": 1.0}},
+            {"etb_sigma": {"exchange": -1.0}},
+            {"etb_num_gaussians": 0},
+            {"etb_ratio": 1.0},
+        ):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                MP2SSOptions(**kwargs)
+
 
 class KnownValues(unittest.TestCase):
     TOL = 1e-6
@@ -289,6 +305,71 @@ class KnownValues(unittest.TestCase):
         correction = mp2ss.compute_correction(direct=True, exchange=True)
 
         self._assert_matches_references(mp2ss, correction)
+
+    ETB_REFERENCES = {
+        "mp2ss_total_correction": -0.005746736462575747,
+        "mp2ss_direct_correction": -0.013726421677420438,
+        "mp2ss_exchange_correction": 0.007979685214844691,
+        "direct_total_correction_q2": -0.011502677257228207,
+        "direct_total_correction_q4": -0.0022237444201922314,
+        "exchange_integral_term": 0.024151840680296723,
+        "exchange_quadrature_term": 0.01617215546545203,
+    }
+    ETB_FULL_DIRECT_REFERENCES = {
+        "mp2ss_total_correction": -0.0058320201415101025,
+        "mp2ss_direct_correction": -0.013811705356354793,
+        "direct_integral_term": -0.04210094658809863,
+        "direct_quadrature_term": -0.02828924123174384,
+    }
+
+    def _run_etb(self, **kwargs):
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2.copy(),
+            pair_density_eval_grid="uniform",
+            auxfunc_direct="ETB",
+            auxfunc_direct_q2="ETB",
+            auxfunc_direct_q4="ETB",
+            auxfunc_exchange="ETB",
+            **kwargs,
+        )
+        mp2ss.compute_correction(direct=True, exchange=True)
+        return mp2ss
+
+    def test_mp2ss_even_tempered_split_q2_q4(self):
+        mp2ss = self._run_etb()
+        for quantity, reference in self.ETB_REFERENCES.items():
+            self.assertAlmostEqual(getattr(mp2ss, quantity), reference, delta=self.TOL, msg=quantity)
+        self.assertEqual(mp2ss.exchange_correction.config.model_kwargs,
+                         {"sigma": 1.0, "num_gaussians": 5, "ratio": 2.0})
+
+        # q4 and exchange are linear in the ETB coefficients: the nonlinear fit must find the same optimum
+        nonlinear = self._run_etb(etb_linear_fit=False)
+        for quantity in ("direct_total_correction_q4", "mp2ss_exchange_correction"):
+            self.assertAlmostEqual(
+                getattr(nonlinear, quantity), getattr(mp2ss, quantity), delta=self.TOL, msg=quantity)
+
+    def test_mp2ss_even_tempered_full_direct(self):
+        mp2ss = self._run_etb(correct_q2_q4_separately=False)
+        for quantity, reference in self.ETB_FULL_DIRECT_REFERENCES.items():
+            self.assertAlmostEqual(getattr(mp2ss, quantity), reference, delta=self.TOL, msg=quantity)
+
+    def test_mp2ss_even_tempered_reduces_basis_for_small_cutoff(self):
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2.copy(),
+            pair_density_eval_grid="uniform",
+            auxfunc_exchange="ETB",
+            qG_norm_cutoff=1.1,
+            etb_sigma={"exchange": 1.0},
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            mp2ss.compute_correction(direct=False, exchange=True)
+        self.assertIn("Exchange ETB reduced from 5 to", output.getvalue())
+        self.assertTrue(np.isfinite(mp2ss.mp2ss_exchange_correction))
 
     def test_mp2ss_check_trs_false(self):
         mp2ss = MP2SS(

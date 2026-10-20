@@ -1,7 +1,26 @@
 from abc import ABC, abstractmethod
 import numpy as np
 from fsec.singularity_subtraction.model_function import ModelFunction, IsotropicModel
-from scipy.optimize import least_squares, minimize
+from fsec.singularity_subtraction.model_function.etb import DEFAULT_RCOND, numerical_rank, radial_shells
+from scipy.optimize import least_squares, lsq_linear, minimize, nnls
+
+
+def coulomb_residual_weights(input_data, isotropic, fit_with_coul, coul_deg):
+    """
+    Residual weights used by the fit methods. Isotropic models take radial input and use 1/r^coul_deg; other
+    models take (N,3) input and use 1/sum_i q_i^coul_deg. Points at q = 0 keep weight 1.
+    """
+    input_data = np.asarray(input_data)
+    weights = np.ones(input_data.shape[0])
+    if not fit_with_coul:
+        return weights
+    if isotropic:
+        nonzero_mask = np.abs(input_data) > 1e-8
+        weights[nonzero_mask] = 1./input_data[nonzero_mask]**coul_deg
+    else:
+        nonzero_mask = np.linalg.norm(input_data, axis=1) > 1e-8
+        weights[nonzero_mask] = 1./np.sum(input_data[nonzero_mask]**coul_deg, axis=1)
+    return weights
 
 class FitMethod(ABC):
     def __init__(self, model_function: ModelFunction, **kwargs):
@@ -49,9 +68,7 @@ class FitMethod(ABC):
         f_fit = self.model_function.eval_model_r(input_data)
         abs_diff = np.abs(f_fit - output_data)
         if self.fit_with_coul:
-            nonzero_mask = np.abs(input_data) > 1e-8
-            input_data_nonzero = input_data[nonzero_mask]
-            abs_diff[nonzero_mask] *= 1./input_data_nonzero**self.coul_deg
+            abs_diff *= self.residual_weights(input_data)
         return abs_diff
 
     def abs_diff_xyz(self, params_input, input_data: np.ndarray, output_data: np.ndarray):
@@ -62,10 +79,15 @@ class FitMethod(ABC):
         f_fit = self.model_function.eval_model(input_data)
         abs_diff = f_fit - output_data
         if self.fit_with_coul:
-            nonzero_mask = np.linalg.norm(input_data, axis=1) > 1e-8
-            input_data_nonzero = input_data[nonzero_mask]
-            abs_diff[nonzero_mask] *= 1./np.sum(input_data_nonzero**self.coul_deg, axis=1)
+            abs_diff *= self.residual_weights(input_data)
         return abs_diff
+
+    def residual_weights(self, input_data: np.ndarray):
+        """
+        Per-point residual weights: 1/|q|^coul_deg away from q = 0 when fitting with the Coulomb kernel, else 1.
+        """
+        isotropic = isinstance(self.model_function, IsotropicModel)
+        return coulomb_residual_weights(input_data, isotropic, self.fit_with_coul, self.coul_deg)
 
     def _prepare_input_data(self, input_data: np.ndarray):
         """
@@ -303,7 +325,7 @@ class ExxScipyLeastSquares(FitMethod):
             params = np.zeros(len(result.x)+1)
             params[1:] = result.x
             params[0] = 1 - \
-                np.sum(result.x[self.model_function.num_primitive_params-1::self.model_function.num_primitives])
+                np.sum(result.x[self.model_function.num_primitive_params-1::self.model_function.num_primitive_params])
             self.fitted_parameters = params
         else:
             self.fitted_parameters = result.x
@@ -369,4 +391,114 @@ class MP2ScipyLeastSquares(FitMethod):
         Dump the flags used in the fitting.
         """
         print("<class MP2ScipyLeastSquares> with model function", self.model_function)
+        print("Fitting with coul: ", self.fit_with_coul)
+
+
+class ETBLinearLeastSquares(FitMethod):
+    """
+    Direct nonnegative least squares for auxiliary functions that are linear in their parameters, i.e. models
+    with fixed even-tempered exponents that implement linear_design_matrix(coords) so that
+    eval_model(coords) = linear_design_matrix(coords) @ parameters.
+
+    Minimizes ||W (A b - y)||^2 subject to b >= 0 (and sum(b) = model.linear_sum_constraint if the model defines
+    one), where W are the same residual weights as the nonlinear fit methods. The problem is strictly convex when
+    W A has full column rank, so the solution is unique and needs no initial guess.
+    """
+    def __init__(self, model_function: ModelFunction, **kwargs):
+        if not hasattr(model_function, 'linear_design_matrix'):
+            raise TypeError(f"{model_function.__class__.__name__} is not linear in its parameters; "
+                            "ETBLinearLeastSquares requires a model with linear_design_matrix()")
+        self.rcond = kwargs.get('rcond', DEFAULT_RCOND)
+        super().__init__(model_function, **kwargs)
+
+    def default_initial_guess(self):
+        return np.asarray(self.model_function.default_parameters(), dtype=float)
+
+    def fit_model(self, input_data: np.ndarray, output_data: np.ndarray, **kwargs):
+        """
+        Solve for the coefficients directly. Keyword arguments used only by the nonlinear fit methods
+        (fit_multipliers, fixed_params, force_positive_params, jac, x_scale, max_nfev) are accepted and ignored;
+        the coefficients are always nonnegative.
+        """
+        model = self.model_function
+        input_data = np.asarray(input_data, dtype=float)
+        output_data = np.real_if_close(np.asarray(output_data)).astype(float).ravel()
+        if isinstance(model, IsotropicModel):
+            weight_input = self._prepare_input_data(input_data)
+        else:
+            weight_input = input_data
+        weights = self.residual_weights(weight_input)
+
+        A = weights[:, None] * model.linear_design_matrix(input_data)
+        y = weights * output_data
+        num_coeffs = A.shape[1]
+
+        constraint = getattr(model, 'linear_sum_constraint', None)
+        rank_matrix = A if constraint is None else np.vstack([A, np.ones((1, num_coeffs))])
+        rank = numerical_rank(rank_matrix, self.rcond)
+        if rank < num_coeffs:
+            n_shells = len(radial_shells(input_data))
+            raise ValueError(
+                f"ETB design matrix has numerical rank {rank} < {num_coeffs} coefficients "
+                f"({len(input_data)} points, {n_shells} distinct nonzero |q| shells): the coefficients are not "
+                "uniquely determined. Increase qG_norm_cutoff or reduce num_gaussians."
+            )
+
+        if constraint is None:
+            coeffs = self._nnls(A, y)
+        else:
+            coeffs = self._nnls_fixed_sum(A, y, constraint)
+
+        self.fitted_parameters = coeffs
+        model.set_parameters(coeffs)
+        residual = weights * (model.eval_model(input_data) if not isinstance(model, IsotropicModel)
+                              else model.eval_model_r(weight_input)) - y
+
+        print("Fitting complete. Parameters: ", self.fitted_parameters)
+        print("Sum residual: ", np.sum(residual**2))
+        return self.fitted_parameters
+
+    def _nnls(self, A, y):
+        """min ||A b - y|| subject to b >= 0, with columns scaled to unit norm for conditioning."""
+        col_norms = np.linalg.norm(A, axis=0)
+        col_norms[col_norms == 0] = 1.0
+        x, _ = nnls(A / col_norms, y, maxiter=100 * A.shape[1])
+        return x / col_norms
+
+    def _nnls_fixed_sum(self, A, y, total):
+        """
+        min ||A b - y|| subject to b >= 0 and sum(b) = total.
+
+        Eliminating b_j = total - sum_{i != j} b_i leaves a bound-constrained problem that relaxes b_j >= 0. If its
+        solution has b_j >= 0 it is optimal for the original convex problem. Candidates j are tried in order of
+        decreasing weight in an approximate (penalized) solution.
+        """
+        num_coeffs = A.shape[1]
+        if num_coeffs == 1:
+            return np.array([float(total)])
+
+        penalty = 1e3 * max(np.linalg.norm(A), 1.0)
+        approx = self._nnls(np.vstack([A, penalty * np.ones((1, num_coeffs))]),
+                            np.concatenate([y, [penalty * total]]))
+        for j in np.argsort(-approx):
+            others = np.arange(num_coeffs) != j
+            A_reduced = A[:, others] - A[:, [j]]
+            col_norms = np.linalg.norm(A_reduced, axis=0)
+            col_norms[col_norms == 0] = 1.0
+            result = lsq_linear(A_reduced / col_norms, y - total * A[:, j], bounds=(0, np.inf),
+                                method='bvls', tol=1e-14)
+            b_others = result.x / col_norms
+            b_j = total - np.sum(b_others)
+            if b_j >= -1e-12 * abs(total):
+                coeffs = np.zeros(num_coeffs)
+                coeffs[others] = b_others
+                coeffs[j] = max(b_j, 0.0)
+                return coeffs * (total / np.sum(coeffs))
+        raise ValueError(f"ETB fit failed to find nonnegative coefficients summing to {total}")
+
+    def dump_flags(self):
+        """
+        Dump the flags used in the fitting.
+        """
+        print("<class ETBLinearLeastSquares> with model function", self.model_function)
         print("Fitting with coul: ", self.fit_with_coul)

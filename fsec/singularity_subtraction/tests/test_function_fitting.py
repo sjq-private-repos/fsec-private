@@ -3,20 +3,31 @@ import unittest
 import numpy as np
 
 from fsec.singularity_subtraction.function_fitting import (
+    ETBLinearLeastSquares,
     ExxScipyLeastSquares,
     ExxScipyMinimize,
     MP2ScipyLeastSquares,
     MP2ScipyMinimize,
 )
+from fsec.singularity_subtraction.model_function.etb import (
+    cutoff_for_min_shells,
+    radial_shells,
+    trim_etb_model_to_data,
+)
 from fsec.singularity_subtraction.model_function.exx_modfunc import (
     ContractedGaussianModel,
+    EvenTemperedGaussianModel,
+    ExponentialModel,
     QuarticExponentialModel,
 )
 from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
+    XNETB,
+    XNETBStackedSingularityQMesh,
     XNGauss,
     XNGaussStackedSingularityQMesh,
 )
 from fsec.singularity_subtraction.model_function.mp2_exchange_modfunc import (
+    XNETBStackedSingularityExchange,
     XNGaussStackedSingularityExchange,
 )
 
@@ -401,6 +412,142 @@ class IsotropicInputShapeTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _ = self.fit_method.abs_diff(self.params, bad_input, output)
+
+
+
+class EvenTemperedFittingTests(unittest.TestCase):
+    spacing = 0.6
+    coeffs = np.array([0.1, 0.2, 0.3, 0.25, 0.15])
+
+    @classmethod
+    def setUpClass(cls):
+        g = np.arange(-4, 5) * cls.spacing
+        grid = np.array(np.meshgrid(g, g, g, indexing="ij")).reshape(3, -1).T
+        cls.grid = grid
+        cls.qG = grid[np.linalg.norm(grid, axis=1) < 2.5]
+
+    def test_linear_fit_recovers_exx_coefficients(self):
+        for coeffs in (self.coeffs, [0.0, 0.0, 1.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0, 0.5]):
+            with self.subTest(coeffs=coeffs):
+                SqG = EvenTemperedGaussianModel(parameters=coeffs).eval_model(self.qG)
+                fit_method = ETBLinearLeastSquares(EvenTemperedGaussianModel(), fit_with_coul=True)
+                fitted = fit_method.fit_model(self.qG, SqG)
+                np.testing.assert_allclose(fitted, coeffs, atol=1e-10)
+                self.assertAlmostEqual(np.sum(fitted), 1.0, places=14)
+
+    def test_linear_fit_recovers_mp2_coefficients(self):
+        q4_model = XNETB(parameters=1e-4 * self.coeffs, deg=4)
+        fit_method = ETBLinearLeastSquares(XNETB(deg=4), fit_with_coul=True)
+        fit_method.coul_deg = 4
+        fitted = fit_method.fit_model(self.qG, q4_model.eval_model(self.qG))
+        np.testing.assert_allclose(fitted, 1e-4 * self.coeffs, rtol=1e-8)
+
+        exchange_model = XNETBStackedSingularityExchange(parameters=1e-3 * self.coeffs, q2s=self.grid, dvol=0.1)
+        fit_method = ETBLinearLeastSquares(
+            XNETBStackedSingularityExchange(q2s=self.grid, dvol=0.1), fit_with_coul=True)
+        fitted = fit_method.fit_model(self.qG, exchange_model.eval_model(self.qG))
+        np.testing.assert_allclose(fitted, 1e-3 * self.coeffs, rtol=1e-8)
+
+    def test_linear_fit_matches_nonlinear_fit(self):
+        """The linear problem has a unique minimizer, which the nonlinear fit methods must also find."""
+        # Heavy-tailed target whose best ETB coefficients are all strictly positive (ExxScipyLeastSquares
+        # eliminates c_0 without bounding it, so it only solves the same problem for interior optima)
+        target = ExponentialModel(num_primitives=1, isotropic=True, parameters=[1.0, 2.0, 0.5])
+        SqG = target.eval_model(self.qG)
+        linear = ETBLinearLeastSquares(EvenTemperedGaussianModel(), fit_with_coul=True).fit_model(self.qG, SqG)
+        self.assertTrue(np.all(linear > 1e-2))
+
+        start = EvenTemperedGaussianModel().default_parameters()
+        nonlinear = ExxScipyLeastSquares(
+            EvenTemperedGaussianModel(), fit_with_coul=True, initial_guess=start,
+        ).fit_model(self.qG, SqG, force_positive_params=True)
+        np.testing.assert_allclose(nonlinear, linear, atol=1e-4)
+
+        q4_data = XNETB(parameters=1e-4 * self.coeffs, deg=4).eval_model(self.qG)
+        q4_linear_fit = ETBLinearLeastSquares(XNETB(deg=4), fit_with_coul=True)
+        q4_linear_fit.coul_deg = 4
+        q4_linear = q4_linear_fit.fit_model(self.qG, q4_data)
+        q4_model = XNETB(deg=4)
+        q4_nonlinear_fit = MP2ScipyLeastSquares(q4_model, fit_with_coul=True)
+        q4_nonlinear_fit.coul_deg = 4
+        q4_nonlinear_fit.initial_guess = q4_model.initial_parameters(1e-4)
+        q4_nonlinear = q4_nonlinear_fit.fit_model(self.qG, q4_data, force_positive_params=True)
+        np.testing.assert_allclose(q4_linear, 1e-4 * self.coeffs, rtol=1e-8)
+        # The nonlinear optimizer converges to the same coefficients within its tolerance
+        np.testing.assert_allclose(q4_nonlinear, q4_linear, rtol=1e-3)
+
+    def test_etb_fits_heavy_tailed_data_better_than_one_gaussian(self):
+        # Nonnegative Gaussian mixtures are log-convex in q^2, so they improve on a single Gaussian for data
+        # with heavier-than-Gaussian tails
+        target = ExponentialModel(num_primitives=1, isotropic=True, parameters=[1.0, 0.8, 2.0])
+        SqG = target.eval_model(self.qG)
+
+        etb = EvenTemperedGaussianModel()
+        etb_fit = ETBLinearLeastSquares(etb, fit_with_coul=True)
+        etb.set_parameters(etb_fit.fit_model(self.qG, SqG))
+        etb_residual = np.sum(etb_fit.abs_diff(etb.parameters, self.qG, SqG) ** 2)
+
+        gauss = ContractedGaussianModel(num_gaussians=1, isotropic=True)
+        gauss_fit = ExxScipyLeastSquares(gauss, fit_with_coul=True)
+        gauss_params = gauss_fit.fit_model(self.qG, SqG)
+        gauss_residual = np.sum(gauss_fit.abs_diff(gauss_params, self.qG, SqG) ** 2)
+        self.assertLess(etb_residual, 1e-2 * gauss_residual)
+
+    def test_radial_shells(self):
+        single_shell = np.vstack([np.eye(3), -np.eye(3)])
+        self.assertEqual(len(radial_shells(single_shell)), 1)
+        self.assertEqual(len(radial_shells(np.vstack([np.zeros((1, 3)), single_shell, 2 * single_shell]))), 2)
+        self.assertAlmostEqual(cutoff_for_min_shells(self.grid, 2), np.sqrt(2) * self.spacing + 1e-8)
+        self.assertIsNone(cutoff_for_min_shells(single_shell, 2))
+
+    def test_too_few_shells(self):
+        few = self.qG[np.linalg.norm(self.qG, axis=1) < 0.9]
+        self.assertEqual(len(radial_shells(few)), 2)
+        SqG = EvenTemperedGaussianModel(parameters=self.coeffs).eval_model(few)
+
+        # Fitting all five coefficients from two |q| shells is ill-posed
+        with self.assertRaisesRegex(ValueError, "not uniquely determined"):
+            ETBLinearLeastSquares(EvenTemperedGaussianModel(), fit_with_coul=True).fit_model(few, SqG)
+
+        # Trimming keeps the largest window around the reference Gaussian the data can determine
+        trimmed = trim_etb_model_to_data(EvenTemperedGaussianModel(), few)
+        self.assertLess(trimmed.num_gaussians, 5)
+        self.assertIn(0.5, trimmed.etb_exponents)
+        ETBLinearLeastSquares(trimmed, fit_with_coul=True).fit_model(few, SqG)
+
+        enough = self.qG[np.linalg.norm(self.qG, axis=1) < 1.5]
+        self.assertEqual(trim_etb_model_to_data(EvenTemperedGaussianModel(), enough).num_gaussians, 5)
+
+        q4 = XNETB(deg=4)
+        trimmed_q4 = trim_etb_model_to_data(q4, few)
+        self.assertLess(trimmed_q4.num_gaussians, 5)
+        self.assertEqual(trimmed_q4.deg, 4)
+
+    def test_stacked_model_trimming_uses_proxy_design(self):
+        cell = CubicCell(lattice_constant=6.0)
+        deltaGs = build_cubic_reciprocal_lattice_grid((9, 9, 9), cell.reciprocal_lattice_constant)
+        qGrid = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, cell.reciprocal_lattice_constant / 2]])
+        model = XNETBStackedSingularityQMesh(qGrid=qGrid, cell=cell, deltaGs=deltaGs)
+        model.set_parameters(model.initial_parameters(1e-4))
+        coords = (qGrid[:, None, :] + deltaGs[None, :, :]).reshape(-1, 3)
+
+        norms = np.linalg.norm(coords, axis=1)
+        self.assertIs(trim_etb_model_to_data(model, coords[norms < 4.0]), model)
+
+        trimmed = trim_etb_model_to_data(model, coords[norms < 1.1])  # two |q| shells
+        self.assertLess(trimmed.num_gaussians, 5)
+        self.assertIn(0.5, trimmed.etb_exponents)
+        np.testing.assert_allclose(trimmed.qGrid, qGrid)
+
+        with self.assertRaisesRegex(ValueError, "cannot determine"):
+            trim_etb_model_to_data(model, coords[norms < 0.6])  # one |q| shell
+
+    def test_linear_fit_rejects_nonlinear_models(self):
+        cell = CubicCell(lattice_constant=6.0)
+        deltaGs = build_cubic_reciprocal_lattice_grid((3, 3, 3), cell.reciprocal_lattice_constant)
+        model = XNETBStackedSingularityQMesh(qGrid=np.zeros((1, 3)), cell=cell, deltaGs=deltaGs)
+        with self.assertRaises(TypeError):
+            ETBLinearLeastSquares(model)
 
 
 if __name__ == "__main__":

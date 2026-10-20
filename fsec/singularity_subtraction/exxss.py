@@ -3,7 +3,20 @@ from pyscf.pbc import df
 import time
 from fsec.singularity_subtraction import model_function
 # import traceback
-from fsec.singularity_subtraction.function_fitting import ExxScipyMinimize, ExxScipyLeastSquares
+from fsec.singularity_subtraction.function_fitting import (
+    ETBLinearLeastSquares,
+    ExxScipyLeastSquares,
+    ExxScipyMinimize,
+    coulomb_residual_weights,
+)
+from fsec.singularity_subtraction.grids import ExxSSGrids
+from fsec.singularity_subtraction.model_function.etb import (
+    DEFAULT_MIN_SHELL_MARGIN,
+    DEFAULT_RCOND,
+    cutoff_for_min_shells,
+    radial_shells,
+    trim_etb_model_to_data,
+)
 from fsec.singularity_subtraction.structure_factor import ExxStructureFactor
 from fsec.singularity_subtraction.structure_factor.exx_sf import (
     normalize_pair_density_becke_grid_level,
@@ -32,7 +45,8 @@ class ExxSS(SingularitySubtraction):
     """
     fit_method_dict = {
         'scipy_minimize': ExxScipyMinimize,
-        'scipy_least_squares': ExxScipyLeastSquares
+        'scipy_least_squares': ExxScipyLeastSquares,
+        'etb_linear': ETBLinearLeastSquares,
     }
     results_title = "ExxSS"
 
@@ -413,6 +427,111 @@ class ExxSSQuarticExponential(ExxSS):
         # Now fit the Exponential model
         norm_qG = np.linalg.norm(self.qG_grid_fit, axis=1) # workaround for the model_function.QuarticExponentialModel being isotropic
         fitted_parameters = self.fit_method.fit_model(norm_qG, self.SqG_fit/self.nocc, force_positive_params=True)
+        self.auxfunc.set_parameters(fitted_parameters)
+        self.model_params = fitted_parameters
+        return fitted_parameters
+
+
+class ExxSSEvenTempered(ExxSS):
+    """
+    ExxSS with an even-tempered Gaussian auxiliary function f(q) = sum_k c_k exp(-alpha_k |q|^2), c_k >= 0,
+    sum_k c_k = 1. The exponents are fixed, centered on the expected width sigma (alpha_k = alpha_sigma *
+    ratio**(k - (N-1)/2), alpha_sigma = 1/(2 sigma^2)), so only the coefficients are fit. By default they are
+    found by direct nonnegative least squares ('etb_linear').
+
+    Additional keyword arguments:
+        sigma (float): Expected width of S(q) in reciprocal space. Default is 1.0.
+        num_gaussians (int): Number of even-tempered Gaussians N. Default is 5.
+        ratio (float): Ratio between consecutive exponents. Default is 2.0.
+        exponents (array-like or None): Explicit exponents, overriding sigma/num_gaussians/ratio grid.
+        rcond (float): Relative singular-value cutoff for deciding whether the fit data determine the
+            coefficients. Default is 1e-8.
+        min_shell_margin (int): Number of distinct nonzero |q| shells required beyond the number of free
+            coefficients. Default is 1.
+
+    If the q+G cutoff is chosen automatically (qG_norm_cutoff_sigma), it is enlarged as needed so that the fit
+    region contains enough distinct |q| shells to determine all N coefficients. If the fit data still cannot
+    determine them (e.g. an explicit small qG_norm_cutoff), the basis is reduced around the Gaussian at sigma.
+    """
+
+    def __init__(self, kmf, dim=3, sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None, **kwargs):
+        self.kmf = kmf
+        self.rcond = kwargs.pop('rcond', DEFAULT_RCOND)
+        self.min_shell_margin = kwargs.pop('min_shell_margin', DEFAULT_MIN_SHELL_MARGIN)
+        self.qG_norm_cutoff_sigma = kwargs.get('qG_norm_cutoff_sigma', 1.0)
+        self.fit_method_name = kwargs.setdefault('fit_method', 'etb_linear')
+        model_params = kwargs.pop('model_params', None)
+
+        auxfunc = model_function.EvenTemperedGaussianModel(
+            sigma=sigma, num_gaussians=num_gaussians, ratio=ratio, exponents=exponents, parameters=model_params,
+        )
+        self.user_initial_guess = kwargs.get('initial_guess') is not None
+        if not self.user_initial_guess:
+            kwargs['initial_guess'] = auxfunc.default_parameters()
+        super().__init__(kmf, auxfunc, dim, model_params=model_params, **kwargs)
+        self.fit_method.rcond = self.rcond
+
+    def required_shells(self):
+        """Distinct nonzero |q| shells needed to determine the N - 1 free coefficients, plus the margin."""
+        return self.auxfunc.num_gaussians - 1 + self.min_shell_margin
+
+    def ensure_min_shells(self):
+        """Enlarge an automatically chosen qG_norm_cutoff until the fit region has enough |q| shells."""
+        grids = ExxSSGrids(self.cell, self.kmf.kpts, N_local=self.N_local)
+        grids.build_GptGrid3D()
+        if self.line_sampling:
+            candidates = grids.build_qG_line_sampling(
+                qG_norm_cutoff=np.max(np.linalg.norm(grids.GptGrid3D, axis=1)))
+        else:
+            candidates = (grids.qGrid[:, None, :] + grids.GptGrid3D[None, :, :]).reshape(-1, 3)
+        candidate_norms = np.linalg.norm(candidates, axis=1)
+
+        required = self.required_shells()
+        n_shells = len(radial_shells(candidate_norms[candidate_norms < self.qG_norm_cutoff]))
+        if n_shells >= required:
+            return self.qG_norm_cutoff
+
+        cutoff = cutoff_for_min_shells(candidate_norms, required)
+        if cutoff is None:
+            print(f"WARNING: only {len(radial_shells(candidate_norms))} distinct |q| shells are available; "
+                  "the ETB basis will be reduced.")
+            return self.qG_norm_cutoff
+        print(f"ETB: qG_norm_cutoff {self.qG_norm_cutoff} contains {n_shells} distinct nonzero |q| shells; "
+              f"enlarging to {cutoff} to include {required}.")
+        self.qG_norm_cutoff = cutoff
+        return cutoff
+
+    def trim_auxfunc_to_fit_data(self):
+        """Reduce the ETB basis if the fit data cannot determine all coefficients."""
+        input_data = self.qG_grid_fit
+        if isinstance(self.auxfunc, model_function.IsotropicModel):
+            input_data = np.linalg.norm(input_data, axis=1)
+        weights = coulomb_residual_weights(input_data, True, self.fit_with_coul, self.fit_method.coul_deg)
+        trimmed = trim_etb_model_to_data(self.auxfunc, self.qG_grid_fit, weights, rcond=self.rcond,
+                                         min_shell_margin=self.min_shell_margin, label="ExxSS ETB")
+        if trimmed is not self.auxfunc:
+            self.auxfunc = trimmed
+            if not self.user_initial_guess:
+                self.initial_guess = trimmed.default_parameters()
+            self.set_fit_method(self.fit_method_name)
+            self.fit_method.rcond = self.rcond
+        return self.auxfunc
+
+    def optimize_parameters(self):
+        if self.qG_norm_cutoff_sigma is not None and self.qG_norm_cutoff is None:
+            sigma = self.compute_approximate_sigma()
+            # Then set qg_cutoff to a multiple of sigma, with enough |q| shells for the ETB coefficients
+            self.qG_norm_cutoff = sigma * self.qG_norm_cutoff_sigma
+            self.ensure_min_shells()
+            self.set_structure_factor()
+        elif self.qG_norm_cutoff is None:
+            raise ValueError("qG_norm_cutoff must be set before optimizing parameters")
+
+        self.trim_auxfunc_to_fit_data()
+        fitted_parameters = self.fit_method.fit_model(self.qG_grid_fit, self.SqG_fit/self.nocc,
+                                                      force_positive_params=self.force_positive_parameters)
+        print('optimize_parameters: fitted_parameters = ', fitted_parameters)
+        print('ETB exponents: ', self.auxfunc.etb_exponents)
         self.auxfunc.set_parameters(fitted_parameters)
         self.model_params = fitted_parameters
         return fitted_parameters
