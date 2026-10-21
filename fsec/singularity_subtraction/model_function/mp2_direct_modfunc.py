@@ -575,6 +575,143 @@ class XNETBStackedSingularityQMesh(XNETBStackedSingularity, XNGaussStackedSingul
         return self.initial_coefficients(np.sqrt(c0_scale / self.g0))
 
 
+class XNETBLiftedStackedSingularityQMesh(EvenTemperedMixin, ModelFunction):
+    """Lifted (linearized) stacked singularity model with even-tempered Gaussian primitives, q-mesh only.
+
+    The stacked model -|q|^2 h(q) sum_dG h(q + dG) with h = sum_k b_k g_k, g_k(r) = exp(-alpha_k r^2), is quadratic
+    in b. Writing it in terms of the pair matrix B = b b^T,
+
+        f(q) = -|q|^2 sum_{k,l} B_kl g_k(q) H_l(q),   H_l(q) = sum_dG g_l(|q + dG|),
+
+    and dropping the rank-1 requirement on B makes the model linear in B, so the fit is a convex nonnegative least
+    squares problem. The analytic Coulomb integral stays exact. The result is a nonnegative sum of pairwise stacked
+    Gaussian terms; it reduces to the stacked model whenever the fitted B has rank 1.
+
+    Parameter order:
+        Upper triangle of B (k <= l, row-major as numpy.triu_indices), N (N + 1) / 2 entries, all >= 0.
+    """
+
+    def __init__(self, qGrid, cell, parameters=None, deltaGs=None, is_contraction=False, remove_deltaG_zero=False,
+                 sigma=1.0, num_gaussians=5, ratio=2.0, exponents=None):
+        self._init_etb(sigma, num_gaussians, ratio, exponents)
+        self._etb_ctor_kwargs = {'qGrid': qGrid, 'cell': cell, 'deltaGs': deltaGs, 'is_contraction': is_contraction,
+                                 'remove_deltaG_zero': remove_deltaG_zero}
+        self.pair_rows, self.pair_cols = np.triu_indices(self.num_gaussians)
+        self.qGrid = np.asarray(qGrid, dtype=float)
+        self.cell = cell
+        self.kdtree_qGrid = KDTree(self.qGrid)
+        self.deltaGs = None if deltaGs is None else np.asarray(deltaGs, dtype=float)
+        self.remove_deltaG_zero = remove_deltaG_zero
+        self.c0 = 1.0
+        self.primitive_sums = None
+        self._pair_integrals = None
+        super().__init__(parameters=parameters, is_contraction=is_contraction)
+        self.parameters = np.asarray(self.parameters, dtype=float)
+
+    def num_window_params(self, num_gaussians):
+        return num_gaussians * (num_gaussians + 1) // 2
+
+    def window_columns(self, idx):
+        """Pair columns (k, l) with both primitives inside the window idx."""
+        inside = np.isin(self.pair_rows, idx) & np.isin(self.pair_cols, idx)
+        return np.flatnonzero(inside)
+
+    def _pair_index(self, k, l):
+        return int(np.flatnonzero((self.pair_rows == min(k, l)) & (self.pair_cols == max(k, l)))[0])
+
+    def default_parameters(self):
+        parameters = np.zeros(len(self.pair_rows))
+        parameters[self._pair_index(self.etb_ref_index, self.etb_ref_index)] = 1.0
+        return parameters
+
+    def set_parameters(self, parameters):
+        self.parameters = np.asarray(parameters, dtype=float)
+
+    @property
+    def pair_matrix(self):
+        """Symmetric pair matrix B (B = b b^T for a stacked model)."""
+        B = np.zeros((self.num_gaussians, self.num_gaussians))
+        B[self.pair_rows, self.pair_cols] = self.parameters
+        B[self.pair_cols, self.pair_rows] = self.parameters
+        return B
+
+    def compute_primitive_sums(self):
+        """sum_dG g_l(|q + dG|) for every q in qGrid and primitive l (independent of the parameters)."""
+        if self.deltaGs is None:
+            raise ValueError("deltaGs must be set on XNETBLiftedStackedSingularityQMesh before evaluation")
+        qp_norm = np.linalg.norm(self.qGrid[:, None, :] + self.deltaGs[None, :, :], axis=2)
+        qp_norm[qp_norm < 1e-8] = np.inf
+        qp2 = qp_norm**2
+        self.primitive_sums = np.stack(
+            [np.sum(np.exp(-alpha * qp2), axis=1) for alpha in self.etb_exponents], axis=1)
+        zero_idx = self.kdtree_qGrid.query(np.zeros((1, 3)), k=1)[1][0]
+        self.g0 = self.primitive_sums[zero_idx, self.etb_ref_index]
+        return self.primitive_sums
+
+    def initial_parameters(self, c0_scale, floor=1e-3):
+        """Reference pair scaled like XNGaussStackedSingularityQMesh.initial_parameters; others at floor."""
+        if self.primitive_sums is None:
+            self.compute_primitive_sums()
+        scale = c0_scale / self.g0
+        parameters = np.full(len(self.pair_rows), floor * scale)
+        parameters[self._pair_index(self.etb_ref_index, self.etb_ref_index)] = scale
+        return parameters
+
+    def _stacked_sums(self, coords):
+        """H_l(q) for each coordinate, using the cached q-mesh sums and removing dG = 0 if requested."""
+        if self.primitive_sums is None:
+            self.compute_primitive_sums()
+        coords_FBZ = minimum_image(self.cell, coords)
+        idxs = self.kdtree_qGrid.query(coords_FBZ, k=1, distance_upper_bound=1e-8)[1]
+        cached = idxs != len(self.qGrid)
+        H = np.empty((coords.shape[0], self.num_gaussians))
+        H[cached] = self.primitive_sums[idxs[cached]]
+        if np.any(~cached):
+            qp_norm = np.linalg.norm(coords_FBZ[~cached, None, :] + self.deltaGs[None, :, :], axis=2)
+            qp_norm[qp_norm < 1e-8] = np.inf
+            H[~cached] = np.stack(
+                [np.sum(np.exp(-alpha * qp_norm**2), axis=1) for alpha in self.etb_exponents], axis=1)
+        if self.remove_deltaG_zero:
+            q_norm = np.linalg.norm(coords, axis=1)
+            g_q = self.gaussian_columns(q_norm)
+            g_q[q_norm < 1e-8] = 0.0
+            H = H - g_q
+        return H
+
+    def linear_design_matrix(self, coords):
+        coords = np.asarray(coords, dtype=float)
+        if coords.ndim != 2 or coords.shape[1] != 3:
+            raise ValueError("coords must be an (N,3) array: [q_x, q_y, q_z]")
+        q_norm = np.linalg.norm(coords, axis=1)
+        g = self.gaussian_columns(q_norm)
+        H = self._stacked_sums(coords)
+        k, l = self.pair_rows, self.pair_cols
+        phi = g[:, k] * H[:, l] + np.where(k == l, 0.0, 1.0) * g[:, l] * H[:, k]
+        return -(q_norm**2)[:, None] * phi
+
+    def eval_model(self, coords: np.ndarray):
+        return self.linear_design_matrix(coords) @ self.parameters
+
+    def pair_integrals(self):
+        """int g_k(q) sum_dG g_l(|q + dG|) d^3q for each pair (k <= l), with dG = 0 removed if requested."""
+        if self._pair_integrals is None:
+            dG2 = np.sum(self.deltaGs**2, axis=1)
+            values = []
+            for k, l in zip(self.pair_rows, self.pair_cols):
+                a_k, a_l = self.etb_exponents[k], self.etb_exponents[l]
+                s = a_k + a_l
+                overlaps = np.sum(np.exp(-a_k * a_l / s * dG2))
+                if self.remove_deltaG_zero:
+                    overlaps -= 1.0
+                values.append((np.pi / s) ** 1.5 * overlaps)
+            self._pair_integrals = np.array(values)
+        return self._pair_integrals
+
+    def coulomb_integral(self):
+        multiplicity = np.where(self.pair_rows == self.pair_cols, 1.0, 2.0)
+        return -float(np.sum(self.parameters * multiplicity * self.pair_integrals()))
+
+
 class PolynomialModel(ModelFunction):
     """Polynomial model: f(q) = c0 + c1 * q + c2 * q^2 + ... + cn * q^n."""
 

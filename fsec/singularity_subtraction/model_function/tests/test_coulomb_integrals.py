@@ -4,7 +4,7 @@ import numpy as np
 from scipy.integrate import dblquad
 
 from fsec.singularity_subtraction.model_function import IsotropicModel
-from fsec.singularity_subtraction.model_function.etb import even_tempered_exponents
+from fsec.singularity_subtraction.model_function.etb import etb_windows, even_tempered_exponents
 from fsec.singularity_subtraction.model_function.exx_modfunc import (
     ContractedGaussianModel,
     EvenTemperedGaussianModel,
@@ -14,6 +14,7 @@ from fsec.singularity_subtraction.model_function.exx_modfunc import (
 )
 from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
     XNETB,
+    XNETBLiftedStackedSingularityQMesh,
     XNETBStackedSingularity,
     XNETBStackedSingularityQMesh,
     XNExpAbs,
@@ -330,6 +331,55 @@ class EvenTemperedModelTests(unittest.TestCase):
                 qmesh.set_parameters(self.coeffs)
                 np.testing.assert_allclose(
                     qmesh.eval_model(coords), stacked.eval_model(coords), rtol=1e-10, atol=1e-14)
+
+    def test_etb_windows(self):
+        windows = [list(window) for window in etb_windows(5, 2)]
+        self.assertEqual(windows, [
+            [0, 1, 2, 3, 4], [0, 1, 2, 3], [1, 2, 3, 4], [1, 2, 3], [0, 1, 2], [2, 3, 4], [1, 2], [2, 3], [2],
+        ])
+        self.assertTrue(all(0 in window for window in etb_windows(3, 0)))
+
+    def test_lifted_model_matches_stacked_model(self):
+        """With B = b b^T the lifted model is the stacked ETB model; with B = sum_r b_r b_r^T it is their sum."""
+        deltaGs = build_cubic_reciprocal_lattice_grid(
+            mesh=(15, 15, 15), reciprocal_lattice_constant=self.cell.reciprocal_lattice_constant)
+        qGrid = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, self.cell.reciprocal_lattice_constant / 2]])
+        nearby_Gs = deltaGs[np.linalg.norm(deltaGs, axis=1) < 2.2]
+        coords = (qGrid[:, None, :] + nearby_Gs[None, :, :]).reshape(-1, 3)
+        b2 = np.array([0.3, 0.0, 0.1, 0.0, 0.2])
+
+        for remove_deltaG_zero in (False, True):
+            with self.subTest(remove_deltaG_zero=remove_deltaG_zero):
+                kwargs = dict(qGrid=qGrid, cell=self.cell, deltaGs=deltaGs, remove_deltaG_zero=remove_deltaG_zero)
+                stacked = XNETBStackedSingularityQMesh(**kwargs)
+                stacked.set_parameters(self.coeffs)
+                stacked2 = XNETBStackedSingularityQMesh(**kwargs)
+                stacked2.set_parameters(b2)
+                lifted = XNETBLiftedStackedSingularityQMesh(**kwargs)
+                self.assertEqual(lifted.num_params, 15)
+
+                B = np.outer(self.coeffs, self.coeffs)
+                lifted.set_parameters(B[lifted.pair_rows, lifted.pair_cols])
+                np.testing.assert_allclose(lifted.pair_matrix, B)
+                np.testing.assert_allclose(lifted.eval_model(coords), stacked.eval_model(coords), rtol=1e-12)
+                self.assertAlmostEqual(lifted.coulomb_integral() / stacked.coulomb_integral(), 1.0, places=12)
+
+                B = B + np.outer(b2, b2)
+                lifted.set_parameters(B[lifted.pair_rows, lifted.pair_cols])
+                np.testing.assert_allclose(
+                    lifted.eval_model(coords), stacked.eval_model(coords) + stacked2.eval_model(coords), rtol=1e-12)
+                self.assertAlmostEqual(
+                    lifted.coulomb_integral() / (stacked.coulomb_integral() + stacked2.coulomb_integral()), 1.0,
+                    places=12)
+
+    def test_lifted_model_window_parameters(self):
+        qGrid = np.zeros((1, 3))
+        lifted = XNETBLiftedStackedSingularityQMesh(qGrid=qGrid, cell=self.cell, deltaGs=self.deltaGs)
+        np.testing.assert_array_equal(lifted.window_columns([2]), [lifted._pair_index(2, 2)])
+        self.assertEqual(len(lifted.window_columns([1, 2, 3])), lifted.num_window_params(3))
+        reduced = lifted.with_exponents(lifted.etb_exponents[1:4])
+        self.assertEqual(reduced.num_params, 6)
+        self.assertAlmostEqual(reduced.etb_exponents[reduced.etb_ref_index], 0.5)
 
     def test_qmesh_initial_parameters_match_gaussian(self):
         qGrid = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, self.cell.reciprocal_lattice_constant / 2]])

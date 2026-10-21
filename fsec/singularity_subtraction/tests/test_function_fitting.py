@@ -22,6 +22,7 @@ from fsec.singularity_subtraction.model_function.exx_modfunc import (
 )
 from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
     XNETB,
+    XNETBLiftedStackedSingularityQMesh,
     XNETBStackedSingularityQMesh,
     XNGauss,
     XNGaussStackedSingularityQMesh,
@@ -541,6 +542,52 @@ class EvenTemperedFittingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "cannot determine"):
             trim_etb_model_to_data(model, coords[norms < 0.6])  # one |q| shell
+
+    def _lifted_setup(self, remove_deltaG_zero=True, qcut=4.0):
+        cell = CubicCell(lattice_constant=6.0)
+        b = cell.reciprocal_lattice_constant
+        deltaGs = build_cubic_reciprocal_lattice_grid((15, 15, 15), b)
+        shifts = np.array([0.0, 0.5])
+        qGrid = np.array(np.meshgrid(shifts, shifts, shifts, indexing="ij")).reshape(3, -1).T * b
+        model = XNETBLiftedStackedSingularityQMesh(
+            qGrid=qGrid, cell=cell, deltaGs=deltaGs, remove_deltaG_zero=remove_deltaG_zero)
+        coords = (qGrid[:, None, :] + deltaGs[None, :, :]).reshape(-1, 3)
+        return model, coords[np.linalg.norm(coords, axis=1) < qcut]
+
+    def test_lifted_linear_fit_recovers_pair_matrix(self):
+        """The lifted q2 model is linear in B, so a non-rank-1 B is recovered exactly by NNLS."""
+        model, coords = self._lifted_setup()
+        B = 1e-4 * (np.outer(self.coeffs, self.coeffs) + np.diag([0.0, 0.05, 0.0, 0.02, 0.0]))
+        true = B[model.pair_rows, model.pair_cols]
+        model.set_parameters(true)
+        data = model.eval_model(coords)
+
+        fit_model, _ = self._lifted_setup()
+        self.assertIs(trim_etb_model_to_data(fit_model, coords), fit_model)
+        fitted = ETBLinearLeastSquares(fit_model, fit_with_coul=True).fit_model(coords, data)
+        np.testing.assert_allclose(fitted, true, rtol=1e-6, atol=1e-14)
+
+    def test_lifted_model_reduced_until_parameters_are_determined(self):
+        # Few |q| shells: N (N + 1) / 2 = 15 pair parameters cannot all be determined
+        model, coords = self._lifted_setup(qcut=1.6)
+        n_shells = len(radial_shells(coords))
+        self.assertLess(n_shells, model.num_params + 1)
+        trimmed = trim_etb_model_to_data(model, coords)
+        self.assertLess(trimmed.num_gaussians, 5)
+        self.assertGreaterEqual(n_shells, trimmed.num_params + 1)
+        self.assertIn(0.5, trimmed.etb_exponents)
+        self.assertEqual(trimmed.num_params, trimmed.num_gaussians * (trimmed.num_gaussians + 1) // 2)
+        ETBLinearLeastSquares(trimmed, fit_with_coul=True).fit_model(coords, -np.ones(len(coords)))
+
+        # Full direct (dG = 0 kept): H_l is lattice-periodic, so at most n_q * N pair columns are independent
+        single_q, coords = self._lifted_setup(remove_deltaG_zero=False)
+        single_q = XNETBLiftedStackedSingularityQMesh(
+            qGrid=np.zeros((1, 3)), cell=single_q.cell, deltaGs=single_q.deltaGs)
+        gamma_coords = coords[np.all(np.isclose(
+            single_q.cell.get_scaled_kpts(coords) % 1.0, 0.0) | np.isclose(
+            single_q.cell.get_scaled_kpts(coords) % 1.0, 1.0), axis=1)]
+        trimmed = trim_etb_model_to_data(single_q, gamma_coords)
+        self.assertLessEqual(trimmed.num_params, trimmed.num_gaussians)
 
     def test_linear_fit_rejects_nonlinear_models(self):
         cell = CubicCell(lattice_constant=6.0)

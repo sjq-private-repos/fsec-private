@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 from fsec.singularity_subtraction.model_function import ModelFunction, IsotropicModel
 from fsec.singularity_subtraction.model_function.etb import DEFAULT_RCOND, numerical_rank, radial_shells
-from scipy.optimize import least_squares, lsq_linear, minimize, nnls
+from scipy.optimize import least_squares, lsq_linear, minimize
 
 
 def coulomb_residual_weights(input_data, isotropic, fit_with_coul, coul_deg):
@@ -459,11 +459,18 @@ class ETBLinearLeastSquares(FitMethod):
         return self.fitted_parameters
 
     def _nnls(self, A, y):
-        """min ||A b - y|| subject to b >= 0, with columns scaled to unit norm for conditioning."""
+        """
+        min ||A b - y|| subject to b >= 0, by bounded-variable least squares. scipy.optimize.nnls is avoided: it
+        returns inaccurate solutions for the moderately ill-conditioned ETB design matrices (cond ~ 1e6). Columns
+        and right-hand side are scaled to unit norm because MP2 structure factors are small.
+        """
         col_norms = np.linalg.norm(A, axis=0)
         col_norms[col_norms == 0] = 1.0
-        x, _ = nnls(A / col_norms, y, maxiter=100 * A.shape[1])
-        return x / col_norms
+        y_norm = np.linalg.norm(y)
+        if y_norm == 0:
+            return np.zeros(A.shape[1])
+        result = lsq_linear(A / col_norms, y / y_norm, bounds=(0, np.inf), method='bvls', tol=1e-14)
+        return np.maximum(result.x, 0.0) * y_norm / col_norms
 
     def _nnls_fixed_sum(self, A, y, total):
         """

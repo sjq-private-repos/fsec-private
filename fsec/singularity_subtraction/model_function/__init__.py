@@ -97,6 +97,7 @@ from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
     XNExpAbsStackedSingularity,
     XNExpAbsStackedSingularityQMesh,
     XNETB,
+    XNETBLiftedStackedSingularityQMesh,
     XNETBStackedSingularity,
     XNETBStackedSingularityQMesh,
     XNExponential,

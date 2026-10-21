@@ -81,14 +81,14 @@ class MP2SSOptions:
     ----------
     auxfunc_direct
         Model used when fitting the complete direct contribution. Supported
-        values are ``"Gauss"``, ``"ExpAbs"``, and ``"ETB"``. NOTE: Ignored when
+        values are ``"Gauss"``, ``"ExpAbs"``, ``"ETB"``, and ``"ETBLifted"``. NOTE: Ignored when
         correct_q2_q4_separately is enabled, in which case auxfunc_direct_q2
         and auxfunc_direct_q4 are used instead.
     auxfunc_direct_q2
         Model used for the second-order direct contribution when
         ``correct_q2_q4_separately`` is enabled. A false-like value falls back
         to ``auxfunc_direct``. Supported values are ``"Gauss"``,
-        ``"ExpAbs"``, and ``"ETB"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
+        ``"ExpAbs"``, ``"ETB"``, and ``"ETBLifted"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
         in which case auxfunc_direct is used instead.
     auxfunc_direct_q4
         Model used for the fourth-order direct contribution when
@@ -102,23 +102,29 @@ class MP2SSOptions:
         are ``"Gauss"``, ``"Exponential"``, ``"QuarticExponential"``,
         ``"ExpAbs"``, ``"ExpAbs2"``, and ``"ETB"``.
     etb_sigma
-        Expected width of the decay function for ``"ETB"`` (even-tempered
-        Gaussian) auxiliary functions. The fixed exponents are
+        Expected width of the decay function for ``"ETB"`` and
+        ``"ETBLifted"`` (even-tempered Gaussian) auxiliary functions.
+        ``"ETBLifted"`` (direct and q2 only) replaces the stacked product
+        h(q) h(q+dG) by a nonnegative sum of pairwise Gaussian terms
+        B_kl g_k(q) g_l(q+dG), which is linear in the N(N+1)/2 entries of
+        B, so its fit is convex. The fixed exponents are
         ``alpha_k = ratio**(k - (N-1)/2) / (2 sigma**2)``. Either a float
         used for every component, or a mapping keyed by ``"direct"``,
         ``"direct_q2"``, ``"direct_q4"``, and ``"exchange"``; components
         missing from the mapping use 1.0.
     etb_num_gaussians
-        Number of even-tempered Gaussians N in ``"ETB"`` auxiliary functions.
-        Reduced automatically, around the Gaussian of width ``etb_sigma``,
-        if the fit data cannot determine all coefficients.
+        Number of even-tempered Gaussians N in ``"ETB"`` and ``"ETBLifted"``
+        auxiliary functions. Reduced automatically, around the Gaussian of
+        width ``etb_sigma``, until the fit data can determine all parameters
+        (N, or N(N+1)/2 for ``"ETBLifted"``).
     etb_ratio
         Ratio between consecutive ``"ETB"`` exponents.
     etb_linear_fit
         Fit ``"ETB"`` models that are linear in their coefficients (q4 and
-        exchange) by direct nonnegative least squares instead of
-        ``fit_method``. The stacked direct and q2 models are quadratic in
-        their coefficients and always use ``fit_method``.
+        exchange, and the ``"ETBLifted"`` direct and q2 models) by direct
+        nonnegative least squares instead of ``fit_method``. The ``"ETB"``
+        stacked direct and q2 models are quadratic in their coefficients and
+        always use ``fit_method``.
     fit_with_coul
         Include the Coulomb kernel in fits of the complete direct and exchange
         contributions. Ignored for direct if ``correct_q2_q4_separately`` is
@@ -464,6 +470,12 @@ DIRECT_MODEL_SPECS = {
         'etb': True,
         'c0_scale': 1.0e-4,
     },
+    'ETBLifted': {
+        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
+        'type': 'qmesh',
+        'etb': True,
+        'c0_scale': 1.0e-4,
+    },
 }
 
 Q4_MODEL_SPECS = {
@@ -518,6 +530,12 @@ Q2_MODEL_SPECS = {
         'etb': True,
         'c0_scale': 1.0e-5,
     },
+    'ETBLifted': {
+        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
+        'type': 'qmesh',
+        'etb': True,
+        'c0_scale': 1.0e-5,
+    },
 }
 
 EXCHANGE_MODEL_SPECS = {
@@ -563,6 +581,15 @@ def _prepare_etb_fit(model, spec, config, fit_coords, *, fit_with_coul, coul_deg
         fit_class = ETBLinearLeastSquares
     print(f"{label} exponents: {model.etb_exponents}")
     return model, initial_params, None, fit_class
+
+
+def _report_etb_pair_matrix(model, label):
+    """For lifted ETB models, report how far the fitted pair matrix is from the rank-1 stacked form."""
+    if not hasattr(model, 'pair_matrix'):
+        return
+    eigenvalues = np.linalg.eigvalsh(model.pair_matrix)[::-1]
+    print(f"{label} pair matrix eigenvalues: {eigenvalues}")
+    print(f"{label} rank-1 fraction: {eigenvalues[0] / np.sum(np.abs(eigenvalues))}")
 
 
 class MP2DirectFourthOrderSS(SingularitySubtraction):
@@ -763,6 +790,7 @@ class MP2DirectSecondOrderSS(SingularitySubtraction):
             max_nfev=1000 * f_q2.num_params, force_positive_params=True
         )
         f_q2.set_parameters(fitted_params_q2)
+        _report_etb_pair_matrix(f_q2, "q2 ETB")
 
         return f_q2, qGlocal_grid_correction, numKpt3D, omega_star
 
@@ -900,6 +928,7 @@ class MP2DirectFullSS(SingularitySubtraction):
 
         f_gauss.set_parameters(fitted_params)
         print(f"Direct auxiliary function parameters: {fitted_params}")
+        _report_etb_pair_matrix(f_gauss, "Direct ETB")
         return f_gauss, qGlocal_grid_correction, numKpt3D, omega_star
 
     def compute_quadrature_term(self, *, f_gauss, qGlocal_grid_correction):
@@ -1298,7 +1327,7 @@ class MP2SS:
 
     def _etb_model_kwargs(self, component, auxfunc):
         """Constructor kwargs for an ETB auxiliary function of the given component, or None."""
-        if auxfunc != 'ETB':
+        if auxfunc not in ('ETB', 'ETBLifted'):
             return None
         sigma = self.etb_sigma
         if isinstance(sigma, Mapping):

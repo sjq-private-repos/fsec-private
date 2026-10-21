@@ -102,6 +102,14 @@ class EvenTemperedMixin:
                 total += term if a_k == a_l else 2 * term
         return total
 
+    def num_window_params(self, num_gaussians):
+        """Number of fit parameters of this model restricted to num_gaussians primitives."""
+        return num_gaussians
+
+    def window_columns(self, idx):
+        """Design-matrix columns belonging to the primitives in the window idx."""
+        return np.asarray(idx)
+
     def with_exponents(self, exponents):
         """Rebuild this model with a subset of its exponents (default coefficients)."""
         kwargs = dict(self._etb_ctor_kwargs)
@@ -155,33 +163,44 @@ def numerical_rank(A, rcond=DEFAULT_RCOND):
 
 
 def etb_windows(num_gaussians, ref_index):
-    """Index windows centered on ref_index, from the full basis down to the reference alone."""
+    """Contiguous index windows containing ref_index, from the full basis down to the reference alone.
+
+    For each size, windows are ordered by how far their center is from ref_index; ties go to the more diffuse
+    (lower-exponent) side.
+    """
     windows = []
-    for half_width in range(max(ref_index, num_gaussians - 1 - ref_index), -1, -1):
-        idx = np.arange(max(0, ref_index - half_width), min(num_gaussians, ref_index + half_width + 1))
-        if not windows or len(idx) != len(windows[-1]):
-            windows.append(idx)
+    for size in range(num_gaussians, 0, -1):
+        starts = range(max(0, ref_index - size + 1), min(ref_index, num_gaussians - size) + 1)
+        for start in sorted(starts, key=lambda lo: (abs(lo + (size - 1) / 2 - ref_index), lo)):
+            windows.append(np.arange(start, start + size))
     return windows
 
 
 def select_etb_window(A, ref_index, constraint_rows=None, rcond=DEFAULT_RCOND,
-                      n_shells=None, min_shell_margin=DEFAULT_MIN_SHELL_MARGIN):
-    """Largest window of columns around ref_index that the samples can determine.
+                      n_shells=None, min_shell_margin=DEFAULT_MIN_SHELL_MARGIN,
+                      num_gaussians=None, window_columns=None):
+    """Largest window of primitives around ref_index whose parameters the samples can determine.
 
-    A window is accepted when its (weighted) design matrix, stacked with any constraint rows, has full
-    numerical column rank and, if n_shells is given, the number of distinct nonzero |q| shells exceeds
-    the window's degrees of freedom by at least min_shell_margin.
+    A window is accepted when the (weighted) design-matrix columns of its parameters, stacked with any constraint
+    rows, have full numerical column rank and, if n_shells is given, the number of distinct nonzero |q| shells
+    exceeds the window's degrees of freedom by at least min_shell_margin. window_columns maps a window of
+    primitives to its design-matrix columns (default: one column per primitive).
     """
     A = np.asarray(A, dtype=float)
+    if num_gaussians is None:
+        num_gaussians = A.shape[1]
+    if window_columns is None:
+        window_columns = np.asarray
     n_constraints = 0 if constraint_rows is None else np.atleast_2d(constraint_rows).shape[0]
-    for idx in etb_windows(A.shape[1], ref_index):
-        sub = A[:, idx]
+    for idx in etb_windows(num_gaussians, ref_index):
+        cols = window_columns(idx)
+        sub = A[:, cols]
         if constraint_rows is not None:
-            sub = np.vstack([sub, np.atleast_2d(constraint_rows)[:, idx]])
-        dof = len(idx) - n_constraints
+            sub = np.vstack([sub, np.atleast_2d(constraint_rows)[:, cols]])
+        dof = len(cols) - n_constraints
         if n_shells is not None and dof > 0 and n_shells < dof + min_shell_margin:
             continue
-        if numerical_rank(sub, rcond) == len(idx):
+        if numerical_rank(sub, rcond) == len(cols):
             return idx
     return None
 
@@ -202,7 +221,8 @@ def trim_etb_model_to_data(model, coords, weights=None, rcond=DEFAULT_RCOND,
 
     n_shells = len(radial_shells(coords))
     idx = select_etb_window(A, model.etb_ref_index, constraint_rows=constraint_rows, rcond=rcond,
-                            n_shells=n_shells, min_shell_margin=min_shell_margin)
+                            n_shells=n_shells, min_shell_margin=min_shell_margin,
+                            num_gaussians=model.num_gaussians, window_columns=model.window_columns)
     if idx is None:
         raise ValueError(
             f"{label}: the fit data ({n_shells} distinct nonzero |q| shells) cannot determine even the "
@@ -211,7 +231,9 @@ def trim_etb_model_to_data(model, coords, weights=None, rcond=DEFAULT_RCOND,
     if len(idx) == model.num_gaussians:
         return model
 
-    print(f"WARNING: {label} reduced from {model.num_gaussians} to {len(idx)} primitives: only "
-          f"{n_shells} distinct nonzero |q| shells within the fit region. Increase qG_norm_cutoff to "
-          "use the full basis.")
+    full_rank = numerical_rank(A if constraint_rows is None else np.vstack([A, constraint_rows]), rcond)
+    print(f"WARNING: {label} reduced from {model.num_gaussians} to {len(idx)} primitives "
+          f"({model.num_window_params(model.num_gaussians)} to {model.num_window_params(len(idx))} parameters): "
+          f"the fit data have {n_shells} distinct nonzero |q| shells and a design matrix of numerical rank "
+          f"{full_rank} for the full basis. Increase qG_norm_cutoff (or the k-point mesh) to use the full basis.")
     return model.with_exponents(model.etb_exponents[idx])

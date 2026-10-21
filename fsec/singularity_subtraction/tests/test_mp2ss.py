@@ -355,6 +355,60 @@ class KnownValues(unittest.TestCase):
         for quantity, reference in self.ETB_FULL_DIRECT_REFERENCES.items():
             self.assertAlmostEqual(getattr(mp2ss, quantity), reference, delta=self.TOL, msg=quantity)
 
+    def test_mp2ss_lifted_even_tempered_q2(self):
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2.copy(),
+            pair_density_eval_grid="uniform",
+            auxfunc_direct_q2="ETBLifted",
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            mp2ss.compute_correction(direct=True, exchange=False)
+        self.assertIn("q2 ETB rank-1 fraction", output.getvalue())
+        self.assertNotIn("reduced", output.getvalue())
+        self.assertAlmostEqual(
+            mp2ss.direct_total_correction_q2, -0.011449296006872507, delta=self.TOL)
+        # q4 is untouched by the q2 auxiliary function
+        self.assertAlmostEqual(
+            mp2ss.direct_total_correction_q4, self.REFERENCES["direct_total_correction_q4"], delta=self.TOL)
+
+        # Linear in the pair matrix: the nonlinear fit method finds the same optimum
+        nonlinear = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2.copy(),
+            pair_density_eval_grid="uniform",
+            auxfunc_direct_q2="ETBLifted",
+            etb_linear_fit=False,
+        )
+        with redirect_stdout(StringIO()):
+            nonlinear.compute_correction(direct=True, exchange=False)
+        self.assertAlmostEqual(
+            nonlinear.direct_total_correction_q2, mp2ss.direct_total_correction_q2, delta=1e-5)
+
+    def test_mp2ss_lifted_even_tempered_full_direct_reduces_basis(self):
+        """With a 1x1x2 mesh the full-direct pair columns have rank <= n_q N = 10 < 15, so the basis is reduced."""
+        mp2ss = MP2SS(
+            kmf=self.kmf,
+            kmp=self.kmp,
+            t2=self.t2.copy(),
+            pair_density_eval_grid="uniform",
+            auxfunc_direct="ETBLifted",
+            correct_q2_q4_separately=False,
+        )
+        output = StringIO()
+        with redirect_stdout(output):
+            mp2ss.compute_correction(direct=True, exchange=False)
+        self.assertIn("Direct ETB reduced from 5 to 2 primitives (15 to 3 parameters)", output.getvalue())
+        self.assertAlmostEqual(mp2ss.mp2ss_direct_correction, -0.004035501046000353, delta=self.TOL)
+
+    def test_lifted_even_tempered_only_for_direct_terms(self):
+        for kwargs in ({"auxfunc_direct_q4": "ETBLifted"}, {"auxfunc_exchange": "ETBLifted"}):
+            with self.subTest(**kwargs), self.assertRaises(ValueError):
+                MP2SS(kmf=self.kmf, kmp=self.kmp, t2=self.t2.copy(), **kwargs)
+
     def test_mp2ss_even_tempered_reduces_basis_for_small_cutoff(self):
         mp2ss = MP2SS(
             kmf=self.kmf,
