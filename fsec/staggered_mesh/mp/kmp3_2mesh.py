@@ -25,6 +25,7 @@ from pyscf.pbc.scf.khf import get_occ
 from pyscf.pbc.cc.kccsd_rhf import _get_epq
 
 from .kmp3 import KMP3
+from .kmp3_3mesh import _KMP3_nmesh
 from .._kpoints import make_kpts_helper
 from pyscf.pbc import tools
 
@@ -454,6 +455,43 @@ class KMP3_2mesh(KMP3):
     double_amplitude = mp3_amplitude_2mesh_efficient
     # double_amplitude = mp3_amplitude_2mesh
     correlation_energy = mp3_energy_2mesh
+
+class KMP3_2mesh_mixed(_KMP3_nmesh):
+    """Two-mesh staggered restricted MP3 with mixed internal sampling.
+
+    The energy uses the same quadrature as :class:`KMP3_2mesh`: mesh 0 is the
+    virtual mesh and mesh 1, shifted by half a mesh spacing, is the occupied
+    mesh.  Summed internal orbitals may instead sit on either mesh.  The
+    4h2p and 2h4p ladders and the exchange-ring contractions cannot avoid zero
+    momentum transfer with two meshes; here the internal meshes are chosen so
+    that every ERI with a ``1/|q|^2`` singularity (occupied-occupied or
+    virtual-virtual pair densities) is sampled on the half-shifted transfer
+    mesh.  Zero transfer remains only in occupied-virtual pairs of auxiliary
+    MP2 amplitudes, whose omitted ``q = 0`` term vanishes by orthogonality.
+
+    The Madelung-like correction on the half-shifted transfer mesh is enabled
+    by default, as is the unshifted correction of :class:`KMP3_2mesh`.
+    """
+
+    _nmesh = 2
+
+    #   (mi, mj, ma, mb): occupied pair on mesh 1 and virtual pair on mesh 0
+    _mesh_mp3_amp_mixed = (1, 1, 0, 0)
+
+    #   Internal assignments, ordered as in kmp3_3mesh.mesh_config_mp3:
+    #   0 (mK, mL) 4h2p: K, L on the virtual mesh, so <KL|IJ> is staggered
+    #   1 (mC, mD) 2h4p: C, D on the occupied mesh, so <AB|CD> is staggered
+    #   2 (mK, mC) (2<AK|IC> - <AK|CI>) s_KJ^CB: nonsingular with K, C swapped
+    #   3 (mK, mC) <AK|IC> s_KJ^BC: nonsingular with the type-based meshes
+    #   4 (mK, mC) <BK|CI> s_KJ^AC: K, C swapped to stagger <BK|CI>
+    #   5-7: the (I, A) <-> (J, B) partners of 2-4
+    _mesh_term_mixed = [(0, 0), (1, 1), (0, 1), (1, 0), (0, 1),
+                        (0, 1), (1, 0), (0, 1)]
+
+    def __init__(self, mf, frozen=None, flag_submesh=False, nks_mp=None,
+                 madelung=True):
+        _KMP3_nmesh.__init__(self, mf, frozen, flag_submesh, nks_mp, madelung)
+        self.set_mesh_config(self._mesh_mp3_amp_mixed, self._mesh_term_mixed)
 
 def _mem_usage(nkpts, nocc, nvir):
     incore = 0

@@ -1,17 +1,20 @@
 """Small periodic regressions for restricted MP3 amplitudes and energies."""
 
+import functools
+
 import numpy as np
 import pytest
 
 from pyscf.pbc import df, gto, scf
 from pyscf.pbc.mp.kmp2 import KMP2
 
-from fsec.staggered_mesh.mp import KMP3, KMP3_2mesh, KMP3_3mesh
+from fsec.staggered_mesh.mp import KMP3, KMP3_2mesh, KMP3_2mesh_mixed, KMP3_3mesh
 from fsec.staggered_mesh.mp.kmp3_2mesh import (
     mp3_amplitude_2mesh,
     mp3_amplitude_2mesh_efficient,
 )
 from fsec.staggered_mesh.mp.kmp3_3mesh import (
+    mesh_config_mp3,
     mp3_amplitude_3mesh,
     mp3_amplitude_3mesh_efficient,
 )
@@ -126,7 +129,10 @@ def test_staggered_modes_route_momenta_and_match_direct_contractions():
     mf = make_h2([1, 1, 6])
     variants = (
         (KMP3_2mesh, mp3_amplitude_2mesh, mp3_amplitude_2mesh_efficient),
+        (KMP3_2mesh_mixed, mp3_amplitude_3mesh, mp3_amplitude_3mesh_efficient),
         (KMP3_3mesh, mp3_amplitude_3mesh, mp3_amplitude_3mesh_efficient),
+        (functools.partial(KMP3_3mesh, scheme='vir'),
+         mp3_amplitude_3mesh, mp3_amplitude_3mesh_efficient),
     )
 
     # The two-mesh formulation enables its correction by default and leaves the
@@ -169,3 +175,53 @@ def test_staggered_modes_route_momenta_and_match_direct_contractions():
                 atol=1e-12,
                 rtol=0,
             )
+
+
+def test_nmesh_engine_reproduces_existing_staggered_schemes():
+    """The generalized n-mesh engine keeps the 3a and 2a results.
+
+    Three-mesh MP3 matches its pre-generalization energies.  The two-mesh
+    engine with type-based internal meshes reproduces ``KMP3_2mesh``, and the
+    mixed 2b scheme shares its second-order energy quadrature.
+    """
+    mf = make_h2([1, 1, 6])
+
+    three_mesh = KMP3_3mesh(mf, flag_submesh=True)
+    three_mesh.kernel()
+    np.testing.assert_allclose(three_mesh.e_corr_mp2, -0.016074014758024037,
+                               atol=1e-10, rtol=0)
+    np.testing.assert_allclose(three_mesh.e_corr_mp3, -0.013665358071595853,
+                               atol=1e-10, rtol=0)
+
+    reference = KMP3_2mesh(mf, flag_submesh=True, madelung=False)
+    reference.kernel()
+    type_based = KMP3_2mesh_mixed(mf, flag_submesh=True, madelung=False)
+    type_based.set_mesh_config((1, 1, 0, 0), [(1, 1), (0, 0)] + [(1, 0)] * 6)
+    type_based.kernel()
+    np.testing.assert_allclose(type_based.e_corr_mp2, reference.e_corr_mp2,
+                               atol=1e-10, rtol=0)
+    np.testing.assert_allclose(type_based.e_corr_mp3, reference.e_corr_mp3,
+                               atol=1e-10, rtol=0)
+
+    mixed = KMP3_2mesh_mixed(mf, flag_submesh=True, madelung=False)
+    mixed.kernel()
+    np.testing.assert_allclose(mixed.e_corr_mp2, reference.e_corr_mp2,
+                               atol=1e-10, rtol=0)
+    assert abs(mixed.e_corr_mp3 - reference.e_corr_mp3) > 1e-6
+
+
+def test_virtual_pair_three_mesh_is_relabeling_invariant():
+    """3b gives the same energy after swapping the occupied meshes.
+
+    ``(1, 2, 0, 0)`` and ``(2, 1, 0, 0)`` differ only by the simultaneous
+    exchange ``(I, A) <-> (J, B)``, so every internal assignment must follow.
+    """
+    mf = make_h2([1, 1, 6])
+    vir = KMP3_3mesh(mf, flag_submesh=True, scheme='vir')
+    vir.kernel()
+
+    swapped = KMP3_3mesh(mf, flag_submesh=True)
+    swapped.set_mesh_config((2, 1, 0, 0), mesh_config_mp3((2, 1, 0, 0)))
+    swapped.kernel()
+    np.testing.assert_allclose(swapped.e_corr_mp2, vir.e_corr_mp2, atol=1e-10, rtol=0)
+    np.testing.assert_allclose(swapped.e_corr_mp3, vir.e_corr_mp3, atol=1e-10, rtol=0)

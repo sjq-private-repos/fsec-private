@@ -6,7 +6,7 @@ Hirata et al., J. Chem. Phys. 120, 2581 (2004).
 
 from pyscf.pbc import df, gto, scf
 
-from fsec.staggered_mesh.mp import KMP3, KMP3_2mesh, KMP3_3mesh
+from fsec.staggered_mesh.mp import KMP3, KMP3_2mesh, KMP3_2mesh_mixed, KMP3_3mesh
 
 
 cell = gto.Cell()
@@ -39,15 +39,19 @@ kmf.kernel()
 # False evaluates band orbitals on an extended mesh.
 flag_submesh = False
 
+# KMP3_2mesh_mixed lets internal orbitals use either mesh; scheme="vir"
+# samples the three-mesh energy with the virtual pair on one mesh.
 methods = (
-    KMP3(kmf),
-    KMP3_2mesh(kmf, flag_submesh=flag_submesh),
-    KMP3_3mesh(kmf, flag_submesh=flag_submesh),
+    ("KMP3", KMP3(kmf)),
+    ("KMP3_2mesh", KMP3_2mesh(kmf, flag_submesh=flag_submesh)),
+    ("KMP3_2mesh_mixed", KMP3_2mesh_mixed(kmf, flag_submesh=flag_submesh)),
+    ("KMP3_3mesh", KMP3_3mesh(kmf, flag_submesh=flag_submesh)),
+    ("KMP3_3mesh vir", KMP3_3mesh(kmf, flag_submesh=flag_submesh, scheme="vir")),
 )
-for method in methods:
+for name, method in methods:
     energy, t2 = method.kernel()
     print(
-        f"{type(method).__name__}: E2={method.e_corr_mp2:.12f} Ha, "
+        f"{name}: E2={method.e_corr_mp2:.12f} Ha, "
         f"E3={method.e_corr_mp3:.12f} Ha, "
         f"E2+E3={energy:.12f} Ha, first-order t2 shape={t2.shape}"
     )

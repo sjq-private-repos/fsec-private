@@ -1,7 +1,9 @@
 """Restricted periodic MP3 with three staggered k-point meshes.
 
-Based on Xin Xing's staggered-mesh formulation. The default correction
-uses an adaptive reciprocal-space quadrature for the shifted-mesh singularity.
+Based on Xin Xing's staggered-mesh formulation. The contractions are driven
+by mesh labels, so the same engine also serves other numbers of staggered
+meshes (see ``_KMP3_nmesh``). The optional correction uses an adaptive
+reciprocal-space quadrature for the shifted-mesh singularity.
 """
 
 import time
@@ -225,25 +227,27 @@ def mp3_amplitude_3mesh_efficient(mp, eris):
         t2new_tmp -= einsum('xakic,xkjcb->ijab', eris.ovov[mesh2idx(mk,ma,mi)][kk_kc[:,0], ika, iki].transpose(0, 2, 1, 3, 4), t_mp2[mesh2idx(mk, mj, mc)][kk_kc[:,0], ikj, kk_kc[:,1]])
 
         #   term 3
+        mk, mc = mp._mesh_term[3]
         t2new_tmp -= einsum('xakic,xkjbc->ijab', eris.voov[mesh2idx(ma,mk,mi)][ika,:,iki], t_mp2[mesh2idx(mk, mj, mb)][:, ikj, ikb])
 
         #   term 4
-        mk, mc = mp._mesh_term[3]
+        mk, mc = mp._mesh_term[4]
         t2new_tmp -= einsum('xkbic,xkjac->ijab', eris.ovov[mesh2idx(mk,mb,mi)][:,ikb,iki], t_mp2[mesh2idx(mk, mj, ma)][:, ikj, ika])
 
 
         #   SYMMETRIZED TERMS with (I, A) <-> (J, B)
         #   term 1 & 2
-        mk, mc = mp._mesh_term[4]
+        mk, mc = mp._mesh_term[5]
         kk_kc = np.asarray([ [ikk, idx_base[mc][kconserv[kb, kj, kk]]] for ikk, kk in enumerate(kpts_base_idx[mk])])
         t2new_tmp += 2*einsum('xbkjc,xkica->ijab', eris.voov[mesh2idx(mb,mk,mj)][ikb, kk_kc[:,0], ikj], t_mp2[mesh2idx(mk, mi, mc)][kk_kc[:,0], iki, kk_kc[:,1]])
         t2new_tmp -= einsum('xbkjc,xkica->ijab', eris.ovov[mesh2idx(mk,mb,mj)][kk_kc[:,0], ikb, ikj].transpose(0, 2, 1, 3, 4), t_mp2[mesh2idx(mk, mi, mc)][kk_kc[:,0], iki, kk_kc[:,1]])
 
         #   term 3
+        mk, mc = mp._mesh_term[6]
         t2new_tmp -= einsum('xbkjc,xkiac->ijab', eris.voov[mesh2idx(mb,mk,mj)][ikb,:,ikj], t_mp2[mesh2idx(mk, mi, ma)][:, iki, ika])
 
         #   term 4
-        mk, mc = mp._mesh_term[5]
+        mk, mc = mp._mesh_term[7]
         t2new_tmp -= einsum('xkajc,xkibc->ijab', eris.ovov[mesh2idx(mk,ma,mj)][:,ika,ikj], t_mp2[mesh2idx(mk, mi, mb)][:, iki, ikb])
 
 
@@ -286,12 +290,11 @@ def mp3_amplitude_3mesh(mp, eris):
     kpts_base_idx = mp.kpts_base_idx
     idx_base = mp.idx_base
 
+    nmesh = mp._nmesh
     if mp.madelung:
-        madelung_correction = [
-                               madelung_stagger(mp.cell, mp.nks_base, np.zeros((1, 3))),
-                               madelung_stagger(mp.cell, mp.nks_base, mp.shifts[0]),
-                               madelung_stagger(mp.cell, mp.nks_base, mp.shifts[1]),
-                              ]
+        #   correction for a transfer mesh shifted by m/nmesh, m = 0, ..., nmesh-1
+        madelung_correction = [madelung_stagger(mp.cell, mp.nks_base, shift)
+                               for shift in [np.zeros((1, 3))] + list(mp.shifts)]
 
     #   auxiliary MP2 t-amplitude
     t_mp2 = {}
@@ -333,7 +336,7 @@ def mp3_amplitude_3mesh(mp, eris):
 
         #   madelung correction
         if mp.madelung:
-            t2new_tmp += madelung_correction[(mi-mk)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp += madelung_correction[(mi-mk)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
 
         #   3rd term: 4p2h
         mc, md = mp._mesh_term[1]
@@ -342,7 +345,7 @@ def mp3_amplitude_3mesh(mp, eris):
 
         #   madelung correction
         if mp.madelung:
-            t2new_tmp += madelung_correction[(mc-ma)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp += madelung_correction[(mc-ma)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
 
         #   4-5th term
         mk, mc = mp._mesh_term[2]
@@ -352,48 +355,48 @@ def mp3_amplitude_3mesh(mp, eris):
             tmp_voov = 2. * eris.voov[mesh2idx(ma,mk,mi)][ika,ikk,iki] - eris.ovov[mesh2idx(mk,ma,mi)][ikk,ika,iki].transpose(1, 0, 2, 3)
             t2new_tmp += einsum('akic,kjcb->ijab', tmp_voov, t_mp2[mesh2idx(mk, mj, mc)][ikk, ikj, ikc])
 
-            kc = kconserv[ka, ki, kk]
-            ikc = idx_base[mc][kc]
-            t2new_tmp -= einsum('akic,kjbc->ijab', eris.voov[mesh2idx(ma,mk,mi)][ika,ikk,iki], t_mp2[mesh2idx(mk, mj, mb)][ikk, ikj, ikb])
-
-        #   madelung correction
+        #   madelung correction for the 1/q^2 singularity of <AK|CI>
         if mp.madelung:
-            t2new_tmp -= madelung_correction[(mc-ma)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp -= madelung_correction[(mc-ma)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+
+        mk, mc = mp._mesh_term[3]
+        for ikk, kk in enumerate(kpts_base_idx[mk]):
+            t2new_tmp -= einsum('akic,kjbc->ijab', eris.voov[mesh2idx(ma,mk,mi)][ika,ikk,iki], t_mp2[mesh2idx(mk, mj, mb)][ikk, ikj, ikb])
 
 
         #   6th term
-        mk, mc = mp._mesh_term[3]
+        mk, mc = mp._mesh_term[4]
         for ikk, kk in enumerate(kpts_base_idx[mk]):
             t2new_tmp -= einsum('kbic,kjac->ijab', eris.ovov[mesh2idx(mk,mb,mi)][ikk,ikb,iki], t_mp2[mesh2idx(mk, mj, ma)][ikk, ikj, ika])
 
         #   madelung correction
         if mp.madelung:
-            t2new_tmp -= madelung_correction[(mc-mb)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp -= madelung_correction[(mc-mb)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
 
 
         #   SYMMETRIZED TERMS with (I, A) <-> (J, B)
-        mk, mc = mp._mesh_term[4]
+        mk, mc = mp._mesh_term[5]
         for ikk, kk in enumerate(kpts_base_idx[mk]):
             kc = kconserv[kb, kj, kk]
             ikc = idx_base[mc][kc]
             tmp_voov = 2. * eris.voov[mesh2idx(mb,mk,mj)][ikb,ikk,ikj] - eris.ovov[mesh2idx(mk,mb,mj)][ikk,ikb,ikj].transpose(1, 0, 2, 3)
             t2new_tmp += einsum('bkjc,kica->ijab', tmp_voov, t_mp2[mesh2idx(mk,mi,mc)][ikk, iki, ikc])
 
-            kc = kconserv[kb, kj, kk]
-            ikc = idx_base[mc][kc]
-            t2new_tmp -= einsum('bkjc,kiac->ijab', eris.voov[mesh2idx(mb,mk,mj)][ikb,ikk,ikj], t_mp2[mesh2idx(mk, mi, ma)][ikk, iki, ika])
-
         #   madelung correction
         if mp.madelung:
-            t2new_tmp -= madelung_correction[(mc-mb)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp -= madelung_correction[(mc-mb)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
 
-        mk, mc = mp._mesh_term[5]
+        mk, mc = mp._mesh_term[6]
+        for ikk, kk in enumerate(kpts_base_idx[mk]):
+            t2new_tmp -= einsum('bkjc,kiac->ijab', eris.voov[mesh2idx(mb,mk,mj)][ikb,ikk,ikj], t_mp2[mesh2idx(mk, mi, ma)][ikk, iki, ika])
+
+        mk, mc = mp._mesh_term[7]
         for ikk, kk in enumerate(kpts_base_idx[mk]):
             t2new_tmp -= einsum('kajc,kibc->ijab', eris.ovov[mesh2idx(mk,ma,mj)][ikk,ika,ikj], t_mp2[mesh2idx(mk, mi, mb)][ikk, iki, ikb])
 
         #   madelung correction
         if mp.madelung:
-            t2new_tmp -= madelung_correction[(mc-ma)%3] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
+            t2new_tmp -= madelung_correction[(mc-ma)%nmesh] * t_mp2[mesh2idx(mi, mj, ma)][iki, ikj, ika]
 
 
         #   MP2 term
@@ -433,137 +436,95 @@ def mp3_energy_3mesh(mp, t2, eris):
     return e.real
 
 def mesh_config_mp3(mesh_mp3_amp):
-    mi, mj, ma, mb = mesh_mp3_amp[0], mesh_mp3_amp[1], mesh_mp3_amp[2], mesh_mp3_amp[3]
-    mi, mj, ma, mb = mi%3, mj%3, ma%3, mb%3
-    if mi == ma or (mi+mj)%3 != (ma+mb)%3:
-        raise ValueError
+    """Internal mesh assignments for three-mesh MP3.
 
-    if not (mi == mj or ma == mb):
-        return ValueError
+    ``mesh_mp3_amp = (mi, mj, ma, mb)`` gives the meshes of the external
+    amplitude ``T_IJ^AB``.  Two forms keep the energy ERIs away from zero
+    momentum transfer: ``t_{xx}^{yz}`` (occupied pair on one mesh) and
+    ``t_{yz}^{xx}`` (virtual pair on one mesh), with ``{x, y, z} = {0, 1, 2}``.
 
-    #   case 1: t_{xx}^{yz}
-    if mi == mj:
-        x, y, z = mi, ma, mb
+    Returns the eight internal assignments used by the amplitude kernels:
 
-        #   PART 1: mesh for MP2 amplitudes
-        mesh_mp2_amp = []
-        #   term 1
-        mesh_mp2_amp.append( (x, x, y, z) )
-        #   term 2
-        mesh_mp2_amp.append( (z, y, y, z) )
-        #   term 3
-        mesh_mp2_amp.append( (x, x, z, y) )
-        #   term 4-5
-        mesh_mp2_amp.append( (y, x, z, z) )
-        #   term 4-5 symmetrized
-        mesh_mp2_amp.append( (z, x, y, y) )
-        # #   term 6
-        # mesh_mp2_amp.append( (z, x, y, y) )
-        # #   term 6 symmetrized
-        # mesh_mp2_amp.append( (y, x, z, z) )
+    ===  ==========  ===========================================
+    0    (mK, mL)    4h2p,  ``<KL|IJ> s_KL^AB``
+    1    (mC, mD)    2h4p,  ``<AB|CD> s_IJ^CD``
+    2    (mK, mC)    3h3p,  ``(2<AK|IC> - <AK|CI>) s_KJ^CB``
+    3    (mK, mC)    3h3p,  ``<AK|IC> s_KJ^BC``
+    4    (mK, mC)    3h3p,  ``<BK|CI> s_KJ^AC``
+    5-7  (mK, mC)    terms 2-4 with ``(I, A) <-> (J, B)``
+    ===  ==========  ===========================================
 
-        #   PART 2: mesh for intermediate momentum vectors in MP3
-        mesh_term = []
-        #   term 2:
-        mesh_term.append( (z, y) )
-        #   term 3:
-        mesh_term.append( (z, y) )
-        #   term 4-5:
-        mesh_term.append( (y, z) )
-        #   term 6:
-        mesh_term.append( (z, y) )
-        #   term 4-5 symmetrized:
-        mesh_term.append( (z, y) )
-        #   term 6 symmetrized:
-        mesh_term.append( (y, z) )
-
-
-        #   PART 3: mesh for ERIs
-        mesh_eri = {}
-        #   term 1:
-        mesh_eri["oovv"] = mesh_mp2_amp[:]
-        #   term 2:
-        mesh_eri["oooo"] = [(z, y, x, x)]
-        #   term 3:
-        mesh_eri["vvvv"] = [(y, z, z, y)]
-        #   term 4-5:
-        mesh_eri["voov"] = [(y, y, x, z)]
-        mesh_eri["ovov"] = [(y, y, x, z)]
-        #   term 4-5 symmetrized
-        mesh_eri["voov"].append((z, z, x, y))
-        mesh_eri["ovov"].append((z, z, x, y))
-        # #   term 6:
-        # mesh_eri["ovov"].append((z, z, x, y))
-        # #   term 6 symmetrized
-        # mesh_eri["ovov"].append((y, y, x, z))
-
-
-    #   case 2: t_{yz}^{xx}
-    if ma == mb:
-        x, y, z = ma, mi, mj
-
-        #   PART 1: mesh for MP2 amplitudes
-        mesh_mp2_amp = []
-        #   term 1
-        mesh_mp2_amp.append( (y, z, x, x) )
-        #   term 2
-        mesh_mp2_amp.append( (z, y, x, x) )
-        #   term 3
-        mesh_mp2_amp.append( (y, z, z, y) )
-        #   term 4-5
-        mesh_mp2_amp.append( (z, z, y, x) )
-        #   term 4-5 symmetrized
-        mesh_mp2_amp.append( (y, y, z, x) )
-        #   term 6
-        mesh_mp2_amp.append( (z, z, x, y) )
-        #   term 6 symmetrized
-        mesh_mp2_amp.append( (y, y, x, z) )
-
-        #   PART 2: mesh for intermediate momentum vectors in MP3
-        mesh_term = []
-        #   term 2:
-        mesh_term.append( (z, y) )
-        #   term 3:
-        mesh_term.append( (z, y) )
-        #   term 4-5:
-        mesh_term.append( (z, y) )
-        #   term 6:
-        mesh_term.append( (z, y) )
-        #   term 4-5 symmetrized:
-        mesh_term.append( (y, z) )
-        #   term 6 symmetrized:
-        mesh_term.append( (y, z) )
-
-
-        #   PART 3: mesh for ERIs
-        mesh_eri = {}
-        #   term 1:
-        mesh_eri["oovv"] = mesh_mp2_amp[:]
-        #   term 2:
-        mesh_eri["oooo"] = [(z, y, y, z)]
-        #   term 3:
-        mesh_eri["vvvv"] = [(x, x, z, y)]
-        #   term 4-5:
-        mesh_eri["voov"] = [(x, z, y, y)]
-        mesh_eri["ovov"] = [(z, x, y, y)]
-        #   term 4-5 symmetrized
-        mesh_eri["voov"].append((x, y, z, z))
-        mesh_eri["ovov"].append((y, x, z, z))
-        # #   term 6:
-        # mesh_eri["ovov"].append((z, x, y, y))
-        # #   term 6 symmetrized
-        # mesh_eri["ovov"].append((y, x, z, z))
-
-    return mesh_mp2_amp, mesh_term, mesh_eri
-
-class KMP3_3mesh(KMP3):
-    """Three-mesh staggered restricted MP3.
-
-    ``flag_submesh=True`` uses three commensurate submeshes of the SCF mesh;
-    otherwise the method evaluates non-SCF band orbitals on three shifted
-    meshes.  The source method's adaptive Madelung correction is disabled by
-    default and can be enabled with ``madelung=True``.
+    Every ERI and MP2 amplitude in these contractions then avoids zero
+    momentum transfer.
     """
+    mi, mj, ma, mb = [m % 3 for m in mesh_mp3_amp]
+    if mi == ma or mi == mb or (mi + mj - ma - mb) % 3:
+        raise ValueError('Invalid three-mesh MP3 amplitude meshes %s'
+                         % (mesh_mp3_amp,))
+
+    if mi == mj:
+        #   t_{xx}^{yz}
+        y, z = ma, mb
+        return [(z, y), (z, y), (y, z), (y, z), (z, y), (z, y), (z, y), (y, z)]
+    else:
+        #   t_{yz}^{xx}
+        y, z = mi, mj
+        return [(z, y), (z, y), (z, y), (z, y), (z, y), (y, z), (y, z), (y, z)]
+
+def mesh_blocks_mp3(mesh_mp3_amp, mesh_term, nmesh):
+    """Collect the ERI blocks read by the staggered MP3 kernels and energy.
+
+    Each block is labeled by the meshes ``(mp, mq, mr, ms)`` of the
+    physicists' ERI ``<PQ|RS>``, where ``ms`` follows from momentum
+    conservation.  MP2 amplitudes are formed for every ``oovv`` block.
+    ``mesh_term`` is ordered as in :func:`mesh_config_mp3`.
+    """
+    mi, mj, ma, mb = mesh_mp3_amp
+    if len(mesh_term) != 8:
+        raise ValueError('mesh_term needs eight internal assignments')
+    t = mesh_term
+
+    #   Check the second internal mesh of each term against conservation
+    second = [mi + mj - t[0][0], mi + mj - t[1][0],
+              ma + t[2][0] - mi, mj + t[3][0] - mb, mb + t[4][0] - mi,
+              mb + t[5][0] - mj, mi + t[6][0] - ma, ma + t[7][0] - mj]
+    for term, expected in zip(t, second):
+        if (term[1] - expected) % nmesh:
+            raise ValueError('Internal meshes %s violate momentum conservation'
+                             % (term,))
+
+    blocks = {
+        'oovv': [(mi, mj, ma), (mi, mj, mb),
+                 (t[0][0], t[0][1], ma), (mi, mj, t[1][0]),
+                 (t[2][0], mj, t[2][1]), (t[3][0], mj, mb), (t[4][0], mj, ma),
+                 (t[5][0], mi, t[5][1]), (t[6][0], mi, ma), (t[7][0], mi, mb)],
+        'oooo': [(t[0][0], t[0][1], mi)],
+        'vvvv': [(ma, mb, t[1][0])],
+        'voov': [(ma, t[2][0], mi), (ma, t[3][0], mi),
+                 (mb, t[5][0], mj), (mb, t[6][0], mj)],
+        'ovov': [(t[2][0], ma, mi), (t[4][0], mb, mi),
+                 (t[5][0], mb, mj), (t[7][0], ma, mj)],
+    }
+    mesh_eri = {}
+    for key, pqr_list in blocks.items():
+        mesh_eri[key] = []
+        for mp, mq, mr in pqr_list:
+            pqrs = (mp % nmesh, mq % nmesh, mr % nmesh, (mp + mq - mr) % nmesh)
+            if pqrs not in mesh_eri[key]:
+                mesh_eri[key].append(pqrs)
+    return mesh_eri
+
+class _KMP3_nmesh(KMP3):
+    """Restricted MP3 on ``_nmesh`` staggered meshes.
+
+    Mesh ``m`` is the base mesh shifted by ``m/_nmesh`` of one mesh spacing
+    along each sampled axis.  ``flag_submesh=True`` selects these meshes from
+    the SCF mesh; otherwise band orbitals are evaluated on them at the fixed
+    SCF density.  Subclasses choose which meshes carry each orbital with
+    :meth:`set_mesh_config`.
+    """
+
+    _nmesh = 3
 
     def __init__(self, mf, frozen=None, flag_submesh=False, nks_mp=None,
                  madelung=False):
@@ -580,32 +541,30 @@ class KMP3_3mesh(KMP3):
         self.e_corr_mp2 = None
         self.e_corr_mp3 = None
 
-        #   Construction of orbitals and orbital energies on two staggered meshes
+        #   Construction of orbitals and orbital energies on nmesh staggered meshes
+        nmesh = self._nmesh
         nks = get_monkhorst_pack_size(mf.cell, mf.kpts)
         self.flag_submesh = flag_submesh
         if flag_submesh is True:
-            #   Choice 1: Use two staggered submeshes of mf.kpts of half size along each dimension
-            if ((nks % 3 != 0) & (nks > 1)).any() :
-                log = logger.Logger(self.stdout, self.verbose)
-                log.warn('The k-point mesh in the input mf has meshsize not divided by 3 in certain dimension. \n'
+            #   Choice 1: Use nmesh staggered submeshes of mf.kpts of 1/nmesh size along each dimension
+            if ((nks % nmesh != 0) & (nks > 1)).any() :
+                log.warn('The k-point mesh in the input mf has meshsize not divided by %d in certain dimension. \n'
                         'Cannot use its submeshes for staggered mesh calculation!\n'
-                        'You may set "flag_submesh" to False')
+                        'You may set "flag_submesh" to False', nmesh)
                 raise RuntimeError
 
             #   Temporary solution for low-dimensional case
             nonperiodic_dir = np.where( nks == 1)
-            nks_base = np.asarray([n // 3 if n > 1 else 1 for n in nks], dtype=int)
+            nks_base = np.asarray([n // nmesh if n > 1 else 1 for n in nks], dtype=int)
             shift = mf.kpts[ np.argmin( np.sum(mf.kpts**2, axis=1) )]   #   shift of the original k-point mesh
             if np.any(shift[nonperiodic_dir]):
                 log.warn("The given k-point mesh has non-zero shift in a "
                          "nonperiodic direction")
                 raise RuntimeError
-            shift13 = mf.cell.get_abs_kpts( [1.0/n if n > 1 else 0 for n in nks] )
-            shift23 = mf.cell.get_abs_kpts( [2.0/n if n > 1 else 0 for n in nks] )
+            shifts = [mf.cell.get_abs_kpts( [float(m)/n if n > 1 else 0 for n in nks] )
+                      for m in range(1, nmesh)]
 
             kpts0 = shift + mf.cell.make_kpts(nks_base, with_gamma_point=True)
-            kpts1 = kpts0 + shift13
-            kpts2 = kpts0 + shift23
 
             self.kpts = mf.kpts
             self.mo_energy = mf.mo_energy
@@ -613,8 +572,8 @@ class KMP3_3mesh(KMP3):
             self.mo_occ = get_occ(mf, mo_energy_kpts=mf.mo_energy)
             self.with_df = mf.with_df
         else:
-            #   Choice 2: Apply non-SCF calculation to compute orbitals and orbital energies on a
-            #             staggered mesh of the same size as mf.kpts.
+            #   Choice 2: Apply non-SCF calculation to compute orbitals and orbital energies on
+            #             nmesh staggered meshes of the same size as mf.kpts.
             if mf.cell.dimension < 3:
                 raise NotImplementedError
 
@@ -629,19 +588,16 @@ class KMP3_3mesh(KMP3):
                 nks_base = mesh_integer
             if all([n == 1 for n in nks_base]):
                 #   when given a 1*1*1 mesh, treat it as a 3d periodic system
-                shift13 = mf.cell.get_abs_kpts( [1.0/3.0/n for n in nks_base] )
-                shift23 = mf.cell.get_abs_kpts( [2.0/3.0/n for n in nks_base] )
+                frac = [1.0/nmesh/n for n in nks_base]
             else:
-                shift13 = mf.cell.get_abs_kpts( [1.0/3.0/n if n > 1 else 0 for n in nks_base] )
-                shift23 = mf.cell.get_abs_kpts( [2.0/3.0/n if n > 1 else 0 for n in nks_base] )
+                frac = [1.0/nmesh/n if n > 1 else 0 for n in nks_base]
+            shifts = [mf.cell.get_abs_kpts( [m*f for f in frac] ) for m in range(1, nmesh)]
 
             if nks_mp is None:
                 kpts0 = mf.kpts
             else:
                 kpts0 = mf.cell.make_kpts(nks_base, with_gamma_point=True)
-            kpts1 = kpts0 + shift13
-            kpts2 = kpts0 + shift23
-            kpts = np.concatenate( (kpts0, kpts1, kpts2), axis=0)
+            kpts = np.concatenate( [kpts0] + [kpts0 + s for s in shifts], axis=0)
             if isinstance(mf, krks.KRKS):
                 with lib.temporary_env(mf, with_df=df.FFTDF(mf.cell, mf.kpts)):
                     mo_energy, mo_coeff = mf.get_bands(kpts)
@@ -665,18 +621,19 @@ class KMP3_3mesh(KMP3):
         self.khelper = make_kpts_helper(self.cell, self.kpts)
 
         #   Mesh info for the staggered mesh method
-        self.kpts_base = [kpts0, kpts1, kpts2]
+        #   NOTE: shifts[m-1] is the offset of mesh m from mesh 0
+        self.kpts_base = [kpts0] + [kpts0 + s for s in shifts]
         self.nkpts_base = len(kpts0)
         self.nkpts = len(self.kpts)
         self.nks_base = nks_base
-        self.shifts = [shift13, shift23]
+        self.shifts = shifts
 
         #   1. Indices of submesh k points in the global k point list
         #      NOTE: the x-th kpt in the i-th submesh has its index in self.kpts
         #      to be kpts_base_idx[i][x]
         kpts_bz = minimum_image(self.cell, self.kpts)
         self.kpts_base_idx = []
-        for i in range(3):
+        for i in range(nmesh):
             kpts_i_bz = minimum_image(self.cell, self.kpts_base[i])
             tmp = [ np.asarray(np.sum((kpts_bz - k0)**2, axis=-1) < 1e-10).nonzero()[0] for k0 in kpts_i_bz]
             self.kpts_base_idx.append( np.concatenate(tmp).astype(int) )
@@ -684,20 +641,19 @@ class KMP3_3mesh(KMP3):
                 len(self.kpts_base_idx[-1]) != self.nkpts_base or
                 len(np.unique(self.kpts_base_idx[-1])) != self.nkpts_base
             ):
-                log = logger.Logger(self.stdout, self.verbose)
-                log.warn('Cannot locate the provided occupied/virtual submeshes in the large k-point mesh')
+                log.warn('Cannot locate the provided staggered submeshes in the large k-point mesh')
                 raise RuntimeError
-        for imesh in range(3):
+        for imesh in range(nmesh):
             for jmesh in range(imesh):
                 if np.intersect1d(
                     self.kpts_base_idx[imesh], self.kpts_base_idx[jmesh]
                 ).size:
-                    raise ValueError('three staggered submeshes must be disjoint')
+                    raise ValueError('staggered submeshes must be disjoint')
 
         #   2. Indexing info of the global k-point list in each submesh
         #      NOTE: kpts[p] is the 'self.idx_base[i][p]'-th k point in the ith submesh
         self.idx_base = []
-        for i in range(3):
+        for i in range(nmesh):
             tmp = -1 * np.ones(self.nkpts, dtype=int)
             tmp[self.kpts_base_idx[i]] = np.arange(self.nkpts_base)
             self.idx_base.append( tmp[:] )
@@ -705,17 +661,12 @@ class KMP3_3mesh(KMP3):
         #   3. Index of the submesh where each k-point belongs to
         #      NOTE: kpts[p] is in the 'self.flag_base[p]'-th submesh
         self.flag_base = -1*np.ones(self.nkpts, dtype = int)
-        for i in range(3):
+        for i in range(nmesh):
             self.flag_base[ self.kpts_base_idx[i] ] = i
 
-        self._mesh_mp3_amp = (0, 0, 1, 2)
-        # self._mesh_mp3_amp = (1, 2, 0, 0)
-        # self._mesh_mp3_amp = (0, 0, 2, 1)
-        # self._mesh_mp3_amp = (1, 1, 0, 2)
-        self._mesh_mp2_amp, self._mesh_term, self._mesh_eri = \
-            mesh_config_mp3( self._mesh_mp3_amp )
-
-        #   Madelung correction
+        #   Madelung correction.  Every staggered transfer mesh with a
+        #   1/|q|^2 singularity is shifted by +-1/nmesh of a mesh spacing, and
+        #   the correction is even in the shift, so one constant suffices.
         self.madelung = madelung
         if self.madelung:
             self.madelung_constant = -madelung_stagger_adaptive(
@@ -724,44 +675,73 @@ class KMP3_3mesh(KMP3):
         else:
             self.madelung_constant = 0.0
 
-        # c0 = -madelung_stagger(self.cell, self.nks_base, self.shifts[0])
-        # c1 = -madelung_stagger_direct(self.cell, self.nks_base, self.shifts[0])
-        # c2 = -madelung_stagger_adaptive(self.cell, self.nks_base, self.shifts[0])
-        # logger.info(self, f"three madelung {c0}, {c1}, {c2}")
-
-
-
-
-    # double_amplitude = mp3_amplitude_3mesh
     double_amplitude = mp3_amplitude_3mesh_efficient
     correlation_energy = mp3_energy_3mesh
 
+    def set_mesh_config(self, mesh_mp3_amp, mesh_term):
+        """Set the external amplitude meshes and internal assignments.
+
+        ``mesh_mp3_amp = (mi, mj, ma, mb)`` places ``T_IJ^AB``, which also
+        fixes the energy quadrature.  ``mesh_term`` lists the eight internal
+        assignments in the order documented in :func:`mesh_config_mp3`.
+        """
+        nmesh = self._nmesh
+        self._mesh_mp3_amp = tuple(m % nmesh for m in mesh_mp3_amp)
+        self._mesh_term = [tuple(m % nmesh for m in term) for term in mesh_term]
+        self._mesh_eri = mesh_blocks_mp3(self._mesh_mp3_amp, self._mesh_term, nmesh)
+        self._mesh_mp2_amp = self._mesh_eri["oovv"]
+        return self
 
     def ao2mo(self, mo_coeff=None, mo_energy=None):
         return _ERIS_3mesh(self, mo_coeff, mo_energy)
 
     def mesh2idx(self, mp, mq, mr):
-        return (mp%3) + 3 * (mq%3) + 9* (mr%3)
+        n = self._nmesh
+        return (mp%n) + n * (mq%n) + n*n * (mr%n)
 
     def idx2mesh(self, idx):
-        mp = idx % 3
-        mq = (idx // 3) % 3
-        mr = (idx // 9) % 3
+        n = self._nmesh
+        mp = idx % n
+        mq = (idx // n) % n
+        mr = (idx // (n*n)) % n
         return mp, mq, mr
 
+class KMP3_3mesh(_KMP3_nmesh):
+    """Three-mesh staggered restricted MP3.
 
-def _mem_usage(nkpts, nocc, nvir):
+    ``flag_submesh=True`` uses three commensurate submeshes of the SCF mesh;
+    otherwise the method evaluates non-SCF band orbitals on three shifted
+    meshes.  ``scheme`` selects the energy quadrature: ``'occ'`` samples
+    ``T_IJ^AB`` with ``I, J`` on mesh 0 and ``A, B`` on meshes 1 and 2;
+    ``'vir'`` places ``A, B`` on mesh 0 and ``I, J`` on meshes 1 and 2.  The
+    source method's adaptive Madelung correction is disabled by default and
+    can be enabled with ``madelung=True``.
+    """
+
+    _nmesh = 3
+    _schemes = {'occ': (0, 0, 1, 2), 'vir': (1, 2, 0, 0)}
+
+    def __init__(self, mf, frozen=None, flag_submesh=False, nks_mp=None,
+                 madelung=False, scheme='occ'):
+        if scheme not in self._schemes:
+            raise ValueError("scheme must be 'occ' or 'vir'")
+        _KMP3_nmesh.__init__(self, mf, frozen, flag_submesh, nks_mp, madelung)
+        self.scheme = scheme
+        mesh_mp3_amp = self._schemes[scheme]
+        self.set_mesh_config(mesh_mp3_amp, mesh_config_mp3(mesh_mp3_amp))
+
+
+def _mem_usage(nkpts, nocc, nvir, mesh_eri):
     incore = 0
-    #   MP2 amp
-    incore += 5 * nkpts ** 3 * (nocc**2 * nvir**2)
-    #   oovv
-    incore += 5 * nkpts ** 3 * (nocc**2 * nvir**2)
+    nov = nocc**2 * nvir**2
+    #   MP2 amp and oovv
+    incore += 2 * len(mesh_eri["oovv"]) * nkpts ** 3 * nov
     #   oooo
-    incore += nkpts ** 3 * nocc**4
+    incore += len(mesh_eri["oooo"]) * nkpts ** 3 * nocc**4
     #   vvvv
-    incore += nkpts ** 3 * nvir**4
+    incore += len(mesh_eri["vvvv"]) * nkpts ** 3 * nvir**4
     #   voov/ovov
-    incore += 4 * nkpts ** 3 * (nocc**2 * nvir**2)
+    incore += (len(mesh_eri["voov"]) + len(mesh_eri["ovov"])) * nkpts ** 3 * nov
 
     # Roughly, factor of two for intermediates and factor of two
     # for safety (temp arrays, copying, etc)
@@ -769,6 +749,7 @@ def _mem_usage(nkpts, nocc, nvir):
     # TODO: Improve incore estimate and add outcore estimate
     outcore = basic = incore
     return incore * 16 / 1e6, outcore * 16 / 1e6, basic * 16 / 1e6
+
 
 class _ERIS_3mesh:
     #   construct ERIs <pq|rs> with all possible sampling of pqrs on the submeshes specified
@@ -811,14 +792,14 @@ class _ERIS_3mesh:
             logger.warn(cc, 'HOMO-LUMO gap %s too small for CC and MBPT. '
                             'May cause issues in convergence.', gap)
 
-        mem_incore, mem_outcore, mem_basic = _mem_usage(nkpts_base, nocc, nvir)
+        mem_incore, mem_outcore, mem_basic = _mem_usage(nkpts_base, nocc, nvir, cc._mesh_eri)
         mem_now = lib.current_memory()[0]
 
         fao2mo = cc.with_df.ao2mo
         kconserv = cc.khelper.kconserv
         kpts_base_idx = cc.kpts_base_idx
 
-        log.info("Three-mesh ERI memory estimate %.1f MB; current use %.1f MB; "
+        log.info("Staggered-mesh ERI memory estimate %.1f MB; current use %.1f MB; "
                  "limit %.1f MB", mem_incore, mem_now, max_memory)
         if (method == 'incore' and (mem_incore + mem_now < max_memory)
                 or cell.incore_anyway):
@@ -925,8 +906,8 @@ class _ERIS_3mesh:
             time1 = log.timer_debug1('vvvv ERI', *time1)
 
             log.info("ERI evaluation time: %.3f" % (time.time() - start))
-            log.timer('MP3 3-mesh integral transformation', *time0)
+            log.timer('MP3 staggered-mesh integral transformation', *time0)
         else:
             raise MemoryError(
-                'In-core three-mesh KMP3 integral storage exceeds max_memory; '
+                'In-core staggered-mesh KMP3 integral storage exceeds max_memory; '
                 'increase the memory limit or reduce the k-point/orbital space.')

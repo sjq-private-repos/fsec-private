@@ -11,6 +11,11 @@ under `fsec.staggered_mesh.mp`, `fsec.staggered_mesh.cc`, and
 for examples, API migration notes, and numerical validation, including the
 unresolved historical H₂ GW reference discrepancy.
 
+Standard periodic G0W0-AC with scalar Ewald corrections is available as
+`fsec.standard.krgwac_ewald.KRGWAC`. See the
+[method guide](docs/krgwac_ewald.md) for the supported systems, correction
+conventions, and a comparison with spherical and uncorrected calculations.
+
 ## Installation
 
 FSEC requires Python 3.9 or newer. Clone the repository and install it with
