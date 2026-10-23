@@ -11,10 +11,12 @@ under `fsec.staggered_mesh.mp`, `fsec.staggered_mesh.cc`, and
 for examples, API migration notes, and numerical validation, including the
 unresolved historical H₂ GW reference discrepancy.
 
-Standard periodic G0W0-AC with scalar Ewald corrections is available as
-`fsec.standard.krgwac_ewald.KRGWAC`. See the
+Standard periodic G0W0-AC with lattice-aware q → 0 corrections is available as
+`fsec.standard.KRGWAC_ewald`: Gaussian auxiliary functions (FHI-gap, the
+default), the Madelung constant, or PySCF's spherical integration, with an
+optional Lebedev average of the k·p dielectric head and wings. See the
 [method guide](docs/krgwac_ewald.md) for the supported systems, correction
-conventions, and a comparison with spherical and uncorrected calculations.
+conventions, and comparisons with uncorrected calculations.
 
 ## Installation
 

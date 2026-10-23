@@ -1,146 +1,153 @@
-# Scalar Ewald corrections for periodic G0W0-AC
+# G0W0-AC with auxiliary-function and Madelung q → 0 corrections
 
-`fsec.standard.krgwac_ewald.KRGWAC` subclasses the PySCF 2.14 `KRGWAC`
-implementation and adds a scalar Ewald correction to exchange and the
-correlation self-energy. The ordinary density-fitted correlation self-energy,
-analytic continuation, and quasiparticle solvers remain PySCF's routines. The
-Ewald correction is added to the imaginary-axis self-energy before
-continuation.
+`fsec.standard.KRGWAC_ewald` is PySCF's `pyscf.pbc.gw.krgw_ac.KRGWAC`, but with
+a choice of how the integrable q → 0 Coulomb singularities of the exchange and
+correlation self-energies are corrected. Everything else (DF integrals,
+frequency grid, analytic continuation, QP solver) is PySCF's code. See
+[Examples and checks](#examples-and-checks) for runnable comparisons.
 
 ```python
-from fsec.standard import krgwac_ewald
+from fsec.standard import KRGWAC_ewald
 
-gw = krgwac_ewald.KRGWAC(mf, frozen=None)
-gw.fc_method = 'ewald'       # default; use 'spherical' for PySCF's correction
-gw.kernel(orbs=[0, 1], kptlist=[0])
+gw = KRGWAC_ewald(kmf)      # kmf: converged KRKS/KRHF with a GDF/RSDF with_df
+gw.fc_method = 'aux'        # 'aux' (default), 'madelung', or 'sphere'
+gw.fc_sigma = None          # Gaussian width for 'aux'; None = FHI-gap choice
+gw.fc_qdirs = None          # None = PySCF's q direction; or a Lebedev size, e.g. 26
+gw.kernel(orbs=..., kptlist=...)
 ```
 
-Set `gw.fc = False` to disable both exchange and correlation finite-size
-corrections. `fc_method='spherical'` delegates directly to upstream PySCF,
-including its existing `fc_grid` treatment. Ewald mode also preserves those
-`fc_grid` directions when it averages the long-wavelength dielectric head.
+With `fc_method='sphere'` and `fc_qdirs=None`, the QP energies agree with
+PySCF's `KRGWAC(fc=True)`. They differ only where PySCF is wrong: with
+`fc_grid=True` (the accumulation bug described below), and for non-contiguous
+or reordered `orbs` (see [Implementation notes](#implementation-notes)).
 
-## Correction and conventions
+## Geometric constants
 
-The complete uniform Monkhorst-Pack mesh is passed once to
-`pyscf.pbc.tools.madelung(cell, kpts=gw.kpts, omega=0)`. Its scalar result
-`chi` has units of inverse Bohr. Ewald exchange adds `-chi` to the diagonal
-matrix elements of active occupied orbitals. The exchange matrix itself is
-computed from the uncorrected upstream DF exchange routine, so the SCF object
-is not changed and no spherical exchange term is combined with `-chi`.
+The singular q → 0 parts of the self-energy are corrected by two scalars:
 
-For a cubic integration supercell of side `L` Bohr,
-`chi = 2.837297479480619 / L`, so this shifts occupied exchange downwards.
-The full supercell geometry already contains the mesh normalization: there
-is no extra factor of `1/nkpts` in either Ewald correction. Virtual exchange
-and all off-diagonal exchange entries are unchanged.
+- `c_head` multiplies `ε⁻¹₀₀(0, iν) − 1` in the correlation head correction
+  (Zhu & Chan Eq. 43). It is also subtracted from the occupied diagonal of Σx.
+- `c_wing` multiplies the wing term `Wn_P0` (Zhu & Chan Eq. 45).
 
-For each imaginary-axis self-energy sample `z`, the diagonal correlation
-correction is
+In FHI-gap notation (Jiang et al. 2013, App. B, Eqs. B.5–B.6) these are
+`c_head = 4π Cs2/Ω` and `c_wing = sqrt(4π/Ω) Cs1`. Here Ω is the unit-cell
+volume, V = N_k Ω, and k runs over the Γ-centred supercell reciprocal lattice
+(k = q + G).
 
-\[
-\Delta\Sigma_c^{nk}(z) = -\frac{\chi}{\pi}
-\sum_l w_l\,[h_l-1]\,
-\frac{z-\epsilon_{nk}}
-     {(z-\epsilon_{nk})^2+\nu_l^2}.
-\]
+| `fc_method` | `c_head` | `c_wing / sqrt(4πΩ)` |
+| --- | --- | --- |
+| `'sphere'` (PySCF) | `2 q0/π` | `q0²/(4π²)` |
+| `'aux'` | `1/sqrt(πβ) − (1/V) Σ'_k 4π e^{−βk²}/k²` | `1/(4π²β) − (1/V) Σ'_k e^{−βk²}/k` |
+| `'madelung'` (β → 0) | `tools.madelung(cell, kpts)` | Ewald-split 1/k constant (below) |
 
-Here `nu_l` and `w_l` are PySCF's scaled Gauss-Legendre quadrature points and
-weights. `h_l` is the average of the inverse dielectric head at `i nu_l` over
-the directions selected by `fc_grid`. Each direction uses PySCF's
-long-wavelength head and wing response;
-the head is inverted with the Schur complement of the dielectric body, so
-dielectric-wing coupling is included. The scalar direction average is a
-screening approximation: it does not retain the angular dependence of the
-screened Coulomb singularity in the Ewald sum.
+where `q0 = (6π²/V)^{1/3}`.
 
-`fc_grid=False` samples the first reciprocal-lattice direction;
-`fc_grid=True` averages PySCF's 26 positive-octant directions. These are
-long-wavelength k.p responses, not finite-q extrapolations. The 26 transition
-densities are constructed from three basis directions using their exact
-linearity in q. This scalar treatment is not a tensor-screened Ewald sum and
-may leave substantial errors in anisotropic systems. When `h_l=1` the
-correlation correction is zero. For positive `chi`, screening below unity,
-and a real `z` inside the gap, the occupied correlation correction is
-positive and the virtual correction is negative.
+- **Default β.** `fc_sigma=None` uses FHI-gap's `β = (Ω/6π²)^{1/3}`, taken
+  literally in atomic units. The paper derives it from `βR_BZ = 1`, which is
+  dimensionally loose because β multiplies `|q+G|²`. A custom width `fc_sigma`
+  (bohr⁻¹) sets `β = 1/(2σ²)`, so the Gaussian is `e^{−q²/2σ²}`.
+- **q = 0 term.** As in Eq. B.6, the q = 0 term of the lattice sum keeps only
+  G ≠ 0. The constant term of `e^{−βq²}/q²` at q → 0 is therefore dropped, and
+  the 'aux' head is exactly `madelung − 4πβ/V`, up to an exponentially small
+  real-space tail. So σ affects the head and exchange only at O(1/N_k), and
+  σ → ∞ recovers the Madelung constant.
+- **1/k Madelung constant.** It is evaluated by splitting
+  `1/k = erfc(√τ k)/k + erf(√τ k)/k`:
 
-The leading self-energy wing has the form
-`A(q) = exp(-alpha*q**2) * (b dot q) / q**2`, with reciprocal-lattice
-periodization. It is odd under `q -> -q`. The supported complete uniform
-meshes have symmetric transfer meshes, so its integral and paired discrete
-sum vanish; Ewald mode therefore adds no separate leading-wing term and does
-not reuse PySCF's spherical wing correction. Higher-order wing contributions
-are left uncorrected.
+  ```
+  C1 = 1/(8π²τ) − (1/V) Σ'_k erfc(√τ k)/k − Σ'_R e^{−R²/4τ}/(2π²R²) + 2 sqrt(τ/π)/V
+  ```
 
-Explicitly, periodization means summing `A(q+G)` over reciprocal-lattice
-vectors `G`. The odd terms cancel on pairs of transfer points, including for
-uniformly shifted orbital meshes. This cancellation concerns the separate
-self-energy wing; it does not remove the dielectric wings in the Schur
-complement. The remaining regular wing contribution discussed by Freysoldt
-et al. scales with the omitted reciprocal-space cell volume and must still
-be checked by mesh convergence.
+  R runs over the supercell lattice. C1 does not depend on τ, and the 'aux'
+  value tends to it as β → 0.
+- **Cost of large σ.** The 'aux' lattice sums are cut off at `βk² = 40`, so the
+  number of terms grows as `σ³`. For very large σ, use `'madelung'`.
+
+## Direction-averaged k·p dielectric head and wings
+
+PySCF builds `ε⁻¹₀₀` and `ε⁻¹_P0` from k·p pair densities along a single
+direction: b₁, or with `fc_grid=True` 26 positive-octant points. In k·p,
+`qij(q)` is exactly linear in q. So the three Cartesian components give
+`ε⁻¹₀₀(q̂) = 1/(q̂ᵀ M q̂)` for any direction, with
+
+```
+M_ab = δ_ab − 4π P_ab − w_a* (1 − Π)⁻¹ w_b,    P_ab = 4/N_k Σ eia qij_a* qij_b,
+ε_P0(q̂) = Σ_a q̂_a w_a,    ε⁻¹_P0(q̂) = −ε⁻¹₀₀(q̂) (1 − Π)⁻¹ ε_P0(q̂).
+```
+
+`fc_qdirs = n` averages these over an n-point Lebedev grid from
+`pyscf.dft.LebedevGrid`; 6 gives ±x, ±y, ±z. The extra cost is negligible.
+
+- **Wings vanish.** `ε⁻¹_P0(q̂)` is odd in q̂. Its 1/q singularity integrates
+  to zero over the sphere, and it sums to zero on an inversion-symmetric k-mesh.
+  Any Lebedev average therefore gives a zero wing correction, up to rounding.
+  PySCF's nonzero wing term comes from sampling only one direction.
+- **Anisotropic head.** The averaged head `⟨ε⁻¹₀₀⟩` multiplies the isotropic
+  `c_head`. That is exact for the Brillouin-zone integral and approximate for
+  the anisotropic part of the lattice sum. An exact treatment would place
+  `1/(k̂ᵀMk̂)` inside the auxiliary sums; this is not implemented.
+- **PySCF `fc_grid` bug.** With `fc_grid=True`, PySCF accumulates `ε⁻¹_P0`
+  using the running sum of `ε⁻¹₀₀` rather than the per-point value. Here the
+  same 26 directions are averaged with per-point values.
+- **Pseudopotential term.** The k·p matrix elements use only ∇. They omit the
+  nonlocal-pseudopotential commutator, as in PySCF.
 
 ## Supported scope
 
-Ewald mode supports 3D restricted, gapped systems with integer occupations,
-a complete uniform Monkhorst-Pack mesh (including a uniform shift), and GDF
-integrals, including RSDF, with the full Coulomb interaction. Mixed DF,
-smearing, spinor/unrestricted references, and symmetry-reduced meshes are
-outside this scope. `kptlist` can select any output subset; it does not
-change `chi`, which is evaluated from the full mean-field mesh. Corrected
-out-of-core calculations and unsupported Ewald setups raise an explicit
-exception. The uncorrected and spherical paths keep upstream PySCF behavior.
+With `fc=True`, `kernel` checks that the system is in scope and raises
+otherwise. It accepts:
 
-Ewald mode builds any missing exchange DF blocks in a private cache without
-changing the mean-field DF object. Noncontiguous output bands are evaluated
-through their containing contiguous range and selected afterwards to avoid
-PySCF 2.14's advanced-indexing limitations. Frozen orbital labels and output
-k-point labels otherwise follow upstream conventions. With `fullsigma=True`
-only correlation diagonals receive the correction; stored `sigmaI` (when
-`rdm=True`) and `writefile` output contain the corrected samples.
+- 3D cells with the full Coulomb interaction (`cell.omega == 0`);
+- GDF or RSDF integrals (not MDF);
+- restricted scalar orbitals with integer occupations;
+- a gap, with the same occupied/virtual active space at every k-point;
+- a complete uniform Monkhorst–Pack mesh, which may be shifted or reordered.
 
-## Running the comparison and checks
+An incomplete or duplicated mesh raises `ValueError`; the other cases raise
+`NotImplementedError`. As in PySCF, metallic (smearing) references switch the
+correction off. `kptlist` selects output k-points only: the constants always
+use the full mean-field mesh.
 
-Run `python examples/krgwac_ewald_comparison.py` for all three modes on one
-small periodic H2 reference. The bond has a component along the default
-dielectric sampling direction, so the head correction is nonzero. The
-example explicitly builds full DF blocks because upstream spherical and
-uncorrected GW require them even after a pure-DFT SCF calculation.
+## Implementation notes
 
-The focused tests are in `fsec/standard/tests/test_krgwac_ewald.py`.
-Periodic SCF/GW tests use `-m slow`. The additional mesh comparison is opt-in:
+- **Raw self-energy.** `kernel` calls PySCF's `get_sigma`/`get_sigma_outcore`
+  with `fc` off. `get_sigma_fc` then adds the head and wing corrections, which
+  need only the q = 0 DF block. The finite-size correction therefore also works
+  with `outcore=True`.
+- **Private DF cache.** Pure-DFT SCF often builds only the (k,k) Coulomb
+  blocks, but GW also needs the (k,k') blocks. If the DF object is unbuilt or
+  J-only, `kernel` builds a full copy in a private temporary file and leaves the
+  SCF's DF object unchanged.
+- **Orbital selection.** PySCF's `get_sigma` mishandles non-contiguous or
+  reordered `orbs`. `kernel` therefore evaluates the containing contiguous range
+  and selects the requested order afterwards. Frozen-orbital labels and output
+  k-points otherwise follow upstream conventions.
+- **`fullsigma`.** With `fullsigma=True`, only the diagonal receives the
+  correlation correction. The stored `sigmaI` (when `rdm=True`) and the
+  `writefile` output contain the corrected values.
+
+## Examples and checks
+
+- [krgwac_ewald_comparison.py](../examples/krgwac_ewald_comparison.py)
+  compares `'aux'` (with and without a 26-point direction average),
+  `'madelung'`, `'sphere'` and the uncorrected QP energies for a small H₂
+  cell on one mesh.
+- [krgwac_ewald.py](../examples/krgwac_ewald.py) prints the diamond Γ-point
+  gap on 2³ and 3³ meshes for every `fc_method` × `fc_qdirs ∈ {None, 26}`,
+  together with `c_head` and `c_wing`.
+
+The tests are in `fsec/standard/tests/test_krgwac_ewald.py`. The kernel-level
+checks of the full self-energy are marked slow:
 
 ```bash
-FSEC_RUN_KRGWAC_EWALD_MESH_STUDY=1 python -m pytest -s -m slow \
-    fsec/standard/tests/test_krgwac_ewald.py -k mesh_study
+python -m pytest fsec/standard/tests/test_krgwac_ewald.py            # fast checks
+python -m pytest -m slow fsec/standard/tests/test_krgwac_ewald.py    # full self-energy checks
 ```
-
-It prints the residual difference between `1x1x1` and `2x1x1` QP gaps for
-all three modes. This small anisotropic mesh study is a diagnostic, not a
-claim of bulk convergence or universally monotonic improvement. For the
-local `fsec-312` environment, include its `lib` directory in
-`LD_LIBRARY_PATH`; one BLAS/OpenMP thread is sufficient for these small cells.
-
-The opt-in study with PySCF 2.14.0, PBE/GTH-SZV, 16 integration points,
-six Pade points, and linearized QP energies gave:
-
-| Mode | Gap(1x1x1) minus gap(2x1x1), Ha |
-| --- | ---: |
-| Ewald | 0.06895421 |
-| Spherical | 0.00834521 |
-| Uncorrected | -0.10960141 |
-
-The two meshes remain far from a bulk convergence study. In particular,
-Ewald is not the smallest residual in this example; scalar screening and
-regular wing/body errors remain relevant.
 
 ## References
 
-- C.-N. Yeh et al., *Phys. Rev. B* **106**, 085121 (2022), Eqs. 49–50,
-  [accepted manuscript](https://link.aps.org/accepted/10.1103/PhysRevB.106.085121).
-- C. Freysoldt et al., “Dielectric anisotropy in the GW space-time method,”
-  Sec. 3.3, [article PDF](https://juser.fz-juelich.de/record/55618/files/aniso-gwst.pdf?version=1).
-
-The first reference motivates the Madelung head correction to dynamic GW and
-the static exchange correction. The second discusses why the leading wing is
-odd and its isotropic average vanishes.
+- T. Zhu and G. K.-L. Chan, J. Chem. Theory Comput. 17, 727 (2021).
+- H. Jiang et al., Comput. Phys. Commun. 184, 348 (2013), Appendix B.
+- S. Massidda, M. Posternak, and A. Baldereschi, Phys. Rev. B 48, 5058 (1993).
+- C.-N. Yeh, J. Shee, Q. Sun, E. Gull, and D. Zgid, Phys. Rev. B 106, 085121 (2022).
+- C. Freysoldt et al., Comput. Phys. Commun. 176, 1 (2007).

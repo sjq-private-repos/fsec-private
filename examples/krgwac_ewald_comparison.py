@@ -1,9 +1,9 @@
-"""Compare Ewald, spherical, and uncorrected periodic G0W0-AC results."""
+"""Compare auxiliary-function, Madelung, spherical, and uncorrected periodic G0W0-AC results."""
 
 import numpy as np
 from pyscf.pbc import df, dft, gto
 
-from fsec.standard import krgwac_ewald
+from fsec.standard import KRGWAC_ewald
 
 
 cell = gto.Cell()
@@ -25,20 +25,24 @@ mf.conv_tol = 1e-9
 mf.kernel()
 if not mf.converged:
     raise RuntimeError('The reference SCF calculation did not converge')
-# SCF builds diagonal J blocks; KRGWAC also needs off-diagonal k-point pairs.
+# SCF builds diagonal J blocks only. Building every k-point pair once lets all
+# GW runs share it; otherwise each KRGWAC_ewald builds its own private copy.
 mf.with_df.build(j_only=False)
 
 settings = (
-    ('ewald', 'ewald', True),
-    ('spherical', 'spherical', True),
-    ('uncorrected', 'ewald', False),
+    ('aux', 'aux', None, True),
+    ('aux, 26 q dirs', 'aux', 26, True),
+    ('madelung', 'madelung', None, True),
+    ('sphere', 'sphere', None, True),
+    ('uncorrected', 'aux', None, False),
 )
-for label, method, enabled in settings:
-    gw = krgwac_ewald.KRGWAC(mf, frozen=None)
+for label, method, qdirs, enabled in settings:
+    gw = KRGWAC_ewald(mf, frozen=None)
     gw.fc_method = method
+    gw.fc_qdirs = qdirs
     gw.fc = enabled
     gw.nw = 40
     gw.ac_iw_cutoff = None
     gw.ac_pade_npts = 12
     gw.kernel(orbs=[0, 1], kptlist=[0])
-    print(f'{label:12s} QP energies at k=0 (Ha): {gw.mo_energy[0]}')
+    print(f'{label:16s} QP energies at k=0 (Ha): {gw.mo_energy[0]}')
