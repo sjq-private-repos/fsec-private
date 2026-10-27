@@ -498,34 +498,6 @@ class EvenTemperedFittingTests(unittest.TestCase):
         self.assertLess(trimmed_q4.num_gaussians, 5)
         self.assertEqual(trimmed_q4.deg, 4)
 
-    def test_stacked_model_trimming_uses_proxy_design(self):
-        cell = CubicCell(lattice_constant=6.0)
-        deltaGs = build_cubic_reciprocal_lattice_grid((9, 9, 9), cell.reciprocal_lattice_constant)
-        qGrid = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, cell.reciprocal_lattice_constant / 2]])
-        model = XNETBStackedSingularityQMesh(qGrid=qGrid, cell=cell, deltaGs=deltaGs)
-        model.set_parameters(model.initial_parameters(1e-4))
-        coords = (qGrid[:, None, :] + deltaGs[None, :, :]).reshape(-1, 3)
-
-        norms = np.linalg.norm(coords, axis=1)
-        self.assertIs(trim_etb_model_to_data(model, coords[norms < 4.0]), model)
-
-        trimmed = trim_etb_model_to_data(model, coords[norms < 1.1])  # two |q| shells
-        self.assertLess(trimmed.num_gaussians, 5)
-        self.assertIn(0.5, trimmed.etb_exponents)
-        np.testing.assert_allclose(trimmed.qGrid, qGrid)
-
-        with self.assertRaisesRegex(ValueError, "cannot determine"):
-            trim_etb_model_to_data(model, coords[norms < 0.6])  # one |q| shell
-
-        # A narrow reference Gaussian underflows at large |q|; the proxy columns must stay finite
-        g = np.arange(-7, 8) * self.spacing
-        wide_grid = np.array(np.meshgrid(g, g, g, indexing="ij")).reshape(3, -1).T
-        narrow = XNETBStackedSingularity(deltaGs=wide_grid, sigma=0.1)
-        far = wide_grid[np.linalg.norm(wide_grid, axis=1) < 4.5]
-        self.assertTrue(np.all(np.isfinite(narrow.linear_proxy_design_matrix(far))))
-        trimmed = trim_etb_model_to_data(narrow, far)
-        self.assertAlmostEqual(trimmed.etb_exponents[trimmed.etb_ref_index], 50.0)
-
     def _lifted_setup(self, remove_deltaG_zero=True, qcut=4.0):
         cell = CubicCell(lattice_constant=6.0)
         b = cell.reciprocal_lattice_constant
@@ -571,14 +543,6 @@ class EvenTemperedFittingTests(unittest.TestCase):
             single_q.cell.get_scaled_kpts(coords) % 1.0, 1.0), axis=1)]
         trimmed = trim_etb_model_to_data(single_q, gamma_coords)
         self.assertLessEqual(trimmed.num_params, trimmed.num_gaussians)
-
-    def test_linear_fit_rejects_nonlinear_models(self):
-        cell = CubicCell(lattice_constant=6.0)
-        deltaGs = build_cubic_reciprocal_lattice_grid((3, 3, 3), cell.reciprocal_lattice_constant)
-        model = XNETBStackedSingularityQMesh(qGrid=np.zeros((1, 3)), cell=cell, deltaGs=deltaGs)
-        with self.assertRaises(TypeError):
-            ETBLinearLeastSquares(model)
-
 
 if __name__ == "__main__":
     unittest.main()

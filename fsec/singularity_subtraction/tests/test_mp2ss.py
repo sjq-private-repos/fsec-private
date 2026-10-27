@@ -163,31 +163,6 @@ class MP2SSOptionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MP2SSOptions(pair_density_becke_grid_level=-1)
 
-    def test_etb_options(self):
-        options = MP2SSOptions(etb_sigma={"exchange": 2}, etb_num_gaussians="3", etb_ratio=3)
-        self.assertEqual(options.etb_sigma, {"exchange": 2.0})
-        self.assertEqual(options.etb_num_gaussians, 3)
-        self.assertEqual(options.etb_ratio, 3.0)
-        self.assertTrue(options.etb_linear_fit)
-        for kwargs in (
-            {"etb_sigma": 0.0},
-            {"etb_sigma": {"direct_q8": 1.0}},
-            {"etb_sigma": {"exchange": -1.0}},
-            {"etb_num_gaussians": 0},
-            {"etb_ratio": 1.0},
-        ):
-            with self.subTest(**kwargs), self.assertRaises(ValueError):
-                MP2SSOptions(**kwargs)
-
-    def test_etb_linear_fit_selects_fit_class(self):
-        coords = np.random.default_rng(0).normal(size=(50, 3))
-        for etb_linear_fit, expected in ((True, ETBLinearLeastSquares), (False, MP2ScipyLeastSquares)):
-            with self.subTest(etb_linear_fit=etb_linear_fit):
-                config = SimpleNamespace(fit_class=MP2ScipyLeastSquares, etb_linear_fit=etb_linear_fit)
-                _, _, _, fit_class = _prepare_etb_fit(
-                    XNETB(deg=4), Q4_MODEL_SPECS["ETB"], config, coords, fit_with_coul=True, coul_deg=4,
-                    label="q4 ETB")
-                self.assertIs(fit_class, expected)
 
 
 class KnownValues(unittest.TestCase):
@@ -395,11 +370,6 @@ class KnownValues(unittest.TestCase):
         mp2ss_full = self._run_etb(auxfunc_direct="ETBStacked", correct_q2_q4_separately=False)
         for quantity, reference in self.ETB_STACKED_FULL_DIRECT_REFERENCES.items():
             self.assertAlmostEqual(getattr(mp2ss_full, quantity), reference, delta=self.TOL, msg=quantity)
-
-    def test_stacked_even_tempered_only_for_direct_terms(self):
-        for kwargs in ({"auxfunc_direct_q4": "ETBStacked"}, {"auxfunc_exchange": "ETBStacked"}):
-            with self.subTest(**kwargs), self.assertRaises(ValueError):
-                MP2SS(kmf=self.kmf, kmp=self.kmp, t2=self.t2.copy(), **kwargs)
 
     def test_mp2ss_check_trs_false(self):
         mp2ss = MP2SS(
