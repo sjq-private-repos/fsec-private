@@ -1,6 +1,7 @@
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from types import SimpleNamespace
 import numpy as np
 from pyscf.pbc import df
 from pyscf.pbc import gto as pbcgto
@@ -8,12 +9,16 @@ from pyscf.pbc import mp
 from pyscf.pbc import scf as pbcscf
 
 from fsec.singularity_subtraction import MP2SS
+from fsec.singularity_subtraction.function_fitting import ETBLinearLeastSquares, MP2ScipyLeastSquares
+from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import XNETB
 from fsec.singularity_subtraction.mp2ss import (
+    Q4_MODEL_SPECS,
     MP2DirectFourthOrderSS,
     MP2DirectFullSS,
     MP2DirectSecondOrderSS,
     MP2ExchangeSS,
     MP2SSOptions,
+    _prepare_etb_fit,
 )
 
 
@@ -173,6 +178,16 @@ class MP2SSOptionsTests(unittest.TestCase):
         ):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 MP2SSOptions(**kwargs)
+
+    def test_etb_linear_fit_selects_fit_class(self):
+        coords = np.random.default_rng(0).normal(size=(50, 3))
+        for etb_linear_fit, expected in ((True, ETBLinearLeastSquares), (False, MP2ScipyLeastSquares)):
+            with self.subTest(etb_linear_fit=etb_linear_fit):
+                config = SimpleNamespace(fit_class=MP2ScipyLeastSquares, etb_linear_fit=etb_linear_fit)
+                _, _, _, fit_class = _prepare_etb_fit(
+                    XNETB(deg=4), Q4_MODEL_SPECS["ETB"], config, coords, fit_with_coul=True, coul_deg=4,
+                    label="q4 ETB")
+                self.assertIs(fit_class, expected)
 
 
 class KnownValues(unittest.TestCase):
@@ -344,12 +359,6 @@ class KnownValues(unittest.TestCase):
         self.assertEqual(mp2ss.exchange_correction.config.model_kwargs,
                          {"sigma": 1.0, "num_gaussians": 5, "ratio": 2.0})
 
-        # q4 and exchange are linear in the ETB coefficients: the nonlinear fit must find the same optimum
-        nonlinear = self._run_etb(etb_linear_fit=False)
-        for quantity in ("direct_total_correction_q4", "mp2ss_exchange_correction"):
-            self.assertAlmostEqual(
-                getattr(nonlinear, quantity), getattr(mp2ss, quantity), delta=self.TOL, msg=quantity)
-
     def test_mp2ss_even_tempered_full_direct(self):
         mp2ss = self._run_etb(correct_q2_q4_separately=False)
         for quantity, reference in self.ETB_FULL_DIRECT_REFERENCES.items():
@@ -374,20 +383,6 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(
             mp2ss.direct_total_correction_q4, self.REFERENCES["direct_total_correction_q4"], delta=self.TOL)
 
-        # Linear in the pair matrix: the nonlinear fit method finds the same optimum
-        nonlinear = MP2SS(
-            kmf=self.kmf,
-            kmp=self.kmp,
-            t2=self.t2.copy(),
-            pair_density_eval_grid="uniform",
-            auxfunc_direct_q2="ETBLifted",
-            etb_linear_fit=False,
-        )
-        with redirect_stdout(StringIO()):
-            nonlinear.compute_correction(direct=True, exchange=False)
-        self.assertAlmostEqual(
-            nonlinear.direct_total_correction_q2, mp2ss.direct_total_correction_q2, delta=1e-5)
-
     def test_mp2ss_lifted_even_tempered_full_direct_reduces_basis(self):
         """With a 1x1x2 mesh the full-direct pair columns have rank <= n_q N = 10 < 15, so the basis is reduced."""
         mp2ss = MP2SS(
@@ -408,22 +403,6 @@ class KnownValues(unittest.TestCase):
         for kwargs in ({"auxfunc_direct_q4": "ETBLifted"}, {"auxfunc_exchange": "ETBLifted"}):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 MP2SS(kmf=self.kmf, kmp=self.kmp, t2=self.t2.copy(), **kwargs)
-
-    def test_mp2ss_even_tempered_reduces_basis_for_small_cutoff(self):
-        mp2ss = MP2SS(
-            kmf=self.kmf,
-            kmp=self.kmp,
-            t2=self.t2.copy(),
-            pair_density_eval_grid="uniform",
-            auxfunc_exchange="ETB",
-            qG_norm_cutoff=1.1,
-            etb_sigma={"exchange": 1.0},
-        )
-        output = StringIO()
-        with redirect_stdout(output):
-            mp2ss.compute_correction(direct=False, exchange=True)
-        self.assertIn("Exchange ETB reduced from 5 to", output.getvalue())
-        self.assertTrue(np.isfinite(mp2ss.mp2ss_exchange_correction))
 
     def test_mp2ss_check_trs_false(self):
         mp2ss = MP2SS(

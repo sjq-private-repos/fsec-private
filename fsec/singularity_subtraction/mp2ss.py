@@ -1072,7 +1072,11 @@ class MP2ExchangeSS(SingularitySubtraction):
                 coul_deg=2, label="Exchange ETB",
             )
         if config.fit_multipliers is not None:
-            fit_multipliers = config.fit_multipliers
+            if spec.get('etb') and len(config.fit_multipliers) != f_gauss.num_params:
+                print(f"WARNING: ignoring fit_multipliers of length {len(config.fit_multipliers)}; "
+                      f"the Exchange ETB basis has {f_gauss.num_params} parameters.")
+            else:
+                fit_multipliers = config.fit_multipliers
 
         f_gauss.set_parameters(initial_params)
         print("initial_params: ", initial_params)

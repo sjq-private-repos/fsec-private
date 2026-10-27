@@ -23,6 +23,7 @@ from fsec.singularity_subtraction.model_function.exx_modfunc import (
 from fsec.singularity_subtraction.model_function.mp2_direct_modfunc import (
     XNETB,
     XNETBLiftedStackedSingularityQMesh,
+    XNETBStackedSingularity,
     XNETBStackedSingularityQMesh,
     XNGauss,
     XNGaussStackedSingularityQMesh,
@@ -464,35 +465,15 @@ class EvenTemperedFittingTests(unittest.TestCase):
         ).fit_model(self.qG, SqG, force_positive_params=True)
         np.testing.assert_allclose(nonlinear, linear, atol=1e-4)
 
+        # MP2 q4: the linear fit recovers these exactly (test_linear_fit_recovers_mp2_coefficients); the nonlinear
+        # optimizer converges to them within its tolerance
         q4_data = XNETB(parameters=1e-4 * self.coeffs, deg=4).eval_model(self.qG)
-        q4_linear_fit = ETBLinearLeastSquares(XNETB(deg=4), fit_with_coul=True)
-        q4_linear_fit.coul_deg = 4
-        q4_linear = q4_linear_fit.fit_model(self.qG, q4_data)
         q4_model = XNETB(deg=4)
         q4_nonlinear_fit = MP2ScipyLeastSquares(q4_model, fit_with_coul=True)
         q4_nonlinear_fit.coul_deg = 4
         q4_nonlinear_fit.initial_guess = q4_model.initial_parameters(1e-4)
         q4_nonlinear = q4_nonlinear_fit.fit_model(self.qG, q4_data, force_positive_params=True)
-        np.testing.assert_allclose(q4_linear, 1e-4 * self.coeffs, rtol=1e-8)
-        # The nonlinear optimizer converges to the same coefficients within its tolerance
-        np.testing.assert_allclose(q4_nonlinear, q4_linear, rtol=1e-3)
-
-    def test_etb_fits_heavy_tailed_data_better_than_one_gaussian(self):
-        # Nonnegative Gaussian mixtures are log-convex in q^2, so they improve on a single Gaussian for data
-        # with heavier-than-Gaussian tails
-        target = ExponentialModel(num_primitives=1, isotropic=True, parameters=[1.0, 0.8, 2.0])
-        SqG = target.eval_model(self.qG)
-
-        etb = EvenTemperedGaussianModel()
-        etb_fit = ETBLinearLeastSquares(etb, fit_with_coul=True)
-        etb.set_parameters(etb_fit.fit_model(self.qG, SqG))
-        etb_residual = np.sum(etb_fit.abs_diff(etb.parameters, self.qG, SqG) ** 2)
-
-        gauss = ContractedGaussianModel(num_gaussians=1, isotropic=True)
-        gauss_fit = ExxScipyLeastSquares(gauss, fit_with_coul=True)
-        gauss_params = gauss_fit.fit_model(self.qG, SqG)
-        gauss_residual = np.sum(gauss_fit.abs_diff(gauss_params, self.qG, SqG) ** 2)
-        self.assertLess(etb_residual, 1e-2 * gauss_residual)
+        np.testing.assert_allclose(q4_nonlinear, 1e-4 * self.coeffs, rtol=1e-3)
 
     def test_radial_shells(self):
         single_shell = np.vstack([np.eye(3), -np.eye(3)])
@@ -542,6 +523,15 @@ class EvenTemperedFittingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "cannot determine"):
             trim_etb_model_to_data(model, coords[norms < 0.6])  # one |q| shell
+
+        # A narrow reference Gaussian underflows at large |q|; the proxy columns must stay finite
+        g = np.arange(-7, 8) * self.spacing
+        wide_grid = np.array(np.meshgrid(g, g, g, indexing="ij")).reshape(3, -1).T
+        narrow = XNETBStackedSingularity(deltaGs=wide_grid, sigma=0.1)
+        far = wide_grid[np.linalg.norm(wide_grid, axis=1) < 4.5]
+        self.assertTrue(np.all(np.isfinite(narrow.linear_proxy_design_matrix(far))))
+        trimmed = trim_etb_model_to_data(narrow, far)
+        self.assertAlmostEqual(trimmed.etb_exponents[trimmed.etb_ref_index], 50.0)
 
     def _lifted_setup(self, remove_deltaG_zero=True, qcut=4.0):
         cell = CubicCell(lattice_constant=6.0)

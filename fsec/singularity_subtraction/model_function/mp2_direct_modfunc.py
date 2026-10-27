@@ -245,6 +245,16 @@ class XNGaussStackedSingularity(ModelFunction):
         result = np.sum(result_matrix, axis=1)
         return result
 
+    def stacked_sum(self, coords: np.ndarray):
+        """sum_dG decay_func(|q + dG|) for each q, skipping q + dG = 0 and, if remove_deltaG_zero, dG = 0."""
+        deltaGs = self.deltaGs
+        if self.remove_deltaG_zero:
+            deltaGs = deltaGs[np.linalg.norm(deltaGs, axis=1) >= 1e-8]
+        qp_norm = np.linalg.norm(coords[:, None, :] + deltaGs[None, :, :], axis=2)
+        h = self.decay_func(qp_norm)
+        h[qp_norm**2 < 1e-8] = 0.0
+        return np.sum(h, axis=1)
+
     def decay_func(self, r: np.ndarray):
         if np.isclose(self.sigma, 0, atol=1e-8):
             return np.zeros_like(r, dtype=float)
@@ -334,8 +344,11 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
         if return_all_zeros:
             return np.zeros(coords.shape[0])
 
-        cn_coeffs = self.c0
+        q_norm = np.linalg.norm(coords, axis=1)
+        return -self.c0 * q_norm**2 * self.decay_func(q_norm) * self.stacked_sum(coords)
 
+    def stacked_sum(self, coords: np.ndarray):
+        """sum_dG decay_func(|q + dG|) for each q from the cached q-mesh sums, removing dG = 0 if requested."""
         coords_FBZ = minimum_image(self.cell, coords)
         idxs_coords_FBZ_in_qGrid = self.kdtree_qGrid.query(
             coords_FBZ, k=1, distance_upper_bound=1e-8
@@ -354,15 +367,13 @@ class XNGaussStackedSingularityQMesh(XNGaussStackedSingularity):
                 axis=1,
             )
 
-        q_norm = np.linalg.norm(coords, axis=1)
-        result = -cn_coeffs * q_norm**2 * self.decay_func(q_norm) * sum_g_q_deltaG
-
         if self.remove_deltaG_zero:
+            q_norm = np.linalg.norm(coords, axis=1)
             g_q = self.decay_func(q_norm)
             g_q[q_norm < 1e-8] = 0
-            result = result + cn_coeffs * q_norm**2 * self.decay_func(q_norm) * g_q
+            sum_g_q_deltaG = sum_g_q_deltaG - g_q
 
-        return result
+        return sum_g_q_deltaG
 
 
 class XNExpAbsStackedSingularity(XNGaussStackedSingularity):
@@ -536,11 +547,11 @@ class XNETBStackedSingularity(EvenTemperedMixin, XNGaussStackedSingularity):
         saved = np.array(self.parameters, dtype=float)
         self.set_parameters(self.one_hot_reference())
         try:
-            reference = self.eval_model(coords)
+            H_ref = self.stacked_sum(coords)
         finally:
             self.set_parameters(saved)
-        columns = self.gaussian_columns(np.linalg.norm(coords, axis=1))
-        return reference[:, None] * columns / columns[:, [self.etb_ref_index]]
+        q_norm = np.linalg.norm(coords, axis=1)
+        return -self.c0 * (q_norm**2 * H_ref)[:, None] * self.gaussian_columns(q_norm)
 
     def coulomb_integral(self):
         norm_deltaGs = np.linalg.norm(self.deltaGs, axis=1)

@@ -94,12 +94,13 @@ class EvenTemperedMixin:
         dG2 = np.asarray(deltaG_norms, dtype=float) ** 2
         total = 0.0
         for k, (b_k, a_k) in enumerate(zip(coeffs, self.etb_exponents)):
-            for b_l, a_l in zip(coeffs[k:], self.etb_exponents[k:]):
+            for l in range(k, len(coeffs)):
+                b_l, a_l = coeffs[l], self.etb_exponents[l]
                 if b_k == 0.0 or b_l == 0.0:
                     continue
                 s = a_k + a_l
                 term = b_k * b_l * (np.pi / s) ** 1.5 * np.sum(np.exp(-a_k * a_l / s * dG2))
-                total += term if a_k == a_l else 2 * term
+                total += term if k == l else 2 * term
         return total
 
     def num_window_params(self, num_gaussians):

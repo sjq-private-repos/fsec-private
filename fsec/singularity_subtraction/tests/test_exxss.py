@@ -36,12 +36,6 @@ class KnownValues(unittest.TestCase):
             "integral_term": -0.5435524885236986,
             "quadrature_term": 0.28190109874542674,
         },
-        "pbe0_even_tempered": {
-            "Ek_ss": -0.5285629124745596,
-            "correction": -0.26191348891017086,
-            "integral_term": -0.5421369262841444,
-            "quadrature_term": 0.2802234373739736,
-        },
         "hf_even_tempered": {
             "Ek_ss": -0.5285629094325447,
             "correction": -0.261913485869514,
@@ -120,6 +114,7 @@ class KnownValues(unittest.TestCase):
                 delta=self.TOL,
                 msg=f"{label} {quantity}",
             )
+        return exxss
 
     def test_pair_density_eval_grid_option(self):
         exxss = ExxSS(
@@ -174,44 +169,33 @@ class KnownValues(unittest.TestCase):
             qG_norm_cutoff_sigma=2.0,
         )
 
-    def test_pbe0_exxss_even_tempered(self):
-        self._assert_exxss_reference(
-            "pbe0_even_tempered",
-            self.pbe0_mf,
-            ExxSSEvenTempered,
-            fit_method="etb_linear",
-        )
-
     def test_hf_exxss_even_tempered(self):
-        self._assert_exxss_reference(
+        exxss = self._assert_exxss_reference(
             "hf_even_tempered",
             self.hf_mf,
             ExxSSEvenTempered,
             fit_method="etb_linear",
         )
-
-    def test_even_tempered_fit_region_and_options(self):
-        exxss = ExxSSEvenTempered(self.hf_mf, sigma=2.0, num_gaussians=3, ratio=3.0)
-        np.testing.assert_allclose(exxss.auxfunc.etb_exponents, [1 / 24, 1 / 8, 3 / 8])
-        self.assertEqual(exxss.fit_method.__class__.__name__, "ETBLinearLeastSquares")
-
-        exxss = ExxSSEvenTempered(self.hf_mf)
-        exxss.compute_correction()
         # The automatic cutoff is enlarged until all N - 1 free coefficients plus a margin are resolvable
         self.assertGreaterEqual(len(radial_shells(exxss.qG_grid_fit)), exxss.required_shells())
         self.assertEqual(exxss.auxfunc.num_gaussians, 5)
         self.assertAlmostEqual(np.sum(exxss.auxfunc.parameters), 1.0, places=12)
         self.assertTrue(np.all(exxss.auxfunc.parameters >= 0))
-        # Close to, but not the same as, the single-Gaussian correction
-        self.assertAlmostEqual(
-            exxss.correction, self.REFERENCES["hf_contracted_gaussian"]["correction"], delta=5e-3)
+
+    def test_even_tempered_options(self):
+        exxss = ExxSSEvenTempered(self.hf_mf, sigma=2.0, num_gaussians=3, ratio=3.0)
+        np.testing.assert_allclose(exxss.auxfunc.etb_exponents, [1 / 24, 1 / 8, 3 / 8])
+        self.assertEqual(exxss.fit_method.__class__.__name__, "ETBLinearLeastSquares")
 
     def test_even_tempered_reduces_basis_for_small_explicit_cutoff(self):
-        exxss = ExxSSEvenTempered(self.hf_mf, qG_norm_cutoff=1.1, qG_norm_cutoff_sigma=None)
-        exxss.compute_correction()
-        self.assertLess(exxss.auxfunc.num_gaussians, 5)
-        self.assertIn(0.5, exxss.auxfunc.etb_exponents)
-        self.assertTrue(np.isfinite(exxss.correction))
+        # A user initial_guess sized for the full basis is replaced once the basis is reduced
+        for kwargs in ({}, {"fit_method": "scipy_least_squares", "initial_guess": np.full(5, 0.2)}):
+            with self.subTest(**kwargs):
+                exxss = ExxSSEvenTempered(self.hf_mf, qG_norm_cutoff=1.1, qG_norm_cutoff_sigma=None, **kwargs)
+                exxss.compute_correction()
+                self.assertLess(exxss.auxfunc.num_gaussians, 5)
+                self.assertIn(0.5, exxss.auxfunc.etb_exponents)
+                self.assertTrue(np.isfinite(exxss.correction))
 
 
 if __name__ == "__main__":

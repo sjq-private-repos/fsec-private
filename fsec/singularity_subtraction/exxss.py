@@ -510,9 +510,11 @@ class ExxSSEvenTempered(ExxSS):
         trimmed = trim_etb_model_to_data(self.auxfunc, self.qG_grid_fit, weights, rcond=self.rcond,
                                          min_shell_margin=self.min_shell_margin, label="ExxSS ETB")
         if trimmed is not self.auxfunc:
+            if self.user_initial_guess:
+                print(f"WARNING: discarding the user initial_guess for {self.auxfunc.num_gaussians} coefficients; "
+                      f"the ETB basis was reduced to {trimmed.num_gaussians}.")
             self.auxfunc = trimmed
-            if not self.user_initial_guess:
-                self.initial_guess = trimmed.default_parameters()
+            self.initial_guess = trimmed.default_parameters()
             self.set_fit_method(self.fit_method_name)
             self.fit_method.rcond = self.rcond
         return self.auxfunc

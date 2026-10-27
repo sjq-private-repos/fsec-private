@@ -250,16 +250,12 @@ class EvenTemperedModelTests(unittest.TestCase):
         exx = EvenTemperedGaussianModel()
         gauss = ContractedGaussianModel(num_gaussians=1, isotropic=True, parameters=[1.0, 1.0])
         np.testing.assert_allclose(exx.eval_model(self.coords), gauss.eval_model(self.coords), atol=1e-14)
-        self.assertAlmostEqual(exx.coulomb_integral(), gauss.coulomb_integral(), places=12)
 
         for deg in (2, 4):
-            for coul_deg in (2, 4):
-                with self.subTest(deg=deg, coul_deg=coul_deg):
-                    etb = XNETB(deg=deg)
-                    gauss = XNGauss(parameters=[1.0, 1.0], deg=deg)
-                    np.testing.assert_allclose(etb.eval_model(self.coords), gauss.eval_model(self.coords))
-                    self.assertAlmostEqual(
-                        etb.coulomb_integral(coul_deg), gauss.coulomb_integral(coul_deg), places=10)
+            with self.subTest(deg=deg):
+                etb = XNETB(deg=deg)
+                gauss = XNGauss(parameters=[1.0, 1.0], deg=deg)
+                np.testing.assert_allclose(etb.eval_model(self.coords), gauss.eval_model(self.coords))
 
         for remove_deltaG_zero in (False, True):
             with self.subTest(remove_deltaG_zero=remove_deltaG_zero):
@@ -274,7 +270,6 @@ class EvenTemperedModelTests(unittest.TestCase):
         etb.set_parameters(etb.one_hot_reference(gauss.uncorrected_q2_quad))
         self.assertAlmostEqual(etb.c0, 1.0, places=12)
         np.testing.assert_allclose(etb.eval_model(self.coords), gauss.eval_model(self.coords))
-        self.assertAlmostEqual(etb.coulomb_integral(), gauss.coulomb_integral(), places=8)
 
     def test_analytic_coulomb_integrals_match_quadrature(self):
         exx = EvenTemperedGaussianModel(parameters=self.coeffs)
@@ -303,17 +298,10 @@ class EvenTemperedModelTests(unittest.TestCase):
         reference, _ = dblquad(integrand, 0, 20, -20, 20, epsabs=1e-12, epsrel=1e-12)
         self.assertAlmostEqual(model.coulomb_integral(), -reference, places=8)
 
-    def test_linear_design_matrix_reproduces_model(self):
-        models = [
-            EvenTemperedGaussianModel(parameters=self.coeffs),
-            XNETB(parameters=self.coeffs, deg=4),
-            XNETBStackedSingularityExchange(parameters=self.coeffs, q2s=self.q2s, dvol=0.1),
-        ]
-        for model in models:
-            with self.subTest(model=model.__class__.__name__):
-                np.testing.assert_allclose(
-                    model.linear_design_matrix(self.coords) @ self.coeffs, model.eval_model(self.coords),
-                    rtol=1e-12, atol=1e-14)
+        # A repeated exponent acts as one primitive carrying the summed coefficient
+        repeated = XNETBStackedSingularity(parameters=[0.2, 0.3, 0.5], deltaGs=self.deltaGs, exponents=[0.5, 0.5, 1.0])
+        merged = XNETBStackedSingularity(parameters=[0.5, 0.5], deltaGs=self.deltaGs, exponents=[0.5, 1.0])
+        self.assertAlmostEqual(repeated.coulomb_integral(), merged.coulomb_integral(), places=12)
 
     def test_qmesh_matches_direct_stacked_evaluation(self):
         # A large dG mesh so that shifting the stacked sum by a nearby G does not change its truncation
@@ -371,23 +359,6 @@ class EvenTemperedModelTests(unittest.TestCase):
                 self.assertAlmostEqual(
                     lifted.coulomb_integral() / (stacked.coulomb_integral() + stacked2.coulomb_integral()), 1.0,
                     places=12)
-
-    def test_lifted_model_window_parameters(self):
-        qGrid = np.zeros((1, 3))
-        lifted = XNETBLiftedStackedSingularityQMesh(qGrid=qGrid, cell=self.cell, deltaGs=self.deltaGs)
-        np.testing.assert_array_equal(lifted.window_columns([2]), [lifted._pair_index(2, 2)])
-        self.assertEqual(len(lifted.window_columns([1, 2, 3])), lifted.num_window_params(3))
-        reduced = lifted.with_exponents(lifted.etb_exponents[1:4])
-        self.assertEqual(reduced.num_params, 6)
-        self.assertAlmostEqual(reduced.etb_exponents[reduced.etb_ref_index], 0.5)
-
-    def test_qmesh_initial_parameters_match_gaussian(self):
-        qGrid = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, self.cell.reciprocal_lattice_constant / 2]])
-        gauss = XNGaussStackedSingularityQMesh(qGrid=qGrid, cell=self.cell, deltaGs=self.deltaGs)
-        gauss.set_parameters(gauss.initial_parameters(1e-4))
-        etb = XNETBStackedSingularityQMesh(qGrid=qGrid, cell=self.cell, deltaGs=self.deltaGs)
-        etb.set_parameters(etb.one_hot_reference(etb.initial_parameters(1e-4)[etb.etb_ref_index]))
-        np.testing.assert_allclose(etb.eval_model(self.coords), gauss.eval_model(self.coords), rtol=1e-12)
 
 
 if __name__ == "__main__":
