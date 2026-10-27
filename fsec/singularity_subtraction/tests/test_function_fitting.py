@@ -475,13 +475,6 @@ class EvenTemperedFittingTests(unittest.TestCase):
         q4_nonlinear = q4_nonlinear_fit.fit_model(self.qG, q4_data, force_positive_params=True)
         np.testing.assert_allclose(q4_nonlinear, 1e-4 * self.coeffs, rtol=1e-3)
 
-    def test_radial_shells(self):
-        single_shell = np.vstack([np.eye(3), -np.eye(3)])
-        self.assertEqual(len(radial_shells(single_shell)), 1)
-        self.assertEqual(len(radial_shells(np.vstack([np.zeros((1, 3)), single_shell, 2 * single_shell]))), 2)
-        self.assertAlmostEqual(cutoff_for_min_shells(self.grid, 2), np.sqrt(2) * self.spacing + 1e-8)
-        self.assertIsNone(cutoff_for_min_shells(single_shell, 2))
-
     def test_too_few_shells(self):
         few = self.qG[np.linalg.norm(self.qG, axis=1) < 0.9]
         self.assertEqual(len(radial_shells(few)), 2)

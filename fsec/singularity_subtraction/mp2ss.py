@@ -81,14 +81,14 @@ class MP2SSOptions:
     ----------
     auxfunc_direct
         Model used when fitting the complete direct contribution. Supported
-        values are ``"Gauss"``, ``"ExpAbs"``, ``"ETB"``, and ``"ETBLifted"``. NOTE: Ignored when
+        values are ``"Gauss"``, ``"ExpAbs"``, ``"ETB"``, and ``"ETBStacked"``. NOTE: Ignored when
         correct_q2_q4_separately is enabled, in which case auxfunc_direct_q2
         and auxfunc_direct_q4 are used instead.
     auxfunc_direct_q2
         Model used for the second-order direct contribution when
         ``correct_q2_q4_separately`` is enabled. A false-like value falls back
         to ``auxfunc_direct``. Supported values are ``"Gauss"``,
-        ``"ExpAbs"``, ``"ETB"``, and ``"ETBLifted"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
+        ``"ExpAbs"``, ``"ETB"``, and ``"ETBStacked"``. NOTE: Ignored when correct_q2_q4_separately is disabled,
         in which case auxfunc_direct is used instead.
     auxfunc_direct_q4
         Model used for the fourth-order direct contribution when
@@ -103,28 +103,28 @@ class MP2SSOptions:
         ``"ExpAbs"``, ``"ExpAbs2"``, and ``"ETB"``.
     etb_sigma
         Expected width of the decay function for ``"ETB"`` and
-        ``"ETBLifted"`` (even-tempered Gaussian) auxiliary functions.
-        ``"ETBLifted"`` (direct and q2 only) replaces the stacked product
+        ``"ETBStacked"`` (even-tempered Gaussian) auxiliary functions.
+        For direct and q2, ``"ETB"`` replaces the stacked product
         h(q) h(q+dG) by a nonnegative sum of pairwise Gaussian terms
         B_kl g_k(q) g_l(q+dG), which is linear in the N(N+1)/2 entries of
-        B, so its fit is convex. The fixed exponents are
+        B, so its fit is convex; ``"ETBStacked"`` keeps the rank-1 product
+        h(q) h(q+dG). The fixed exponents are
         ``alpha_k = ratio**(k - (N-1)/2) / (2 sigma**2)``. Either a float
         used for every component, or a mapping keyed by ``"direct"``,
         ``"direct_q2"``, ``"direct_q4"``, and ``"exchange"``; components
         missing from the mapping use 1.0.
     etb_num_gaussians
-        Number of even-tempered Gaussians N in ``"ETB"`` and ``"ETBLifted"``
+        Number of even-tempered Gaussians N in ``"ETB"`` and ``"ETBStacked"``
         auxiliary functions. Reduced automatically, around the Gaussian of
         width ``etb_sigma``, until the fit data can determine all parameters
-        (N, or N(N+1)/2 for ``"ETBLifted"``).
+        (N, or N(N+1)/2 for the lifted ``"ETB"`` direct and q2 models).
     etb_ratio
         Ratio between consecutive ``"ETB"`` exponents.
     etb_linear_fit
-        Fit ``"ETB"`` models that are linear in their coefficients (q4 and
-        exchange, and the ``"ETBLifted"`` direct and q2 models) by direct
-        nonnegative least squares instead of ``fit_method``. The ``"ETB"``
-        stacked direct and q2 models are quadratic in their coefficients and
-        always use ``fit_method``.
+        Fit ``"ETB"`` models (which are linear in their coefficients) by direct
+        nonnegative least squares instead of ``fit_method``. The
+        ``"ETBStacked"`` direct and q2 models are quadratic in their
+        coefficients and always use ``fit_method``.
     fit_with_coul
         Include the Coulomb kernel in fits of the complete direct and exchange
         contributions. Ignored for direct if ``correct_q2_q4_separately`` is
@@ -465,13 +465,13 @@ DIRECT_MODEL_SPECS = {
         'fit_multipliers': [1e4, 1.0],
     },
     'ETB': {
-        'cls_name': 'XNETBStackedSingularityQMesh',
+        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
         'type': 'qmesh',
         'etb': True,
         'c0_scale': 1.0e-4,
     },
-    'ETBLifted': {
-        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
+    'ETBStacked': {
+        'cls_name': 'XNETBStackedSingularityQMesh',
         'type': 'qmesh',
         'etb': True,
         'c0_scale': 1.0e-4,
@@ -525,13 +525,13 @@ Q2_MODEL_SPECS = {
         'fit_multipliers': [1e4, 1.0],
     },
     'ETB': {
-        'cls_name': 'XNETBStackedSingularityQMesh',
+        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
         'type': 'qmesh',
         'etb': True,
         'c0_scale': 1.0e-5,
     },
-    'ETBLifted': {
-        'cls_name': 'XNETBLiftedStackedSingularityQMesh',
+    'ETBStacked': {
+        'cls_name': 'XNETBStackedSingularityQMesh',
         'type': 'qmesh',
         'etb': True,
         'c0_scale': 1.0e-5,
@@ -1331,7 +1331,7 @@ class MP2SS:
 
     def _etb_model_kwargs(self, component, auxfunc):
         """Constructor kwargs for an ETB auxiliary function of the given component, or None."""
-        if auxfunc not in ('ETB', 'ETBLifted'):
+        if auxfunc not in ('ETB', 'ETBStacked'):
             return None
         sigma = self.etb_sigma
         if isinstance(sigma, Mapping):
