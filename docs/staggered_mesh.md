@@ -14,6 +14,7 @@ primitive cell. GW orbital energies are in hartree.
 
 | Import from | Classes | Runnable example |
 | --- | --- | --- |
+| `fsec.staggered_mesh.mp` | `KMP2_stagger` | [MP2 with sTC](../examples/staggered_mp2_stc.py) |
 | `fsec.staggered_mesh.mp` | `KMP3`, `KMP3_2mesh`, `KMP3_2mesh_mixed`, `KMP3_3mesh` | [MP3](../examples/staggered_mp3.py) |
 | `fsec.staggered_mesh.cc` | `KRCCD_2mesh`, `KRCCD_3mesh` | [CCD](../examples/staggered_ccd.py) |
 | `fsec.staggered_mesh.gw` | `KRGWAC_stagger_submesh`, `KRGWAC_stagger_extend` | [G0W0](../examples/staggered_gw.py) |
@@ -30,6 +31,48 @@ These are dense reference implementations. Start with the small examples;
 integral and amplitude storage grows rapidly with the mesh and orbital count.
 GW runs without MPI or the archived `pyrpa` package. MP3/CCD integral
 transformations can use Python thread workers, in addition to PySCF threading.
+
+## MP2 with sTC band orbitals
+
+`KMP2_stagger` is a copy of `pyscf.pbc.mp.kmp2_stagger`, and by default it gives
+the same energies unless the auxiliary basis is linearly dependent (see below).
+It adds a density-fitted route to the orbitals and orbital energies on the
+shifted mesh for `flag_submesh=False`.
+
+PySCF evaluates those bands at the fixed reference density with a temporary
+FFTDF and hard `vcut_sph` truncation. With `band_df='stc'`, each band point
+$\mathbf{k}$ instead uses
+
+$$
+F^{\mathbf{k}}_{\mu\nu}[D] = h^{\mathbf{k}}_{\mu\nu} + J^{\mathbf{k}}_{\mu\nu}[D]
+  - \tfrac{1}{2} K^{\mathrm{sTC},\mathbf{k}}_{\mu\nu}[D]
+$$
+
+where $J$ is ordinary GDF and $K^{\mathrm{sTC}}$ comes from `RSGDF_STC`. The
+density $D$ stays on `mf.kpts`, which also defines the cutoff. The correlation
+integrals are always bare. This path requires the custom
+`pyscf.pbc.df.rsdf_stc` module, and a 3D closed-shell KRHF reference.
+
+| Reference | Call | Band Fock | Correlation integrals |
+| --- | --- | --- | --- |
+| Not sTC | `KMP2_stagger(mf)` | FFTDF, hard `vcut_sph` | As in PySCF |
+| GDF or RSGDF | `KMP2_stagger(mf, band_df='stc')` | GDF+sTC, `vcut_ws`, `eta=4` | GDF on the union, reference `auxbasis` |
+| `rsdf_stc.density_fit` | `KMP2_stagger(mf)` | GDF+sTC, reference `eta` and cutoff | GDF on the union, reference `auxbasis` |
+| `rsdf_stc.density_fit` | `KMP2_stagger(mf, flag_submesh=True)` | None; reference orbitals | GDF on `mf.kpts`, reference `auxbasis` |
+
+`eta`, `exxdiv`, and `auxbasis` override these defaults. The sTC band energies
+inherit the fitting error of the auxiliary basis, so converge it. On H2/gth-szv
+at 2x2x2, the 12-function default gave a Hartree error of 5e-3 against FFTDF at
+the shifted points, and a 122-function even-tempered basis gave 3e-7.
+
+`KMP2_stagger` reads (L|pq) with `sr_loop`, not with `CDERIArray` as PySCF does.
+Linear dependency makes the auxiliary count depend on q, and `CDERIArray` unpacks
+every k-point pair with the count of the first pair. Diamond/gth-szv with
+`def2-universal-jkfit` stores {129, 132, 150} functions per pair, and
+`CDERIArray` gives integral errors up to 0.37. With a larger first count it can
+read past the array: a small H2 test returned -4.4e+120 Ha. PySCF `KMP2` shares
+this reader, as do `fsec/standard/krgwac_ewald.py` and
+`fsec/singularity_subtraction/structure_factor/mp2_smallq.py`.
 
 ## Migration from the archive
 
@@ -60,6 +103,10 @@ choice. The staggered formulations retain their archive defaults:
 `KMP3_2mesh(..., madelung=True)`, `KMP3_2mesh_mixed(..., madelung=True)`, and
 `KMP3_3mesh(..., madelung=False)`. These flags describe the respective
 formulations' corrections; they are not interchangeable with a GW correction.
+
+See the [MP3 density-fitting review](mp3_density_fitting.md) for current
+backend and storage capabilities, and a proposal for incorporating
+RSDF-direct into every staggered MP3 scheme and sharing it with CCD/GW.
 
 ### CCD
 
