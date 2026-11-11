@@ -70,6 +70,90 @@ Two separate problems drive this form:
    $\mathrm{sgn}(\epsilon_F-\epsilon_n)$ away from the window, and stays continuous even when the mesh
    Drude weight is poor.
 
+### Derivation of the self-energy
+
+**Head integral.** At $\mathbf q=0$ the overlap $\langle n\mathbf k|m\mathbf k\rangle$ is $\delta_{nm}$, so
+only $m=n$ survives. With $H_n$ even in $\omega'$, combining $\pm\omega'$ gives the kernel already in
+`get_sigma_fc`:
+
+$$
+\Sigma_n(i\omega_l)=-\frac{1}{2\pi}\int_{-\infty}^{\infty}d\omega'\,\frac{H_n(\omega')}{y_{nl}+i\omega'}
+=-\frac{1}{\pi}\int_0^\infty d\omega'\,H_n(\omega')\,\frac{y_{nl}}{y_{nl}^2+\omega'^2}.
+$$
+
+**Near-pole subtraction.** Let $\Delta=\epsilon_F-\epsilon_n$. The denominator factorizes as
+$(\omega'-\omega_l+i\Delta)(\omega'+\omega_l-i\Delta)$, so as $\Delta\to0$ the pole lands on the node
+$\omega_l$. The kernel has a known integral,
+
+$$
+\int_0^\infty d\omega'\,\frac{y_{nl}}{y_{nl}^2+\omega'^2}=\frac{\pi}{2}\,\mathrm{sgn}(\Delta),
+$$
+
+so adding and subtracting $H_n(\omega_l)$ is exact at $T=0$ and removes the pole:
+
+$$
+\Sigma_n(i\omega_l)=-\frac{1}{\pi}\left[\frac{\pi}{2}\mathrm{sgn}(\Delta)H_n(\omega_l)
++\int_0^\infty d\omega'\,[H_n(\omega')-H_n(\omega_l)]\frac{y_{nl}}{y_{nl}^2+\omega'^2}\right].
+$$
+
+**Occupation weighting.** At $T>0$, neglecting bosonic occupations (valid when the spectral weight of
+$H_n$ sits at energies well above $\sigma$), the self-energy is a pole-weighted mix of the two branches:
+
+$$
+\Sigma=f_n\Sigma^{<}+(1-f_n)\Sigma^{>},\qquad
+\Sigma^{<}-\Sigma^{>}=-H_n(\omega^*),\qquad
+\omega^*=\omega_l-i\Delta.
+$$
+
+For the Drude head, $H(\omega)=-c\,\omega_p^2/(\omega^2+\omega_p^2)$, the branches are
+$\Sigma^{<}(y)=\frac{c}{2}\,\omega_p/(\omega_p+y)$ and $\Sigma^{>}(y)=-\frac{c}{2}\,\omega_p/(\omega_p-y)$,
+which confirms the jump in closed form. The exact finite-$T$ result is therefore
+
+$$
+\Sigma=\frac{\Sigma^{<}+\Sigma^{>}}{2}-\frac{1}{2}(2f_n-1)H_n(\omega^*).
+$$
+
+The plan's formula follows with one approximation, $H_n(\omega^*)\approx H_n(\omega_l)$. Replacing
+$\mathrm{sgn}(\Delta)$ with $2f_n-1$ is therefore a derived step, but not an exact one.
+
+**On-shell continuity.** For a Drude head, $\Sigma^{\gtrless}(0)=\mp c/2$, so adding $\Sigma^{x,\rm fc}=-cf_n$
+gives $-c/2$ for every $f_n$. Keeping sharp $\Sigma_c$ instead gives $-0.3c$ at $f_n=0.8$ and $-0.7c$ at
+$f_n=0.2$.
+
+### Numerical check of the subtraction
+
+Drude model with `nw=400`, $\omega_p=0.5$, $c=1$, at the node $\omega_l\approx0.03$ (spacing about $10^{-3}$):
+
+| $\Delta$ | Plain sum error | Subtracted error |
+| --- | --- | --- |
+| $10^{-3}$ | $2\times10^{-3}$ | $5\times10^{-7}$ |
+| $10^{-4}$ | $1.2$ | $3\times10^{-5}$ |
+| $10^{-6}$ | $159$ | $3.8\times10^{-5}$ |
+
+Two residuals remain, both small relative to $c$:
+
+- **Dropping node $j=l$.** Once $\Delta$ is below the node spacing, the error saturates at
+  $w_l H'_n(\omega_l)/2\pi$: $3.8\times10^{-5}$ at this node and $1.3\times10^{-3}$ at $\omega_l\approx0.5$.
+  A derivative term at the node should remove it, but that has not been tried.
+- **Freezing $H$ at $\omega_l$.** The error is $(f_n-\theta_n)[H_n(\omega^*)-H_n(\omega_l)]$, where
+  $\theta_n$ is the sharp $T=0$ occupation. It reached about $2\times10^{-3}$ at $\sigma=0.01$ and only applies
+  inside the smearing window.
+
+### Prior use
+
+- **Near-pole subtraction in GW for metals.** Haule & Mandal (Eqs. 12-14) use the same kernel with the
+  same add-and-subtract at the external frequency. They apply it to the full $\Sigma$ on the Matsubara
+  axis, not only the head, and keep $\arctan(L/y)$ for a finite cutoff $L$ because $\pm\pi/2$ is not precise
+  enough there. On PySCF's grid mapped to infinity, $\pm\pi/2$ was fine in the Drude test above.
+- **Outside GW.** This resembles the Haftel-Tabakin principal-value subtraction from nuclear scattering.
+  That attribution is from memory and has not been checked against the original paper.
+- **Drude term in the $\mathbf q\to0$ head.** Established. Sesti et al. describe adding such a head term as a
+  known approach and note that neglecting intraband terms is common. The readings of Haule & Mandal,
+  Friedrich et al., and Liu et al. on this point come from summaries of those sections, not their equations.
+- **The $(2f_n-1)$ weighting.** Not found in Haule & Mandal, Duchemin & Blase, Friedrich et al., Sesti et al.,
+  or Liu et al. This is not a full literature search. Tan, Kas & Rehr look like the closest finite-$T$
+  formula, but only an excerpt was read.
+
 **Expected physics.** On shell ($y=0$) with a Drude-dominated head, every band gets a rigid $-c_{\rm head}/2$,
 plus a $Z$ renormalization with
 $\partial_z\Sigma^{\rm head} = -c_{\rm head}/(2\sqrt{\epsilon_\infty}\Omega_p)$. This is the
@@ -185,7 +269,8 @@ Acceptance criteria:
   $\epsilon_{m,\mathbf k-\mathbf q}$ near $\epsilon_F$, and the subtraction here only fixes the head.
   Padé input may stay noisy on unlucky meshes. If criterion 4 fails, the follow-up is separating the
   $\Sigma$ grid from the quadrature grid, which means forking `get_sigma`. I would stop and report
-  rather than do that inside this change.
+  rather than do that inside this change. Haule & Mandal's full-$\Sigma$ subtraction is the likely
+  template for that follow-up.
 - **Raw finite-T mismatch.** Raw $\Sigma_x(f)$ and raw $\Sigma_c$(sharp) still disagree at small
   $\mathbf q \ne 0$. A head correction cannot fix that. It matters when $\sigma \gg v_F q_0$.
 - **Singular $\Omega_p^2$ tensors** (1D or layered metals, or 1D k-meshes) are not resolved by Lebedev
@@ -201,3 +286,12 @@ Acceptance criteria:
 - T. Zhu and G. K.-L. Chan, JCTC 17, 727 (2021), Sec. 3.6.
 - P. Liu, M. Kaltak, J. Klimeš, G. Kresse, PRB 94, 165109 (2016), Eqs. 79-80.
 - J. Yan et al., PRB 83, 245122 (2011).
+- K. Haule and S. Mandal, All electron GW with linearized augmented plane waves for metals and
+  semiconductors, [arXiv:2008.07727](https://arxiv.org/abs/2008.07727), Eqs. 12-14.
+- Sesti et al., A viable and accurate route to GW simulations of metals and doped semiconductors,
+  [arXiv:2508.06930](https://arxiv.org/abs/2508.06930).
+- C. Friedrich, S. Blügel, A. Schindlmayr, Efficient implementation of the GW approximation within the
+  all-electron FLAPW method, [arXiv:1003.0316](https://arxiv.org/abs/1003.0316).
+- I. Duchemin and X. Blase, Robust analytic continuation approach to many-body GW calculations,
+  [arXiv:1912.06459](https://arxiv.org/abs/1912.06459).
+- Tan, Kas & Rehr, PRB 98, 115125 (2018).
