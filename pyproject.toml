@@ -16,3 +16,9 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["fsec*"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: periodic numerical reference calculations (opt in with -m slow)",
+]

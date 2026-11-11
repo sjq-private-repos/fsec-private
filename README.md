@@ -5,6 +5,19 @@ calculations. It includes singularity-subtraction methods for exact exchange
 (ExxSS) and MP2 (MP2SS) correlation energies and is designed to work with periodic
 [PySCF](https://pyscf.org/) calculations.
 
+Staggered mesh methods for restricted periodic MP3, CCD, and G0W0 are available
+under `fsec.staggered_mesh.mp`, `fsec.staggered_mesh.cc`, and
+`fsec.staggered_mesh.gw`. See the [staggered mesh guide](docs/staggered_mesh.md)
+for examples, API migration notes, and numerical validation, including the
+unresolved historical H₂ GW reference discrepancy.
+
+Standard periodic G0W0-AC with lattice-aware q → 0 corrections is available as
+`fsec.standard.KRGWAC_ewald`: Gaussian auxiliary functions (FHI-gap, the
+default), the Madelung constant, or PySCF's spherical integration, with an
+optional Lebedev average of the k·p dielectric head and wings. See the
+[method guide](docs/krgwac_ewald.md) for the supported systems, correction
+conventions, and comparisons with uncorrected calculations.
+
 ## Installation
 
 FSEC requires Python 3.9 or newer. Clone the repository and install it with
